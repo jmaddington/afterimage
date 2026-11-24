@@ -102,6 +102,9 @@ impl Outlets {
             let ok = s.write_all(line.as_bytes()).is_ok();
             if ok {
                 asked.push(*id);
+            } else {
+                // Its reader sees the end and whoever listens for it hears nothing more.
+                let _ = s.shutdown(std::net::Shutdown::Both);
             }
             ok
         });

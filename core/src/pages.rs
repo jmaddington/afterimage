@@ -25,6 +25,8 @@ pub struct TabSeen {
     pub urls: Vec<String>,
     /// The browser says it isn't the one showing.
     pub background: bool,
+    /// The page itself says nobody can see it.
+    pub hidden: bool,
     /// Something secret is showing or being typed and the extension can't say where.
     pub sensitive: bool,
     /// Size of the visible page in device pixels.
@@ -97,14 +99,15 @@ pub fn plan_page(ex: &Exclusions, hint: &PageHint, areas: &[PageArea], complete:
         let named: Vec<&String> = tab.urls.iter().filter(|u| u.contains("://")).collect();
         let showing: Vec<&PageArea> = areas.iter().filter(|a| named.iter().any(|u| **u == clean_address(&a.url))).collect();
         // Out of sight: the browser says so, its address is known, and everything on screen was read and isn't it.
-        if tab.background && complete && !named.is_empty() && named.len() == tab.urls.len() && showing.is_empty() {
+        if (tab.background || tab.hidden) && complete && !named.is_empty() && named.len() == tab.urls.len() && showing.is_empty() {
             continue;
         }
         let [area] = showing.as_slice() else { return leave_out(HideReason::SecretField) };
         let same = |points: f64, pixels: f64| (points * area.scale - pixels).abs() <= 3.0;
         let r = area.rect;
         // NaN fails every comparison, so it lands here too.
-        let trusted = complete && tab.current && !tab.sensitive && tab.urls.len() == 1 && pixels_ok(tab) && same(r.w, tab.width) && same(r.h, tab.height) && r.x.is_finite() && r.y.is_finite();
+        // A page that thinks it's hidden while the screen shows it doesn't know where it is.
+        let trusted = complete && !tab.hidden && tab.current && !tab.sensitive && tab.urls.len() == 1 && pixels_ok(tab) && same(r.w, tab.width) && same(r.h, tab.height) && r.x.is_finite() && r.y.is_finite();
         if !trusted {
             return leave_out(HideReason::SecretField);
         }
@@ -140,6 +143,8 @@ struct Frame {
     sensitive: bool,
     /// The latest question this frame had heard when it measured.
     n: u64,
+    /// It says nobody can see it.
+    hidden: bool,
 }
 
 struct Tab {
@@ -165,12 +170,14 @@ pub struct Pages {
     browsers: HashMap<(i32, u64), Browser>,
     /// More browsers than could be believed: everyone is suspect until it passes.
     crowded: Option<Instant>,
+    /// The latest question put to each browser. Only measurements made since then say where anything is now.
+    issued: HashMap<i32, u64>,
 }
 
 enum Message {
     Page { tab: i64, frame: i64, said: Frame },
     Tabs(HashMap<i64, Tab>),
-    Asked(u64),
+    Asked(u64, Option<Vec<(i64, i64)>>),
 }
 
 fn fresh(at: Instant, now: Instant) -> bool {
@@ -211,7 +218,7 @@ fn parse(json: &str, now: Instant) -> Option<Message> {
             // A field that can't be placed is still a field; only the top page knows where it is.
             let sensitive = v.get("typing")?.as_bool()? | v.get("unplaced")?.as_bool()? | (fields.len() < raw.len()) | (frame != 0 && !raw.is_empty());
             let size = |k: &str| v.get(k).and_then(Value::as_f64).filter(|n| n.is_finite()).unwrap_or(0.0);
-            Some(Message::Page { tab, frame, said: Frame { at: now, url: text(&v, "url"), width: size("width"), height: size("height"), fields, sensitive, n: v.get("n").and_then(Value::as_u64).unwrap_or(0) } })
+            Some(Message::Page { tab, frame, said: Frame { at: now, url: text(&v, "url"), width: size("width"), height: size("height"), fields, sensitive, n: v.get("n").and_then(Value::as_u64).unwrap_or(0), hidden: v.get("hidden").and_then(Value::as_bool).unwrap_or(false) } })
         }
         "tabs" => {
             let raw = v.get("tabs")?.as_array()?;
@@ -221,7 +228,14 @@ fn parse(json: &str, now: Instant) -> Option<Message> {
             let tab = |t: &Value| Some((t.get("tab")?.as_i64()?, Tab { active: t.get("active")?.as_bool()?, private: t.get("private")?.as_bool()?, url: text(t, "url") }));
             Some(Message::Tabs(raw.iter().map(tab).collect::<Option<_>>()?))
         }
-        "asked" => Some(Message::Asked(v.get("n")?.as_u64()?)),
+        "asked" => {
+            let pair = |p: &Value| Some((p.get(0)?.as_i64()?, p.get(1)?.as_i64()?));
+            let live = match v.get("live") {
+                Some(l) => Some(l.as_array().filter(|l| l.len() <= MAX_STORED)?.iter().map(pair).collect::<Option<Vec<_>>>()?),
+                None => None,
+            };
+            Some(Message::Asked(v.get("n")?.as_u64()?, live))
+        }
         _ => None,
     }
 }
@@ -252,13 +266,31 @@ impl Pages {
                 b.tabs = tabs;
                 b.tabs_at = Some(now);
             }
-            Some(Message::Asked(n)) => {
+            Some(Message::Asked(n, live)) => {
                 b.asked = b.asked.max(n);
+                // Frames that no longer exist can't answer, and have nothing left to show.
+                if let Some(live) = live {
+                    b.frames.retain(|k, _| live.contains(k));
+                }
                 // Keeps a connection with nothing else to say from being forgotten.
                 b.tabs_at = b.tabs_at.or(Some(now));
             }
             None => b.muddled = Some(now),
         }
+    }
+
+    /// A question is about to be put to this browser.
+    pub fn issue(&mut self, pid: i32, n: u64) {
+        if self.issued.len() > 64 {
+            self.issued.retain(|p, _| self.browsers.keys().any(|k| k.0 == *p));
+        }
+        self.issued.insert(pid, n);
+    }
+
+    /// Connections of this browser that have said anything lately.
+    pub fn sources(&self, pid: i32, now: Instant) -> Vec<u64> {
+        let live = |b: &Browser| b.frames.values().map(|f| f.at).chain(b.tabs_at).chain(b.muddled).any(|at| fresh(at, now));
+        self.browsers.iter().filter(|(k, b)| k.0 == pid && live(b)).map(|(k, _)| k.1).collect()
     }
 
     pub fn answered(&self, pid: i32, source: u64, n: u64) -> bool {
@@ -271,22 +303,30 @@ impl Pages {
             let tabs = b.tabs_at.filter(|at| fresh(*at, now)).map(|_| &b.tabs);
             h.private_window |= tabs.is_some_and(|t| t.values().any(|t| t.active && t.private));
             h.sensitive |= b.muddled.is_some_and(|at| fresh(at, now));
+            let issued = self.issued.get(&pid).copied().unwrap_or(0);
             let mut seen: HashMap<i64, TabSeen> = HashMap::new();
+            let mut hidden: Vec<i64> = Vec::new();
             for ((tab, frame), f) in b.frames.iter().filter(|(_, f)| fresh(f.at, now)) {
-                if !f.sensitive && f.fields.is_empty() {
+                // Silent since the question: whatever it said before may no longer be so.
+                let stale = f.n < issued;
+                if !f.sensitive && f.fields.is_empty() && !stale {
                     continue;
                 }
                 let s = seen.entry(*tab).or_default();
-                s.sensitive |= f.sensitive;
+                s.sensitive |= f.sensitive | stale;
                 if *frame == 0 {
                     (s.width, s.height) = (f.width, f.height);
                     s.fields = f.fields.clone();
-                    s.current = b.asked > 0 && f.n >= b.asked;
+                    s.current = issued > 0 && !stale;
+                    if f.hidden {
+                        hidden.push(*tab);
+                    }
                 }
             }
             for (id, mut s) in seen {
                 let fact = tabs.and_then(|t| t.get(&id));
                 s.background = fact.is_some_and(|t| !t.active);
+                s.hidden = hidden.contains(&id);
                 // Every name this tab goes by, so one out-of-date name can't make it look gone.
                 let page = b.frames.get(&(id, 0)).filter(|f| fresh(f.at, now)).map(|f| f.url.clone());
                 s.urls = page.into_iter().chain(fact.map(|t| t.url.clone())).collect();
@@ -455,6 +495,7 @@ mod tests {
     }
     fn hint_of(msgs: &[String]) -> PageHint {
         let (mut p, t) = (Pages::default(), Instant::now());
+        p.issue(7, 1);
         for m in msgs {
             p.receive(7, 1, m, t);
         }
@@ -551,31 +592,54 @@ mod tests {
     }
 
     #[test]
-    fn a_place_is_trusted_only_if_measured_since_the_last_question() {
-        let asked = |n| format!(r#"{{"v":1,"type":"asked","n":{n}}}"#);
+    fn a_place_is_trusted_only_if_measured_since_the_question_just_put() {
         let measured = |n: &str| page(3, FIELD).replace("\"n\":1,", n);
-        for (msgs, want) in [
-            (vec![measured("\"n\":2,"), asked(2)], None),
-            (vec![measured("\"n\":3,"), asked(2)], None),
-            (vec![measured("\"n\":1,"), asked(2)], Some(HideReason::SecretField)),
-            (vec![measured(""), asked(2)], Some(HideReason::SecretField)),
-            (vec![measured("\"n\":2,")], Some(HideReason::SecretField)),
-        ] {
+        for (m, want) in [(measured("\"n\":20,"), None), (measured("\"n\":21,"), None), (measured("\"n\":19,"), Some(HideReason::SecretField)), (measured(""), Some(HideReason::SecretField))] {
             let (mut p, t) = (Pages::default(), Instant::now());
-            for m in &msgs {
-                p.receive(7, 1, m, t);
-            }
-            assert_eq!(plan_page(&ex(), &p.hint(7, t), &[area(URL)], true).hide, want, "{msgs:?}");
+            p.issue(7, 20);
+            p.receive(7, 1, &m, t);
+            assert_eq!(plan_page(&ex(), &p.hint(7, t), &[area(URL)], true).hide, want, "{m}");
         }
+        // Never asked: never trusted.
+        let (mut p, t) = (Pages::default(), Instant::now());
+        p.receive(7, 1, &measured("\"n\":20,"), t);
+        assert_eq!(plan_page(&ex(), &p.hint(7, t), &[area(URL)], true).hide, Some(HideReason::SecretField));
+    }
+
+    /// A page that said "nothing here" before the question may have something now.
+    #[test]
+    fn a_page_that_did_not_answer_is_not_believed_clean() {
+        let (mut p, t) = (Pages::default(), Instant::now());
+        p.receive(7, 1, &page(3, CLEAN), t);
+        p.receive(7, 1, &page(3, CLEAN).replace("\"frame\":0", "\"frame\":4"), t);
+        assert_eq!(plan_page(&ex(), &p.hint(7, t), &[area(URL)], true), PagePlan::default());
+        p.issue(7, 5);
+        assert_eq!(plan_page(&ex(), &p.hint(7, t), &[area(URL)], true).hide, Some(HideReason::SecretField));
+        p.receive(7, 1, &page(3, CLEAN).replace("\"n\":1,", "\"n\":5,"), t);
+        assert_eq!(plan_page(&ex(), &p.hint(7, t), &[area(URL)], true).hide, Some(HideReason::SecretField), "the inner frame hasn't");
+        // The browser says which frames still exist; the rest are forgotten.
+        p.receive(7, 1, r#"{"v":1,"type":"asked","n":5,"live":[[3,0]]}"#, t);
+        assert_eq!(plan_page(&ex(), &p.hint(7, t), &[area(URL)], true), PagePlan::default());
+        p.receive(7, 1, r#"{"v":1,"type":"asked","n":5,"live":[[3,"x"]]}"#, t);
+        assert!(p.hint(7, t).sensitive);
+    }
+
+    #[test]
+    fn a_page_that_says_it_is_hidden_is_set_aside_unless_the_screen_disagrees() {
+        let hidden = page(3, FIELD).replace("\"n\":1,", "\"n\":1,\"hidden\":true,");
+        assert_eq!(plan_page(&ex(), &hint_of(&[hidden.clone()]), &[area("https://b.com/")], true).hide, None);
+        assert_eq!(plan_page(&ex(), &hint_of(&[hidden.clone()]), &[area(URL)], true).hide, Some(HideReason::SecretField));
+        assert_eq!(plan_page(&ex(), &hint_of(&[hidden]), &[area("https://b.com/")], false).hide, Some(HideReason::SecretField));
     }
 
     #[test]
     fn answers_are_counted_per_connection() {
         let asked = |n| format!(r#"{{"v":1,"type":"asked","n":{n}}}"#);
         let (mut p, t) = (Pages::default(), Instant::now());
-        assert!(!p.answered(7, 1, 1));
+        assert!(!p.answered(7, 1, 1) && p.sources(7, t).is_empty());
         p.receive(7, 1, &asked(1), t);
         assert!(p.answered(7, 1, 1) && !p.answered(7, 1, 2) && !p.answered(7, 2, 1) && !p.answered(8, 1, 1));
+        assert_eq!(p.sources(7, t), vec![1]);
         p.receive(7, 1, &asked(5), t);
         p.receive(7, 1, &asked(2), t);
         assert!(p.answered(7, 1, 5));

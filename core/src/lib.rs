@@ -198,7 +198,7 @@ impl Engine {
             hasher: RandomState::new(), forgotten: Default::default(), loaded_by_us: Default::default(),
             last_lm_use: Mutex::new(Instant::now()), lm_state: Mutex::new(LmState::Unknown), links: Default::default(),
             discarded: AtomicU64::new(0), reason: Default::default(), busy: AtomicBool::new(false),
-            describing: AtomicBool::new(false), on_power: AtomicBool::new(true), calm: AtomicBool::new(true), pages: Default::default(), outlets: Default::default(), question: AtomicU64::new(0),
+            describing: AtomicBool::new(false), on_power: AtomicBool::new(true), calm: AtomicBool::new(true), pages: Default::default(), outlets: Default::default(), question: AtomicU64::new(now_ms() as u64),
         });
         for (name, f) in [("afterimage-save", save_loop as fn(Arc<Shared>)), ("afterimage-index", index_loop)] {
             let s = s.clone();
@@ -229,8 +229,14 @@ impl Engine {
     /// Blocking; call off the main thread.
     pub fn refresh_pages(&self, pid: i32) -> bool {
         let Some(o) = self.s.outlets.get() else { return true };
+        // Rises across launches too, so a page can't answer with something measured for an earlier run.
         let n = self.s.question.fetch_add(1, SeqCst) + 1;
+        lock(&self.s.pages).issue(pid, n);
         let asked = o.ask(pid, n);
+        // Someone who spoke lately and can't be asked now can't be vouched for.
+        if lock(&self.s.pages).sources(pid, Instant::now()).iter().any(|id| !asked.contains(id)) {
+            return false;
+        }
         let end = Instant::now() + Duration::from_millis(900);
         loop {
             if asked.iter().all(|id| lock(&self.s.pages).answered(pid, *id, n)) {
@@ -1205,6 +1211,7 @@ mod tests {
         assert!(!e.refresh_pages(77));
         assert!(t.elapsed() < Duration::from_secs(2));
         let mut r = BufReader::new(s.try_clone().unwrap());
+        let s2 = s.try_clone().unwrap();
         let h = std::thread::spawn(move || {
             let mut line = String::new();
             while r.read_line(&mut line).unwrap_or(0) > 0 {
@@ -1215,6 +1222,10 @@ mod tests {
         });
         assert!(e.refresh_pages(77));
         assert!(e.refresh_pages(78));
+        // It spoke lately but has hung up: nobody to ask, so nothing can be vouched for.
+        s2.shutdown(std::net::Shutdown::Both).unwrap();
+        wait(|| e.s.outlets.get().unwrap().ask(77, 0).is_empty());
+        assert!(!e.refresh_pages(77));
         e.shutdown();
         drop(h);
     }

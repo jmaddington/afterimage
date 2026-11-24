@@ -37,31 +37,34 @@
     return false;
   }
 
-  function look() {
+  /** `asked`: the app wants an answer now, seen or not. Resolves once the report is on its way. */
+  function look(asked = false) {
     timer = 0;
-    // Out of sight: say nothing and let the last report lapse. "Hidden" can be wrong for a moment, so it never clears one.
-    if (dead || document.visibilityState === 'hidden') return;
+    const hidden = document.visibilityState === 'hidden';
+    // Out of sight and unasked: say nothing. Being hidden never clears a report; it only lapses.
+    if (dead || (hidden && !asked)) return Promise.resolve(false);
     const r = report({
       elements: () => all(document), styleOf: (el) => getComputedStyle(el), width: innerWidth, height: innerHeight,
       url: location.href, top: window === window.top, focused: focused(), ratio: devicePixelRatio,
       pinch: visualViewport?.scale ?? 1, filled,
     }, watcher);
+    if (hidden) r.hidden = true;
     // Which question this answers: a place is believed only if measured since the latest.
     if (heard) r.n = heard;
     const s = JSON.stringify(r);
     const matters = r.fields.length > 0 || r.typing || r.unplaced;
     const now = Date.now();
-    if (s !== last || (matters && now - sentAt >= REPEAT)) {
-      last = s;
-      sentAt = now;
-      try {
-        api.runtime.sendMessage({ type: 'page', ...r })?.catch?.(() => {});
-      } catch {
-        dead = true; // The extension was updated or removed underneath this page.
-      }
-    }
     clearTimeout(again);
-    if (matters) again = setTimeout(soon, REPEAT);
+    if (matters && !hidden) again = setTimeout(soon, REPEAT);
+    if (!asked && s === last && !(matters && now - sentAt >= REPEAT)) return Promise.resolve(false);
+    last = s;
+    sentAt = now;
+    try {
+      return Promise.resolve(api.runtime.sendMessage({ type: 'page', ...r })).then(() => true, () => false);
+    } catch {
+      dead = true; // The extension was updated or removed underneath this page.
+      return Promise.resolve(false);
+    }
   }
   function soon() {
     if (!timer && !dead) timer = setTimeout(look, SOON);
@@ -70,13 +73,13 @@
   new MutationObserver(soon).observe(document, { subtree: true, childList: true, attributes: true, attributeFilter: ['type', 'style', 'class', 'hidden', 'name', 'id', 'autocomplete', 'src'] });
   for (const e of ['scroll', 'resize', 'focusin', 'focusout', 'input', 'change', 'load', 'transitionend', 'animationstart']) addEventListener(e, soon, { capture: true, passive: true });
   visualViewport?.addEventListener('resize', soon);
-  // The app asks just before and just after each picture.
+  // The app asks just before and just after each picture. The answer is "my report is sent", never just "I heard".
   api.runtime.onMessage.addListener((m, sender, reply) => {
     if (m?.type !== 'measure' || sender.id !== api.runtime.id || !Number.isSafeInteger(m.n)) return;
     heard = Math.max(heard, m.n);
     clearTimeout(timer);
-    look();
-    reply(true);
+    look(true).then(reply);
+    return true;
   });
   let was = document.visibilityState;
   document.addEventListener('visibilitychange', (e) => {
@@ -86,7 +89,7 @@
     if (!back) return;
     last = ''; // Back in sight: report at once, even if nothing changed.
     clearTimeout(timer);
-    look();
+    void look();
   });
   soon();
 })();

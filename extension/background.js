@@ -36,17 +36,20 @@ function send(m) {
     port = null;
   }
 }
-/** Every page that's showing measures itself; then the app hears that they have. */
+/** Every frame of every tab reports afresh; then the app hears that they have, and which frames still exist. */
 async function measure(n) {
   await tabs();
-  const list = await api.tabs.query({});
-  const slow = new Promise((r) => setTimeout(r, 400, 'slow'));
-  // Pages that can't run the script (settings, stores) have nothing to say and reject at once.
-  const all = Promise.all(list.filter((t) => t.id != null && !t.discarded).map((t) =>
-    api.tabs.sendMessage(t.id, { type: 'measure', n }).then(() => true, () => true)));
-  if ((await Promise.race([all, slow])) === 'slow') return; // No answer is an answer: the app skips the picture.
-  await new Promise((r) => setTimeout(r, 40)); // Frames inside pages report in the same breath.
-  send({ type: 'asked', n });
+  const list = (await api.tabs.query({})).filter((t) => t.id != null && !t.discarded);
+  const frames = (await Promise.all(list.map((t) =>
+    api.webNavigation.getAllFrames({ tabId: t.id }).then((f) => (f ?? []).map((x) => [t.id, x.frameId]), () => [])))).flat();
+  // A frame the script can't run in (settings, stores) rejects at once and has never said anything to go stale.
+  const all = Promise.all(frames.map(([tab, frame]) =>
+    api.tabs.sendMessage(tab, { type: 'measure', n }, { frameId: frame }).then((sent) => sent === true, () => false)));
+  const slow = new Promise((r) => setTimeout(r, 600, 'slow'));
+  // No answer is an answer: the app leaves this browser out of the picture.
+  if ((await Promise.race([all, slow])) === 'slow') return;
+  // The app holds any frame that reported before and stayed silent now against the whole browser.
+  send({ type: 'asked', n, live: frames.slice(0, 2000) });
 }
 async function tabs() {
   const list = await api.tabs.query({});
