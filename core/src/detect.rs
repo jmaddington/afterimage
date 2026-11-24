@@ -94,6 +94,7 @@ macro_rules! re {
 re!(SSN, r"\b\d{3}[\s\-\u{2010}-\u{2015}\u{2212}.]{1,3}\d{2}[\s\-\u{2010}-\u{2015}\u{2212}.]{1,3}\d{4}\b");
 re!(NINE, r"\b\d{9}\b");
 re!(DIGIT_RUN, r"\d(?:[\s\-\u{2010}-\u{2015}\u{2212}.]{0,2}\d){11,18}");
+re!(CARD_PREFIX, r"^(?:3[47]\d{13}|(?:4\d|5[1-5]|2[2-7]|6[05])\d{14})$");
 re!(CARD_GROUPS, r"\b\d{4}[\s\-.]{1,2}\d{4}[\s\-.]{1,2}\d{4}[\s\-.]{1,2}\d{1,7}\b|\b3[47]\d{2}[\s\-.]{1,2}\d{6}[\s\-.]{1,2}\d{5}\b");
 re!(IBAN, r"\b[A-Z]{2}\d{2}(?:\s?[A-Z0-9]{4}){2,7}(?:\s?[A-Z0-9]{1,4})?\b");
 re!(SSN_LABEL, r"(?i)\b(?:ssn|social\s+security|tax(?:payer)?\s*id|itin|tin)\b");
@@ -228,6 +229,8 @@ pub fn scan_text(text: &str, line: usize, hits: &mut Vec<Hit>) {
     if text.is_ascii() {
         return scan_latin(text, line, hits);
     }
+    // Both readings: looking through lookalikes may only ever add.
+    scan_latin(text, line, hits);
     let (t, at) = latinised(text);
     let mut found = Vec::new();
     scan_latin(&t, line, &mut found);
@@ -249,7 +252,9 @@ fn scan_latin(text: &str, line: usize, hits: &mut Vec<Hit>) {
     }
     for m in DIGIT_RUN.find_iter(text) {
         let d: String = m.as_str().chars().filter(char::is_ascii_digit).collect();
-        if (13..=19).contains(&d.len()) && luhn(&d) {
+        // A stray digit beside a card must not hide it; inside a longer run only real card shapes count.
+        let inside = [15, 16].into_iter().flat_map(|n| d.as_bytes().windows(n).filter_map(|w| std::str::from_utf8(w).ok())).any(|w| CARD_PREFIX.is_match(w) && luhn(w));
+        if (13..=19).contains(&d.len()) && luhn(&d) || inside {
             push(hits, line, m.range(), Financial);
         }
     }
@@ -334,7 +339,7 @@ pub fn scan(lines: &[TextLine]) -> Vec<Hit> {
         if PASS_LABEL.is_match(t) {
             for j in neighbours(lines, i) {
                 let v = &latin[j];
-                if plausible_value(v) && !PASS_LABEL.is_match(v) {
+                if (plausible_value(v) || plausible_value(&lines[j].text)) && !PASS_LABEL.is_match(v) {
                     push(&mut hits, j, 0..lines[j].text.len(), SecretKind::Password);
                 }
             }
@@ -438,30 +443,16 @@ pub fn scrub_url(raw: &str) -> String {
     mask_text(u.as_str())
 }
 
-// A path made of words ("/our-story/menu.html"): no digits, no mixed case, nothing long enough to be a token.
-re!(WORDY_PATH, r"^(?:/|(?:/(?:[a-z]{1,14}|[A-Z][a-z]{0,13})(?:[-_.](?:[a-z]{1,14}|[A-Z][a-z]{0,13}))*)+/?)$");
-re!(WORDY_PATH_CAPS, r"^(?:/[A-Z]{1,11}(?:[-_.][A-Z]{1,11})*)+/?$");
-/// Longest code payload that can still be an ordinary web address.
-const CODE_MAX: usize = 300;
+// The raw payload must be just a plain host and perhaps one everyday word. Judged as written, before any URL parser
+// can tidy away "..", "@" or a trailing "?".
+re!(PLAIN_ADDRESS, r"(?i)^https?://[a-z][a-z-]{0,17}(?:\.[a-z][a-z-]{0,17}){1,3}(?:/(?:menu|about|home|contact|info|app|apps|download|help|support|events|careers|jobs|news|map|hours|shop|store|wifi|feedback|survey|welcome))?/?$");
 
 /// Deny by default: a code stays visible only when it is a bare web address carrying nothing private.
 /// AIDEV-NOTE: privacy-critical. Codes hold 2FA seeds, Wi-Fi keys, login tokens; OCR can't see any of them.
 fn code_is_harmless(payload: &str) -> bool {
-    if payload.len() > CODE_MAX || payload.chars().any(|c| c.is_control() || c.is_whitespace()) {
-        return false;
-    }
-    let Ok(u) = url::Url::parse(payload) else { return false };
     let mut found = Vec::new();
     scan_text(payload, 0, &mut found);
-    matches!(u.scheme(), "http" | "https")
-        && u.username().is_empty()
-        && u.password().is_none()
-        && u.query().is_none()
-        && u.fragment().is_none()
-        && u.port().is_none()
-        && (WORDY_PATH.is_match(u.path()) || WORDY_PATH_CAPS.is_match(u.path()))
-        && u.host_str().is_some_and(|h| h.split('.').all(|l| l.len() <= 18))
-        && found.is_empty()
+    PLAIN_ADDRESS.is_match(payload) && found.is_empty()
 }
 
 /// The secrets inside a code's payload, as they might also be shown as text ("or type this key instead").
@@ -497,8 +488,8 @@ fn latin(c: char) -> char {
     if matches!(c, '\u{ff01}'..='\u{ff5e}') {
         return char::from_u32(c as u32 - 0xfee0).unwrap_or(c);
     }
-    const FROM: &str = "АВЕЅІЈКМНОРСТХУЗЬаеѕіјкморсхуһԁΑΒΕΖΗΙΚΜΝΟΡΤΥΧοκν";
-    const TO: &str = "ABESIJKMHOPCTXY3baesijkmopcxyhdABEZHIKMNOPTYXokv";
+    const FROM: &str = "АВЕЅІЈКМНОРСТХУЬаеѕіјкморсхуһԁΑΒΕΖΗΙΚΜΝΟΡΤΥΧοκν";
+    const TO: &str = "ABESIJKMHOPCTXYbaesijkmopcxyhdABEZHIKMNOPTYXokv";
     if c.is_ascii() { c } else { FROM.chars().position(|f| f == c).map_or(c, |i| TO.as_bytes()[i] as char) }
 }
 
@@ -518,6 +509,7 @@ fn latinised(text: &str) -> (String, Vec<usize>) {
 /// Case, spacing and the letters OCR confuses don't make it a different secret.
 fn fold(c: char) -> char {
     match c {
+        '\u{0437}' => '3', // Cyrillic ze; a letter, so only a twin of the digit when hunting a known value.
         'o' => '0',
         'l' | 'i' | '|' => '1',
         's' => '5',
@@ -537,13 +529,16 @@ pub fn find_secret(lines: &[TextLine], value: &str) -> Vec<(usize, Range<usize>)
     let needle: Vec<char> = folded(value).map(|x| x.0).collect();
     let mut out: Vec<(usize, Range<usize>)> = Vec::new();
     if needle.len() < 6 {
-        // Too short to match loosely: verbatim, as a word of its own.
-        let v = value.trim();
+        // Too short to match loosely: as a word of its own, spacing and all.
+        let v = latinised(value.trim()).0.to_ascii_lowercase();
         let word = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
         for (i, l) in lines.iter().enumerate().filter(|_| v.chars().any(char::is_alphanumeric)) {
-            for (s, m) in l.text.match_indices(v) {
-                if !word(l.text[..s].chars().next_back()) && !word(l.text[s + m.len()..].chars().next()) {
-                    out.push((i, s..s + m.len()));
+            let (t, at) = latinised(&l.text);
+            let t = t.to_ascii_lowercase();
+            for (s, m) in t.match_indices(v.as_str()) {
+                let e = s + m.len();
+                if !word(t[..s].chars().next_back()) && !word(t[e..].chars().next()) {
+                    out.push((i, at[s]..at[e]));
                 }
             }
         }
@@ -722,7 +717,7 @@ mod tests {
             assert!(!scan(&[code(t)]).is_empty(), "{t}");
         }
         assert!(!scan(&[code(&format!("https://x.com/{}", "a/".repeat(400)))]).is_empty());
-        for t in ["https://example.com/menu", "http://example.com", "HTTPS://EXAMPLE.COM/MENU", "https://www.example.co.uk/our-story/Opening_Hours.html"] {
+        for t in ["https://example.com/menu", "http://example.com", "HTTPS://EXAMPLE.COM/MENU"] {
             assert_eq!(scan(&[code(t)]), vec![], "{t}");
         }
         // The same characters as ordinary text aren't a code.
@@ -804,5 +799,47 @@ mod tests {
         assert!(scan(&l).iter().any(|x| x.line == 1 && x.range == (0..l[1].text.len())));
         let found = find_secret(&[line("type JBSW Y3DP ЕНРК ЗРХР", 0.1, 0.1)], "JBSWY3DPEHPK3PXP");
         assert_eq!(found, vec![(0, 5.."type JBSW Y3DP ЕНРК ЗРХР".len())]);
+    }
+
+    #[test]
+    fn looking_through_lookalikes_only_ever_adds() {
+        for (t, secret) in [
+            ("password: hunter2（旧）", "hunter2"),
+            ("password: abc；def9", "abc"),
+            ("З4111111111111111", "4111111111111111"),
+            ("4111111111111111З", "4111111111111111"),
+            ("password： ｈｕｎｔｅｒ２", "ｈｕｎｔｅｒ２"),
+        ] {
+            assert!(!masked(t).contains(secret), "{t}: {}", masked(t));
+        }
+        for v in ["hunter2（旧）", "hunter2；x"] {
+            let l = vec![line("Password", 0.1, 0.10), line(v, 0.1, 0.14)];
+            assert!(scan(&l).iter().any(|x| x.line == 1), "{v}");
+        }
+    }
+
+    #[test]
+    fn a_card_inside_a_longer_run_is_found() {
+        for t in ["9 4111111111111111", "41111111111111117", "ref 378282246310005 2"] {
+            assert!(masked(t).contains("[hidden]"), "{t}");
+        }
+        assert_eq!(masked("at 1790512345678"), "at 1790512345678");
+    }
+
+    #[test]
+    fn short_secrets_match_through_lookalikes() {
+        assert_eq!(find_secret(&[line("pin КЕУ9 ok", 0.1, 0.1)], "key9"), vec![(0, 4..4 + "КЕУ9".len())]);
+        assert_eq!(find_secret(&[line("XKEY9", 0.1, 0.1)], "key9"), vec![]);
+    }
+
+    #[test]
+    fn code_addresses_are_judged_as_written() {
+        for t in ["https://x.com/a/../menu", "https://x.com/./menu", "https://x.com\\menu", "https:x.com/menu", "https://@x.com/menu", "https://x.com/?", "https://x.com/#",
+                  "https://x.com/correct-horse-battery", "https://x.com/kqzvxwpt", "https://x.com/menu/kqzv", "https://a.b.c.d.e.com/", "https://x7.com/", "https://аррӏе.com/", "https://x.com:443/"] {
+            assert!(!scan(&[code(t)]).is_empty(), "{t}");
+        }
+        for t in ["https://example.com", "https://www.example.co.uk/Menu/", "HTTP://EXAMPLE.COM/ABOUT"] {
+            assert_eq!(scan(&[code(t)]), vec![], "{t}");
+        }
     }
 }

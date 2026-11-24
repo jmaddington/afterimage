@@ -208,6 +208,13 @@ const WRAPPERS: &[&str] = &["view-source", "blob", "feed", "chrome-distiller", "
 const MAX_LAYERS: usize = 32;
 const MAX_DECODES: usize = 6;
 const MAX_ADDRESS: usize = 16_384;
+const MAX_FOUND: usize = 256;
+
+/// Parse the address starting here; only its first stretch matters to any rule.
+fn address(s: &str) -> Option<url::Url> {
+    let end = s.char_indices().map(|x| x.0).find(|i| *i >= 2048).unwrap_or(s.len());
+    url::Url::parse(&s[..end]).ok()
+}
 
 /// This address and every address it carries inside, plain or percent-encoded. A wrapper can add suspicion, never
 /// remove it. False when there was too much to look through; what was found is still returned and must be checked.
@@ -231,11 +238,16 @@ fn layers(u: &url::Url) -> (Vec<url::Url>, bool) {
             complete = false;
             continue;
         }
-        let mut found: Vec<url::Url> = u.query_pairs().filter_map(|(_, v)| url::Url::parse(&v).ok()).collect();
+        let mut found: Vec<url::Url> = u.query_pairs().filter_map(|(_, v)| address(&v)).take(MAX_FOUND + 1).collect();
         for n in 0.. {
-            found.extend(url::Url::parse(&rest));
+            found.extend(address(&rest));
             for mark in ["https://", "http://"] {
-                found.extend(rest.match_indices(mark).filter_map(|(at, _)| url::Url::parse(&rest[at..]).ok()));
+                found.extend(rest.match_indices(mark).take(MAX_FOUND + 1).filter_map(|(at, _)| address(&rest[at..])));
+            }
+            if out.len() + found.len() > MAX_FOUND {
+                found.truncate(MAX_FOUND);
+                complete = false;
+                break;
             }
             let next = percent_encoding::percent_decode_str(&rest).decode_utf8_lossy().to_lowercase();
             if next == rest {
@@ -364,6 +376,7 @@ pub fn hide_browser(ex: &Exclusions, bundle_id: &str, windows: Option<Vec<Browse
             };
             let (all, complete) = layers(&u);
             // Built to evade: hidden whenever any rule might have applied, whatever the unreadable setting says.
+            unreadable |= !complete;
             evasive |= !complete && (ex.password_managers || !rules.is_empty());
             if ex.password_managers && all.iter().any(|u| manager_url(u, w.title.as_deref().unwrap_or(""))) {
                 return Some(HideReason::PasswordManager);
@@ -699,5 +712,24 @@ mod tests {
         assert_eq!(hid(&lax(&["chase.com"]), &u), Some(HideReason::Unreadable));
         assert_eq!(hid(&Exclusions { password_managers: true, ..lax(&[]) }, &u), Some(HideReason::Unreadable));
         assert_eq!(hid(&Exclusions { password_managers: false, ..lax(&[]) }, &u), None);
+    }
+
+    #[test]
+    fn too_much_to_check_counts_as_unreadable() {
+        let mut deep = "%41".to_owned();
+        for _ in 0..12 {
+            deep = deep.replace('%', "%25");
+        }
+        let u = format!("chrome-extension://cjpalhdlnbpafiamejdnhcphjbkeiagm/v#{deep}");
+        assert_eq!(hid(&Exclusions { password_managers: false, ..sites(&[]) }, &u), Some(HideReason::Unreadable));
+    }
+
+    #[test]
+    fn nested_addresses_are_bounded() {
+        let t = std::time::Instant::now();
+        let many: String = (0..1200).map(|i| format!("http://{i}.a/")).collect();
+        let u = format!("chrome-extension://cjpalhdlnbpafiamejdnhcphjbkeiagm/v#{many}");
+        assert!(hid(&sites(&["chase.com"]), &u).is_some());
+        assert!(t.elapsed().as_millis() < 300, "{:?}", t.elapsed());
     }
 }
