@@ -82,8 +82,10 @@ still waiting in memory.
 
 ## Browser extension
 
-The extension tells the app where secret fields are on a page, including ones inside frames, so that only those
-are frosted. It reports positions and kinds, never what is typed, and only to the app on the same Mac.
+The extension tells the app where password, card and account fields are on a page, so that only those are frosted
+and the rest of the page stays readable. When it can't say exactly where one is (inside an embedded frame, for
+example), the whole browser is left out of that picture. It reports positions and kinds, never what is typed, and
+only to the app on the same Mac.
 
 It ships inside the app and is not yet in the browser stores:
 
