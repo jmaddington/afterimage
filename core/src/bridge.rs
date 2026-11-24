@@ -17,10 +17,12 @@ const MAX_LINE: u64 = 1 << 20;
 const MAX_CONNECTIONS: usize = 16;
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Event {
-    /// Browser process id, connection, message.
-    Message(i32, u64, String),
-    Gone(i32, u64),
+pub struct Event {
+    /// The browser's process id.
+    pub pid: i32,
+    /// Which connection; one browser can have several (a bridge per profile).
+    pub source: u64,
+    pub message: String,
 }
 
 /// One native-messaging message as a single line; "null" if it wasn't JSON. None at a clean end.
@@ -32,7 +34,8 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Option<String>> {
     }
     let len = u32::from_ne_bytes(len);
     if len > MAX_FRAME {
-        return Err(io::ErrorKind::InvalidData.into());
+        let skipped = io::copy(&mut r.take(len as u64), &mut io::sink())?;
+        return if skipped == len as u64 { Ok(Some("null".into())) } else { Err(io::ErrorKind::UnexpectedEof.into()) };
     }
     let mut body = vec![0; len as usize];
     r.read_exact(&mut body)?;
@@ -95,16 +98,14 @@ fn serve(s: UnixStream, id: u64, heard: &dyn Fn(Event)) {
     let Some(Some(hello)) = line() else { return };
     let pid = serde_json::from_str::<Value>(&hello).ok().and_then(|v| v.get("pid")?.as_i64()).and_then(|p| i32::try_from(p).ok()).filter(|p| *p > 0);
     let Some(pid) = pid else { return };
+    // AIDEV-NOTE: hanging up clears nothing. What was last said stands until it goes stale.
     while let Some(l) = line() {
-        match l {
-            Some(l) => heard(Event::Message(pid, id, l)),
-            None => {
-                heard(Event::Message(pid, id, "null".into()));
-                break;
-            }
+        let end = l.is_none();
+        heard(Event { pid, source: id, message: l.unwrap_or_else(|| "null".into()) });
+        if end {
+            break;
         }
     }
-    heard(Event::Gone(pid, id));
 }
 
 #[cfg(test)]
@@ -133,7 +134,12 @@ mod tests {
         // Not JSON: the app should hear that something was wrong.
         assert_eq!(read_frame(&mut Cursor::new(frame("not json\nat all"))).unwrap().as_deref(), Some("null"));
         assert_eq!(read_frame(&mut Cursor::new([4u32.to_ne_bytes().as_slice(), &[0xff, 0xfe, 0xff, 0xff]].concat())).unwrap().as_deref(), Some("null"));
-        // Absurd or cut short: there's no telling where the next one starts.
+        // Too long to be honest: heard as nonsense, and the next one still arrives.
+        let long = format!("\"{}\"", "a".repeat(2 << 20));
+        let mut c = Cursor::new([frame(&long), frame("{}")].concat());
+        assert_eq!(read_frame(&mut c).unwrap().as_deref(), Some("null"));
+        assert_eq!(read_frame(&mut c).unwrap().as_deref(), Some("{}"));
+        // Cut short: there's no telling where the next one starts.
         assert!(read_frame(&mut Cursor::new(u32::MAX.to_ne_bytes().to_vec())).is_err());
         assert!(read_frame(&mut Cursor::new(frame("{}")[..5].to_vec())).is_err());
         assert!(read_frame(&mut Cursor::new(vec![1, 0])).is_err());
@@ -151,11 +157,10 @@ mod tests {
         forward(&mut Cursor::new(input), &path, 4242).unwrap();
         let mut got = vec![];
         while let Ok(e) = rx.recv_timeout(Duration::from_secs(2)) {
-            let end = matches!(e, Event::Gone(..));
             got.push(e);
-            if end { break; }
+            if got.len() == 2 { break; }
         }
-        assert_eq!(got, vec![Event::Message(4242, 0, r#"{"v":1}"#.into()), Event::Message(4242, 0, "null".into()), Event::Gone(4242, 0)]);
+        assert_eq!(got, vec![Event { pid: 4242, source: 0, message: r#"{"v":1}"#.into() }, Event { pid: 4242, source: 0, message: "null".into() }]);
     }
 
     #[test]
@@ -186,9 +191,8 @@ mod tests {
         for _ in 0..4 {
             if s.write_all(&junk).is_err() { break; }
         }
-        // Heard as nonsense, then gone.
-        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), Event::Message(9, 0, "null".into()));
-        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), Event::Gone(9, 0));
+        // Heard as nonsense.
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), Event { pid: 9, source: 0, message: "null".into() });
     }
 
     #[test]

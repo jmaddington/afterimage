@@ -201,10 +201,7 @@ impl Engine {
     /// Hear from the browser extension, if it's there. Its absence changes nothing.
     pub fn listen_for_pages(&self) -> bool {
         let s = self.s.clone();
-        let heard = move |e| match e {
-            bridge::Event::Message(pid, id, m) => lock(&s.pages).receive(pid, id, &m, Instant::now()),
-            bridge::Event::Gone(pid, id) => lock(&s.pages).gone(pid, id),
-        };
+        let heard = move |e: bridge::Event| lock(&s.pages).receive(e.pid, e.source, &e.message, Instant::now());
         match bridge::listen(&self.s.root.join("bridge.sock"), heard) {
             Ok(()) => true,
             Err(e) => {

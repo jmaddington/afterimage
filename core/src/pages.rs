@@ -144,20 +144,13 @@ impl Pages {
         }
     }
 
-    /// That connection hung up.
-    pub fn gone(&mut self, pid: i32, source: u64) {
-        self.browsers.remove(&(pid, source));
-    }
-
     pub fn hint(&self, pid: i32, now: Instant) -> PageHint {
         let mut h = PageHint { sensitive: self.crowded.is_some_and(|at| fresh(at, now)), ..Default::default() };
         for b in self.browsers.iter().filter(|((p, _), _)| *p == pid).map(|x| x.1) {
             let tabs = b.tabs_at.filter(|at| fresh(*at, now)).map(|_| &b.tabs);
-            // Only a tab known to be in the background is ignored.
-            let showing = |tab: i64| tabs.and_then(|t| t.get(&tab)).is_none_or(|t| t.active);
             h.private_window |= tabs.is_some_and(|t| t.values().any(|t| t.active && t.private));
             h.sensitive |= b.muddled.is_some_and(|at| fresh(at, now));
-            for f in b.frames.iter().filter(|((tab, _), f)| fresh(f.at, now) && showing(*tab)).map(|x| x.1) {
+            for f in b.frames.values().filter(|f| fresh(f.at, now)) {
                 h.sensitive |= f.sensitive;
                 h.fields.extend(f.fields.iter().cloned());
             }
@@ -225,21 +218,15 @@ mod tests {
         assert_eq!(p.hint(7, t + at(13)), PageHint::default());
     }
 
+    /// In a split view a tab can be on screen without being "active". The page itself says when it's hidden.
     #[test]
-    fn only_showing_tabs_count_but_unknown_ones_do_too() {
-        let tabs = |active| format!(r#"{{"v":1,"type":"tabs","tabs":[{{"tab":3,"window":1,"active":{active},"private":false}}]}}"#);
+    fn a_tab_called_inactive_still_counts() {
         let (mut p, t) = (Pages::default(), Instant::now());
         p.receive(7, 1, &page(3, FIELD), t);
-        p.receive(7, 1, &tabs(false), t);
-        assert_eq!(p.hint(7, t).fields.len(), 0);
-        p.receive(7, 1, &tabs(true), t);
+        p.receive(7, 1, r#"{"v":1,"type":"tabs","tabs":[{"tab":3,"window":1,"active":false,"private":false}]}"#, t);
         assert_eq!(p.hint(7, t).fields.len(), 1);
-        // A tab the snapshot doesn't mention, and a snapshot too old to trust.
-        p.receive(7, 1, &page(4, FIELD), t);
-        p.receive(7, 1, &tabs(false), t);
-        assert_eq!(p.hint(7, t).fields.iter().map(|f| f.tab).collect::<Vec<_>>(), vec![4]);
-        p.receive(7, 1, &page(3, FIELD), t + at(13));
-        assert_eq!(p.hint(7, t + at(13)).fields.len(), 1);
+        p.receive(7, 1, &page(3, CLEAN), t);
+        assert_eq!(p.hint(7, t), PageHint::default());
     }
 
     #[test]
@@ -296,8 +283,6 @@ mod tests {
         // And it recovers.
         p.receive(7, 1, &page(1, FIELD), t + at(30));
         assert!(!p.hint(7, t + at(30)).sensitive);
-        p.gone(7, 1);
-        assert_eq!(p.hint(7, t + at(30)), PageHint::default());
     }
 
     /// Two Chrome profiles share one process but speak through two bridges.
@@ -310,9 +295,8 @@ mod tests {
         p.receive(7, 2, &tabs(4, false), t);
         assert!(p.hint(7, t).private_window);
         assert_eq!(p.hint(7, t).fields.len(), 1);
-        p.gone(7, 2);
-        assert!(p.hint(7, t).private_window);
-        p.gone(7, 1);
-        assert_eq!(p.hint(7, t), PageHint::default());
+        // Hanging up proves nothing about what's on screen; only time does.
+        assert!(p.hint(7, t + at(11)).private_window);
+        assert_eq!(p.hint(7, t + at(13)), PageHint::default());
     }
 }

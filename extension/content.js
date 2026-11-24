@@ -30,8 +30,9 @@
 
   function look() {
     timer = 0;
-    if (dead || document.visibilityState === 'hidden') return;
-    const r = report({
+    if (dead) return;
+    // Out of sight: say so once, so nothing stale is held against whatever shows next.
+    const r = document.visibilityState === 'hidden' ? { v: 1, url: '', top: window === window.top, fields: [], typing: false, unplaced: false } : report({
       elements: () => all(document), styleOf: (el) => getComputedStyle(el), width: innerWidth, height: innerHeight,
       url: location.href, top: window === window.top, focused: focused(),
     }, watcher);

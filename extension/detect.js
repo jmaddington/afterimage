@@ -52,7 +52,7 @@ export class Watcher {
 export function cleanAddress(raw) {
   try {
     const u = new URL(raw);
-    return /^https?:$/.test(u.protocol) ? `${u.origin}${u.pathname}` : u.protocol;
+    return /^https?:$/.test(u.protocol) ? `${u.origin}${u.pathname}`.slice(0, 2048) : u.protocol;
   } catch {
     return '';
   }
