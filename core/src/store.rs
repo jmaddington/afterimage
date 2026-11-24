@@ -434,7 +434,8 @@ impl Store {
             let gone: std::collections::HashSet<i64> = out.iter().copied().collect();
             let mut st = self.db.prepare("SELECT id,bytes,kept FROM shots ORDER BY taken_at")?;
             let rows: Vec<(i64, i64, bool)> = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Res<_>>()?;
-            let mut total: i64 = rows.iter().filter(|r| !gone.contains(&r.0)).map(|r| r.1).sum();
+            // Kept pictures are never removed, so they aren't counted: otherwise enough of them would cost every new one.
+            let mut total: i64 = rows.iter().filter(|r| !gone.contains(&r.0) && !r.2).map(|r| r.1).sum();
             for (id, b, kept) in rows {
                 if total <= max_bytes as i64 {
                     break;
@@ -545,7 +546,9 @@ mod tests {
         s.set_kept(&ids[..1], true).unwrap();
         let now = 5 * day;
         assert_eq!(s.expired(now, 2, 0).unwrap(), vec![ids[1]]);
-        assert_eq!(s.expired(now, 0, 250).unwrap(), vec![ids[1], ids[2]]);
+        // 300 bytes can go; the kept 100 are outside the budget.
+        assert_eq!(s.expired(now, 0, 250).unwrap(), vec![ids[1]]);
+        assert_eq!(s.expired(now, 0, 150).unwrap(), vec![ids[1], ids[2]]);
         assert_eq!(s.expired(now, 0, 0).unwrap(), Vec::<i64>::new());
     }
 
@@ -603,5 +606,18 @@ mod tests {
         assert_eq!(s.dev_list(100, None).unwrap().len(), 8);
         s.dev_trim(now, 7, 3).unwrap();
         assert_eq!(s.dev_list(100, None).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn kept_pictures_over_the_limit_do_not_cost_every_new_one() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = Store::open(d.path()).unwrap();
+        let mut mk = |at: i64, bytes: u64| s.insert(&NewShot { moment: Moment { taken_at: at, ..Default::default() }, path: format!("Shots/{at}"), thumb_path: format!("Shots/{at}t"), width: 1, height: 1, bytes, regions: vec![], lines: vec![], ai_checked: true }).unwrap();
+        let (a, b, c, e) = (mk(1, 100), mk(2, 100), mk(3, 10), mk(4, 60));
+        s.set_kept(&[a, b], true).unwrap();
+        // Kept ones are outside the budget: only what can be removed is counted against it.
+        assert_eq!(s.expired(10, 0, 150).unwrap(), Vec::<i64>::new());
+        assert_eq!(s.expired(10, 0, 65).unwrap(), vec![c]);
+        let _ = e;
     }
 }

@@ -373,8 +373,15 @@ impl Engine {
 
     /// Delete a span of time, including frames still waiting in memory. Kept shots go too: the person asked.
     pub fn forget(&self, from: i64, to: i64) -> Result<u64, EngineError> {
+        // Forgetting reaches back, never forward: "everything" means everything so far. Otherwise nothing could
+        // be saved again until the app was reopened.
+        let to = to.min(now_ms() + 1);
         // Order matters: mark first, so a frame mid-flight is refused at insert time.
-        lock(&self.s.forgotten).push((from, to));
+        let mut f = lock(&self.s.forgotten);
+        // Old ranges only matter while a frame from then could still be in flight.
+        f.retain(|(_, end)| *end > now_ms() - 600_000);
+        f.push((from, to));
+        drop(f);
         lock(&self.s.queue).frames.retain(|f| !(from..to).contains(&f.moment.taken_at));
         let store = lock(&self.s.store);
         store.dev_forget(from, to)?;
@@ -1289,6 +1296,18 @@ mod tests {
         assert!(!all.contains("quartz"), "{all}");
         let log = e.dev_log(50, None).unwrap();
         assert!(log.iter().filter(|x| x.kind == "check").count() >= 2 && log.iter().all(|x| x.kind != "check" || x.request.is_empty() && x.response.is_empty()), "{log:?}");
+        e.shutdown();
+    }
+
+    // ---- outside review 2026-11-24 ----
+    #[test]
+    fn forgetting_everything_does_not_stop_what_comes_after() {
+        let d = tempfile::tempdir().unwrap();
+        let e = Engine::new(d.path().to_string_lossy().into(), config(false), Arc::new(FakeHost(Default::default()))).unwrap();
+        e.forget(i64::MIN, i64::MAX).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        e.ingest(frame(now_ms()));
+        wait(|| e.stats().unwrap().count == 1);
         e.shutdown();
     }
 }

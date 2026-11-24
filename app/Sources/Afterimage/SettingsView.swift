@@ -222,7 +222,7 @@ private struct StorageSettings: View {
                     Text("100 GB").tag(100)
                     Text("No limit").tag(0)
                 }
-            } footer: { Text("The oldest go first. Pictures you keep are never removed automatically.").foregroundStyle(.secondary) }
+            } footer: { Text("The oldest go first. Pictures you keep are never removed automatically and don’t count toward the limit.").foregroundStyle(.secondary) }
             Section {
                 Button("Forget Everything…", role: .destructive) { model.confirmForget = .init(title: "everything", seconds: nil); NSApp.activate() }
             }
