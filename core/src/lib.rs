@@ -130,7 +130,8 @@ pub struct Status {
 
 /// A request to forget a span of time.
 /// AIDEV-NOTE: privacy-critical. Frames are refused by arrival number, never by the clock: anything that arrived
-/// AIDEV-NOTE: before the request and falls in its span is refused, however its timestamp compares with "now".
+/// AIDEV-NOTE: before the request and falls in its span is refused, however its timestamp compares with "now"; so is
+/// AIDEV-NOTE: anything taken before the request that arrives after it.
 struct Forgot {
     from: i64,
     to: i64,
@@ -394,10 +395,14 @@ impl Engine {
         // Order matters: mark first, so a frame mid-flight is refused at insert time.
         let mut q = lock(&self.s.queue);
         let mut f = lock(&self.s.forgotten);
-        // A request only matters while something that arrived before it is still waiting or being checked.
-        let oldest = q.in_hand.or(q.frames.front().map(|x| x.0)).unwrap_or(u64::MAX);
-        f.retain(|x| x.upto >= oldest);
         f.push(Forgot { from, to, upto: q.arrived, asked: now_ms() });
+        // Kept for as long as the app runs: a picture taken before a request can still be on its way here. Too many,
+        // and the two oldest become one that covers both.
+        while f.len() > 64 {
+            let b = f.remove(1);
+            let a = &mut f[0];
+            *a = Forgot { from: a.from.min(b.from), to: a.to.max(b.to), upto: a.upto.max(b.upto), asked: a.asked.max(b.asked) };
+        }
         drop(f);
         q.frames.retain(|(_, f)| !(from..to).contains(&f.moment.taken_at));
         drop(q);
@@ -731,7 +736,7 @@ impl Shared {
         };
         let mut store = lock(&self.store);
         let at = m.taken_at;
-        if lock(&self.forgotten).iter().any(|x| arrived <= x.upto && (x.from..x.to).contains(&at)) {
+        if lock(&self.forgotten).iter().any(|x| (x.from..x.to).contains(&at) && (arrived <= x.upto || at <= x.asked)) {
             drop(store);
             remove();
             return Ok(None);
@@ -1335,13 +1340,19 @@ mod tests {
             e.forget(i64::MIN, i64::MAX).unwrap();
         }
         assert_eq!(e.stats().unwrap().count, 0);
-        assert!(lock(&e.s.forgotten).len() <= 2);
+        assert!(lock(&e.s.forgotten).len() <= 64);
         // A frame already waiting, stamped ahead of the clock, is refused by a forgetting that covers it...
         e.set_config(config(true));
         e.ingest(frame(now_ms() + 60_000));
         e.forget(i64::MIN, i64::MAX).unwrap();
         e.set_config(config(false));
         std::thread::sleep(Duration::from_secs(4));
+        assert_eq!(e.stats().unwrap().count, 0);
+        // A picture taken before the request but still being read when it was made arrives afterwards: refused too.
+        let before = now_ms() - 2_000;
+        e.forget(before - 1_000, i64::MAX).unwrap();
+        e.ingest(frame(before));
+        std::thread::sleep(Duration::from_secs(2));
         assert_eq!(e.stats().unwrap().count, 0);
         // ...and one that arrives afterwards with the same stamp is kept.
         e.ingest(frame(now_ms() + 60_000));
