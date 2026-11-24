@@ -83,6 +83,8 @@ pub struct Hit {
     pub line: usize,
     pub range: Range<usize>,
     pub kind: SecretKind,
+    /// What found it: a rule's name, "model", "extension"... Never the secret.
+    pub why: &'static str,
 }
 
 macro_rules! re {
@@ -218,9 +220,9 @@ fn neighbours(lines: &[TextLine], i: usize) -> Vec<usize> {
     right.into_iter().chain(below).map(|(_, j)| j).collect()
 }
 
-fn push(hits: &mut Vec<Hit>, line: usize, range: Range<usize>, kind: SecretKind) {
+fn push(hits: &mut Vec<Hit>, line: usize, range: Range<usize>, kind: SecretKind, why: &'static str) {
     if range.start < range.end {
-        hits.push(Hit { line, range, kind });
+        hits.push(Hit { line, range, kind, why });
     }
 }
 
@@ -242,27 +244,27 @@ pub fn scan_text(text: &str, line: usize, hits: &mut Vec<Hit>) {
 fn scan_latin(text: &str, line: usize, hits: &mut Vec<Hit>) {
     use SecretKind::*;
     for m in SSN.find_iter(text) {
-        push(hits, line, m.range(), Ssn);
+        push(hits, line, m.range(), Ssn, "ssn");
     }
     if SSN_LABEL.is_match(text) {
         for m in NINE.find_iter(text) {
-            push(hits, line, m.range(), Ssn);
+            push(hits, line, m.range(), Ssn, "ssn");
         }
     }
     for m in CARD_GROUPS.find_iter(text) {
-        push(hits, line, m.range(), Financial);
+        push(hits, line, m.range(), Financial, "card");
     }
     for m in DIGIT_RUN.find_iter(text) {
         let (at, d): (Vec<usize>, String) = m.as_str().char_indices().filter(|x| x.1.is_ascii_digit()).unzip();
         if (13..=19).contains(&d.len()) && luhn(&d) {
-            push(hits, line, m.range(), Financial);
+            push(hits, line, m.range(), Financial, "card");
         }
         // A stray digit beside a card must not hide it; inside a longer run only real card shapes count.
         for n in [15, 16] {
             for i in 0..(d.len() + 1).saturating_sub(n) {
                 let w = &d[i..i + n];
                 if CARD_PREFIX.is_match(w) && luhn(w) {
-                    push(hits, line, m.start() + at[i]..m.start() + at[i + n - 1] + 1, Financial);
+                    push(hits, line, m.start() + at[i]..m.start() + at[i + n - 1] + 1, Financial, "card");
                 }
             }
         }
@@ -270,19 +272,19 @@ fn scan_latin(text: &str, line: usize, hits: &mut Vec<Hit>) {
     for m in IBAN.find_iter(text) {
         let compact: String = m.as_str().split_whitespace().collect();
         if compact.len() >= 15 && compact.chars().filter(char::is_ascii_digit).count() >= 8 {
-            push(hits, line, m.range(), Financial);
+            push(hits, line, m.range(), Financial, "iban");
         }
     }
     if let Some(label) = FIN_LABEL.find(text) {
         // "Order number 88213" has no financial label; "Account number 4417 2280 9931" does.
         if let Some(v) = FIN_VALUE.find_at(text, label.end()) {
             if v.start() - label.end() <= 24 && v.as_str().chars().filter(char::is_ascii_digit).count() >= 4 {
-                push(hits, line, v.range(), Financial);
+                push(hits, line, v.range(), Financial, "account");
             }
         }
     }
     for c in CVV.captures_iter(text) {
-        push(hits, line, c.get(1).unwrap().range(), Financial);
+        push(hits, line, c.get(1).unwrap().range(), Financial, "cvv");
     }
     for c in ASSIGN.captures_iter(text) {
         let v = c.get(2).unwrap();
@@ -291,32 +293,32 @@ fn scan_latin(text: &str, line: usize, hits: &mut Vec<Hit>) {
             && !NOT_A_VALUE.is_match(v.as_str())
             && !CODE_EXPR.is_match(v.as_str())
         {
-            push(hits, line, v.range(), if c[1].to_lowercase().contains("pass") { Password } else { Key });
+            push(hits, line, v.range(), if c[1].to_lowercase().contains("pass") { Password } else { Key }, "assignment");
         }
     }
-    for re in [&*PASS_PHRASE, &*FLAG] {
+    for (re, why) in [(&*PASS_PHRASE, "phrase"), (&*FLAG, "flag")] {
         for c in re.captures_iter(text) {
             let v = c.get(1).unwrap();
             if plausible_value(v.as_str()) {
-                push(hits, line, v.range(), Password);
+                push(hits, line, v.range(), Password, why);
             }
         }
     }
     for c in BEARER.captures_iter(text) {
-        push(hits, line, c.get(1).unwrap().range(), Key);
+        push(hits, line, c.get(1).unwrap().range(), Key, "bearer");
     }
     for c in URL_CRED.captures_iter(text) {
-        push(hits, line, c.get(1).unwrap().range(), Password);
+        push(hits, line, c.get(1).unwrap().range(), Password, "url-login");
     }
     for m in QR_SECRET.find_iter(text) {
-        push(hits, line, m.range(), Key);
+        push(hits, line, m.range(), Key, "setup-code");
     }
     for m in KNOWN.find_iter(text) {
-        push(hits, line, m.range(), Key);
+        push(hits, line, m.range(), Key, "known-key");
     }
     for m in LONG_TOKEN.find_iter(text) {
         if looks_random(m.as_str()) {
-            push(hits, line, m.range(), Key);
+            push(hits, line, m.range(), Key, "random");
         }
     }
 }
@@ -330,7 +332,7 @@ pub fn scan(lines: &[TextLine]) -> Vec<Hit> {
         let t = &latin[i];
         if l.code {
             if !code_is_harmless(&l.text) {
-                hits.push(Hit { line: i, range: 0..l.text.len(), kind: SecretKind::Key });
+                hits.push(Hit { line: i, range: 0..l.text.len(), kind: SecretKind::Key, why: "code" });
             }
             continue;
         }
@@ -338,7 +340,7 @@ pub fn scan(lines: &[TextLine]) -> Vec<Hit> {
             in_pem = true;
         }
         if in_pem {
-            push(&mut hits, i, 0..l.text.len(), SecretKind::Key);
+            push(&mut hits, i, 0..l.text.len(), SecretKind::Key, "private-key");
         }
         if PEM_END.is_match(t) {
             in_pem = false;
@@ -349,7 +351,7 @@ pub fn scan(lines: &[TextLine]) -> Vec<Hit> {
             for j in neighbours(lines, i) {
                 let v = &latin[j];
                 if (plausible_value(v) || plausible_value(&lines[j].text)) && !PASS_LABEL.is_match(v) {
-                    push(&mut hits, j, 0..lines[j].text.len(), SecretKind::Password);
+                    push(&mut hits, j, 0..lines[j].text.len(), SecretKind::Password, "label");
                 }
             }
         }
@@ -357,7 +359,7 @@ pub fn scan(lines: &[TextLine]) -> Vec<Hit> {
             for j in neighbours(lines, i) {
                 let v = latin[j].trim();
                 if v.len() <= 4 && v.chars().all(|c| c.is_ascii_digit()) {
-                    push(&mut hits, j, 0..lines[j].text.len(), SecretKind::Financial);
+                    push(&mut hits, j, 0..lines[j].text.len(), SecretKind::Financial, "label");
                 }
             }
         }
@@ -370,9 +372,9 @@ pub fn scan(lines: &[TextLine]) -> Vec<Hit> {
                 let compact = v.chars().filter(|c| !c.is_whitespace()).count().max(1);
                 let mostly = digits * 10 >= compact * 6;
                 if ssn_label && digits >= 4 && digits <= 9 && mostly {
-                    push(&mut hits, j, 0..lines[j].text.len(), SecretKind::Ssn);
+                    push(&mut hits, j, 0..lines[j].text.len(), SecretKind::Ssn, "label");
                 } else if fin_label && (6..=24).contains(&digits) && mostly && !v.contains(['$', '€', '£', '/']) {
-                    push(&mut hits, j, 0..lines[j].text.len(), SecretKind::Financial);
+                    push(&mut hits, j, 0..lines[j].text.len(), SecretKind::Financial, "label");
                 }
             }
         }
@@ -401,8 +403,8 @@ pub fn extend_wrapped(lines: &[TextLine], hits: &mut Vec<Hit>) {
                     && o.text.chars().map(latin).any(|c| c.is_ascii_digit() || c.is_ascii_uppercase())
             });
             let Some((j, o)) = next else { break };
-            let h = Hit { line: j, range: 0..o.text.len(), kind: SecretKind::Key };
-            if hits.contains(&h) {
+            let h = Hit { line: j, range: 0..o.text.len(), kind: SecretKind::Key, why: "wrapped" };
+            if hits.iter().any(|x| x.line == j && x.range == h.range && x.why == "wrapped") {
                 break;
             }
             hits.push(h);
@@ -867,5 +869,24 @@ mod tests {
         for n in ["3530111333300000", "6200000000000005", "6445644564456445"] {
             assert!(masked(&format!("{n}9")).contains("[hidden]"), "{n}");
         }
+    }
+
+    #[test]
+    fn every_hit_says_why() {
+        let why = |t: &str| { let mut h = Vec::new(); scan_text(t, 0, &mut h); h.into_iter().map(|h| h.why).collect::<Vec<_>>() };
+        for (t, w) in [
+            ("SSN: 219-09-9999", "ssn"), ("Card 4111 1111 1111 1111", "card"), ("GB82 WEST 1234 5698 7654 32", "iban"), ("Account number: 4417 2280 9931", "account"),
+            ("CVV 737", "cvv"), ("DB_PASSWORD=correct-horse-9", "assignment"), ("my password is hunter2", "phrase"), ("curl --token Zx81qwerty", "flag"),
+            ("Authorization: Bearer abcdef1234567890abcd", "bearer"), ("postgres://app:s3cr3t!@db.local/x", "url-login"), ("WIFI:S:x;P:marmalade;;", "setup-code"),
+            ("ghp_abcdefghijklmnop1234", "known-key"), ("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "random"),
+        ] {
+            assert!(why(t).contains(&w), "{t}: {:?}", why(t));
+        }
+        let of = |l: &[TextLine], i: usize| scan(l).into_iter().find(|h| h.line == i).map(|h| h.why);
+        assert_eq!(of(&[line("Password", 0.1, 0.10), line("blue-heron-7", 0.1, 0.14)], 1), Some("label"));
+        assert_eq!(of(&[line("-----BEGIN RSA PRIVATE KEY-----", 0.1, 0.1), line("MIIabc", 0.1, 0.2)], 1), Some("private-key"));
+        assert_eq!(of(&[code("")], 0), Some("code"));
+        let l = vec![line("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0", 0.1, 0.10), line("9dGhpcyBpcyBub3Q0IHJlYWw", 0.1, 0.12)];
+        assert_eq!(scan(&l).into_iter().filter(|h| h.line == 1).map(|h| h.why).find(|w| *w == "wrapped"), Some("wrapped"));
     }
 }

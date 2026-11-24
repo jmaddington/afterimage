@@ -5,6 +5,7 @@
 
 pub mod bridge;
 mod detect;
+mod devlog;
 mod lm;
 pub mod pages;
 mod privacy;
@@ -102,6 +103,9 @@ pub struct Config {
     pub max_age_days: u32,
     pub max_bytes: u64,
     pub unload_after_secs: u32,
+    /// Keep a redacted log of calls to LM Studio and of every capture decision.
+    #[uniffi(default = false)]
+    pub developer: bool,
 }
 
 #[derive(Debug, Clone, uniffi::Enum, PartialEq)]
@@ -158,6 +162,9 @@ struct Shared {
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+pub(crate) fn lock_tape(t: &lm::Tape) -> MutexGuard<'_, Vec<lm::Call>> {
+    lock(t)
 }
 fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
@@ -283,10 +290,13 @@ impl Engine {
     pub fn search(&self, filter: Filter, semantic: bool, limit: u32) -> Result<Vec<Shot>, EngineError> {
         let c = lock(&self.s.config).clone();
         let emb = if semantic && !c.embed_model.is_empty() && filter.text.trim().chars().count() >= 3 {
-            self.s.lm(&c).and_then(|l| {
+            let (l, tape) = self.s.taped(&c);
+            let e = l.and_then(|l| {
                 self.s.ensure(&l, &c.embed_model, 2048)?;
                 l.embed(&c.embed_model, &format!("search_query: {}", filter.text), 10)
-            }).ok()
+            }).ok();
+            self.s.note(devlog::search(take(&tape)));
+            e
         } else {
             None
         };
@@ -322,7 +332,10 @@ impl Engine {
         // Order matters: mark first, so a frame mid-flight is refused at insert time.
         lock(&self.s.forgotten).push((from, to));
         lock(&self.s.queue).frames.retain(|f| !(from..to).contains(&f.moment.taken_at));
-        let ids = lock(&self.s.store).ids_matching(&Filter { from: Some(from), to: Some(to), ..Default::default() })?;
+        let store = lock(&self.s.store);
+        store.dev_forget(from, to)?;
+        let ids = store.ids_matching(&Filter { from: Some(from), to: Some(to), ..Default::default() })?;
+        drop(store);
         self.delete(ids)
     }
 
@@ -338,6 +351,17 @@ impl Engine {
 
     pub fn apply_retention(&self) -> Result<u64, EngineError> {
         Ok(self.s.retain()?)
+    }
+
+    /// A capture decision, for the developer log.
+    pub fn note_capture(&self, trigger: String, outcome: String) {
+        self.s.note(vec![DevEntry { at: now_ms(), kind: "capture".into(), ok: true, request: trigger, note: outcome, ..Default::default() }]);
+    }
+    pub fn dev_log(&self, limit: u32, before: Option<i64>) -> Result<Vec<DevEntry>, EngineError> {
+        Ok(lock(&self.s.store).dev_list(limit, before)?)
+    }
+    pub fn dev_clear(&self) -> Result<(), EngineError> {
+        Ok(lock(&self.s.store).dev_clear()?)
     }
 
     pub fn models(&self) -> Result<Vec<ModelInfo>, EngineError> {
@@ -390,7 +414,35 @@ impl Engine {
     }
 }
 
+fn take(t: &lm::Tape) -> Vec<lm::Call> {
+    std::mem::take(&mut *lock(t))
+}
+
 impl Shared {
+    /// A client that records its calls when developer mode is on.
+    fn taped(&self, c: &Config) -> (Result<lm::Lm, lm::LmError>, lm::Tape) {
+        let tape = lm::Tape::default();
+        let l = self.lm(c).map(|mut l| {
+            l.tape = c.developer.then(|| tape.clone());
+            l
+        });
+        (l, tape)
+    }
+
+    fn note(&self, entries: Vec<DevEntry>) {
+        if entries.is_empty() || !lock(&self.config).developer {
+            return;
+        }
+        let store = lock(&self.store);
+        let forgotten = lock(&self.forgotten);
+        for e in entries {
+            // Forgotten while it was happening, or about a picture that's gone.
+            if !forgotten.iter().any(|(a, b)| (*a..*b).contains(&e.at)) {
+                let _ = store.dev_add(&e);
+            }
+        }
+    }
+
     fn lm(&self, c: &Config) -> Result<lm::Lm, lm::LmError> {
         lm::Lm::new(&c.lm_url)
     }
@@ -424,6 +476,7 @@ impl Shared {
     fn retain(&self) -> Result<u64, rusqlite::Error> {
         let c = lock(&self.config).clone();
         let mut st = lock(&self.store);
+        st.dev_trim(now_ms(), 7, 5000)?;
         let ids = st.expired(now_ms(), c.max_age_days, c.max_bytes)?;
         if ids.is_empty() {
             return Ok(0);
@@ -440,7 +493,7 @@ impl Shared {
     }
 
     /// Ask the model about every line it hasn't already cleared. Err means "not checked".
-    fn ai_hits(&self, c: &Config, lines: &[TextLine], known: &[Hit]) -> Result<Vec<Hit>, lm::LmError> {
+    fn ai_hits(&self, c: &Config, tape: &mut lm::Tape, lines: &[TextLine], known: &[Hit]) -> Result<Vec<Hit>, lm::LmError> {
         let keys: Vec<u64> = (0..lines.len()).map(|i| self.line_key(lines, i)).collect();
         let todo: Vec<usize> = {
             let clean = lock(&self.clean);
@@ -464,7 +517,9 @@ impl Shared {
                 (i, detect::mask(&lines[i].text, &r))
             })
             .collect();
-        let l = self.lm(c)?;
+        let (l, t) = self.taped(c);
+        *tape = t;
+        let l = l?;
         self.ensure(&l, &c.model, CONTEXT)?;
 
         let mut hits = Vec::new();
@@ -514,10 +569,22 @@ impl Shared {
 
     /// Redact and save one frame. Err(reason) means nothing was written.
     fn process(&self, f: &mut Frame, require_ai: bool) -> Result<(), String> {
+        let mut tape = lm::Tape::default();
+        let r = self.process_taped(f, require_ai, &mut tape);
+        let calls = take(&tape);
+        match &r {
+            Ok(Some((id, hits))) => self.note(devlog::checks(calls, &f.lines, Some(hits), Some(*id))),
+            Ok(None) => {} // Forgotten while it was being checked.
+            Err(_) => self.note(devlog::checks(calls, &f.lines, None, None)),
+        }
+        r.map(|_| ())
+    }
+
+    fn process_taped(&self, f: &mut Frame, require_ai: bool, tape: &mut lm::Tape) -> Result<Option<(i64, Vec<Hit>)>, String> {
         let c = lock(&self.config).clone();
         let mut hits = detect::scan(&f.lines);
         hits.extend(covered(&f.lines, &f.covers));
-        let ai_checked = match self.ai_hits(&c, &f.lines, &hits) {
+        let ai_checked = match self.ai_hits(&c, tape, &f.lines, &hits) {
             Ok(h) => {
                 hits.extend(h);
                 true
@@ -528,11 +595,14 @@ impl Shared {
         detect::extend_wrapped(&f.lines, &mut hits);
         propagate(&f.lines, &mut hits);
 
-        let mut regions: Vec<Region> = f.covers.iter().map(|c| region(c.kind, c.rect)).collect();
+        let mut regions: Vec<Region> = f.covers.iter().map(|c| region(c.kind, c.rect, "extension")).collect();
         for h in &hits {
-            let r = region(h.kind, detect::hit_rect(&f.lines[h.line], &h.range));
-            if !regions.iter().any(|x| x.rect == r.rect) {
-                regions.push(r);
+            let r = region(h.kind, detect::hit_rect(&f.lines[h.line], &h.range), h.why);
+            match regions.iter_mut().find(|x| x.rect == r.rect) {
+                // Several things can agree; say so once each.
+                Some(x) if !x.why.split(',').any(|w| w == h.why) => x.why = format!("{},{}", x.why, h.why),
+                Some(_) => {}
+                None => regions.push(r),
             }
         }
         let rects: Vec<Rect> = regions.iter().map(|r| r.rect).collect();
@@ -578,15 +648,17 @@ impl Shared {
         if lock(&self.forgotten).iter().any(|(a, b)| (*a..*b).contains(&at)) {
             drop(store);
             remove();
-            return Ok(());
+            return Ok(None);
         }
         let new = NewShot { moment: m, path: path.clone(), thumb_path: thumb_path.clone(), width: e.width, height: e.height, bytes: e.bytes, regions, lines, ai_checked };
-        if let Err(e) = store.insert(&new) {
-            drop(store);
-            remove();
-            return Err(format!("The library couldn't be updated: {e}"));
+        match store.insert(&new) {
+            Ok(id) => Ok(Some((id, hits))),
+            Err(e) => {
+                drop(store);
+                remove();
+                Err(format!("The library couldn't be updated: {e}"))
+            }
         }
-        Ok(())
     }
 }
 
@@ -601,11 +673,11 @@ fn covered(lines: &[TextLine], covers: &[pages::Cover]) -> Vec<Hit> {
     for c in covers {
         for (i, l) in lines.iter().enumerate().filter(|(_, l)| !l.code) {
             if l.tokens.is_empty() && inside(&l.rect, &c.rect) {
-                hits.push(Hit { line: i, range: 0..l.text.len(), kind: c.kind });
+                hits.push(Hit { line: i, range: 0..l.text.len(), kind: c.kind, why: "extension" });
             }
             let byte = |scalar: u32| l.text.char_indices().nth(scalar as usize).map_or(l.text.len(), |x| x.0);
             for t in l.tokens.iter().filter(|t| inside(&t.rect, &c.rect)) {
-                hits.push(Hit { line: i, range: byte(t.start)..byte(t.start + t.len), kind: c.kind });
+                hits.push(Hit { line: i, range: byte(t.start)..byte(t.start + t.len), kind: c.kind, why: "extension" });
             }
         }
     }
@@ -625,7 +697,7 @@ fn propagate(lines: &[TextLine], hits: &mut Vec<Hit>) {
     for v in secret_values(lines, hits) {
         for (line, range) in detect::find_secret(lines, &v) {
             if !hits.iter().any(|x| x.line == line && x.range.start <= range.start && x.range.end >= range.end) {
-                hits.push(Hit { line, range, kind: SecretKind::Other });
+                hits.push(Hit { line, range, kind: SecretKind::Other, why: "repeated" });
             }
         }
     }
@@ -717,7 +789,16 @@ fn describe_one(s: &Shared) -> Result<bool, String> {
         return Ok(false);
     }
     let Some((shot, body)) = lock(&s.store).next_pending().map_err(|e| e.to_string())? else { return Ok(false) };
-    let l = s.lm(&c).map_err(|e| e.to_string())?;
+    let (l, tape) = s.taped(&c);
+    let l = l.map_err(|e| e.to_string())?;
+    // However this ends, what was said is logged against the picture.
+    struct Log<'a>(&'a Shared, lm::Tape, i64);
+    impl Drop for Log<'_> {
+        fn drop(&mut self) {
+            self.0.note(devlog::about(take(&self.1), self.2));
+        }
+    }
+    let _log = Log(s, tape, shot.id);
     s.describing.store(true, SeqCst);
     s.ensure(&l, &c.model, CONTEXT).map_err(|e| e.to_string())?;
     // Reachable model from here on: failures count against this shot so one bad image can't block the rest.
@@ -762,7 +843,7 @@ mod tests {
 
     // Port 9 refuses connections: stands in for LM Studio being off.
     fn config(require_ai: bool) -> Config {
-        Config { lm_url: "http://127.0.0.1:9".into(), model: "m".into(), embed_model: String::new(), require_ai, describe: DescribeWhen::Never, max_age_days: 0, max_bytes: 0, unload_after_secs: 0 }
+        Config { lm_url: "http://127.0.0.1:9".into(), model: "m".into(), embed_model: String::new(), require_ai, describe: DescribeWhen::Never, max_age_days: 0, max_bytes: 0, unload_after_secs: 0, developer: false }
     }
     fn frame(at: i64) -> Frame {
         let l = |t: &str, y: f64| TextLine { text: t.into(), rect: Rect { x: 0.1, y, w: 0.5, h: 0.1 }, tokens: vec![], code: false };
@@ -938,6 +1019,115 @@ mod tests {
         f.covers = vec![Cover { kind: SecretKind::Other, rect: Rect { x: -0.5, y: 0.9, w: 0.7, h: 0.5 } }];
         e.ingest(f);
         wait(|| e.stats().unwrap().count == 1);
+        e.shutdown();
+    }
+
+    /// A stand-in LM Studio: answers every check with one finding and remembers nothing.
+    fn fake_lm(answer: &'static str, status: u16) -> String {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for mut s in l.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0; 4096];
+                    let head = loop {
+                        let n = s.read(&mut chunk).unwrap_or(0);
+                        if n == 0 { return; }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") { break i + 4; }
+                    };
+                    let h = String::from_utf8_lossy(&buf[..head]).to_lowercase();
+                    let len: usize = h.lines().find_map(|l| l.strip_prefix("content-length: ")).and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+                    while buf.len() < head + len {
+                        let n = s.read(&mut chunk).unwrap_or(0);
+                        if n == 0 { return; }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    let (code, body) = if h.starts_with("get /api/v1/models") {
+                        (200, r#"{"models":[{"key":"m","loaded_instances":[{}],"type":"llm"}]}"#.to_owned())
+                    } else if status != 200 {
+                        (status, r#"{"error":{"message":"bad prompt: quartz-otter-9 was in it"}}"#.to_owned())
+                    } else {
+                        (200, serde_json::json!({"choices":[{"finish_reason":"stop","message":{"content":answer}}]}).to_string())
+                    };
+                    let _ = write!(s, "HTTP/1.1 {code} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+                });
+            }
+        });
+        url
+    }
+    fn secretive(at: i64) -> Frame {
+        let mut f = frame(at);
+        f.lines[0].text = "the door says quartz-otter-9 today".into();
+        f.lines[1].text = "password: hunter22".into();
+        f.lines[2].text = "plain words".into();
+        f.moment.window_title = "t".into();
+        f
+    }
+    const FOUND: &str = r#"{"findings":[{"line":0,"value":"quartz-otter-9","kind":"password"}]}"#;
+
+    #[test]
+    fn the_developer_log_is_complete_and_holds_no_secret() {
+        let d = tempfile::tempdir().unwrap();
+        let c = Config { lm_url: fake_lm(FOUND, 200), developer: true, ..config(true) };
+        let e = Engine::new(d.path().to_string_lossy().into(), c, Arc::new(FakeHost(Default::default()))).unwrap();
+        e.ingest(secretive(1000));
+        wait(|| e.stats().unwrap().count == 1);
+        let log = e.dev_log(50, None).unwrap();
+        let check = log.iter().find(|x| x.kind == "check").expect("the check is logged");
+        assert!(check.ok && check.shot_id.is_some() && check.model == "m");
+        assert!(check.request.contains("the door says [hidden] today") && check.request.contains("password: [hidden]") && check.request.contains("plain words"), "{}", check.request);
+        assert!(check.request.contains("You find secrets") && check.request.contains("json_schema"), "the whole call: {}", check.request);
+        assert!(check.response.contains("password") && check.response.contains("\"line\""), "{}", check.response);
+        let everything = format!("{log:?}");
+        for x in ["quartz", "otter", "hunter22"] {
+            assert!(!everything.contains(x), "{x}: {everything}");
+        }
+        // And each hidden place says what hid it.
+        let shot = e.list(Filter::default(), 1, 0).unwrap().remove(0);
+        let mut why: Vec<_> = shot.regions.iter().map(|r| r.why.as_str()).collect();
+        why.sort_unstable();
+        assert_eq!(why, vec!["assignment", "model"]);
+        e.delete(vec![shot.id]).unwrap();
+        assert!(e.dev_log(50, None).unwrap().iter().all(|x| x.kind != "check"));
+        e.shutdown();
+    }
+
+    #[test]
+    fn a_frame_that_was_not_saved_leaves_no_words_in_the_log() {
+        for (answer, status) in [("not json quartz-otter-9", 200), (FOUND, 400)] {
+            let d = tempfile::tempdir().unwrap();
+            let c = Config { lm_url: fake_lm(answer, status), developer: true, ..config(true) };
+            let e = Engine::new(d.path().to_string_lossy().into(), c, Arc::new(FakeHost(Default::default()))).unwrap();
+            e.ingest(secretive(1000));
+            wait(|| e.status().discarded == 1);
+            let log = e.dev_log(50, None).unwrap();
+            assert!(log.iter().any(|x| x.kind == "check" && !x.ok && x.request.is_empty() && x.response.is_empty() && !x.note.is_empty()), "{log:?}");
+            let all = format!("{log:?}{:?}", e.status());
+            for x in ["quartz", "hunter22", "plain words"] {
+                assert!(!all.contains(x), "{x}: {all}");
+            }
+            e.shutdown();
+        }
+    }
+
+    #[test]
+    fn nothing_is_logged_unless_asked() {
+        let d = tempfile::tempdir().unwrap();
+        let c = Config { lm_url: fake_lm(FOUND, 200), ..config(true) };
+        let e = Engine::new(d.path().to_string_lossy().into(), c, Arc::new(FakeHost(Default::default()))).unwrap();
+        e.note_capture("app".into(), "Saved".into());
+        e.ingest(secretive(1000));
+        wait(|| e.stats().unwrap().count == 1);
+        assert!(e.dev_log(50, None).unwrap().is_empty());
+        e.set_config(Config { developer: true, ..config(true) });
+        e.note_capture("app".into(), "Nothing has changed".into());
+        let l = e.dev_log(50, None).unwrap();
+        assert_eq!((l.len(), l[0].kind.as_str(), l[0].request.as_str(), l[0].note.as_str()), (1, "capture", "app", "Nothing has changed"));
+        e.forget(i64::MIN, i64::MAX).unwrap();
+        assert!(e.dev_log(50, None).unwrap().is_empty());
         e.shutdown();
     }
 }

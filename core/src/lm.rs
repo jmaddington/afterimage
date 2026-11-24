@@ -16,9 +16,26 @@ pub enum LmError {
     BadAnswer(&'static str),
 }
 
+/// One exchange with LM Studio, held in memory until it's known what may be written down.
+/// AIDEV-NOTE: privacy-critical. Raw: may hold secrets the model was only then finding. `devlog` redacts before disk.
+pub struct Call {
+    pub path: &'static str,
+    pub at: i64,
+    pub ms: u64,
+    pub request: Value,
+    /// The answer, or why there wasn't one (never the server's own words about a prompt).
+    pub result: Result<Value, String>,
+    /// For a secret check: which lines were sent.
+    pub lines: Vec<usize>,
+}
+
+pub type Tape = std::sync::Arc<std::sync::Mutex<Vec<Call>>>;
+
 pub struct Lm {
     base: String,
     agent: ureq::Agent,
+    /// Records calls when developer mode is on.
+    pub tape: Option<Tape>,
 }
 
 /// AIDEV-NOTE: privacy-critical. Only literal loopback; no proxies, no redirects (a redirect could leave the Mac).
@@ -59,10 +76,21 @@ impl Lm {
             .timeout_connect(Some(Duration::from_secs(2)))
             .build()
             .new_agent();
-        Ok(Self { base, agent })
+        Ok(Self { base, agent, tape: None })
     }
 
-    fn call(&self, path: &str, body: Option<&Value>, timeout: u64) -> Result<Value, LmError> {
+    fn call(&self, path: &'static str, body: Option<&Value>, timeout: u64) -> Result<Value, LmError> {
+        let (at, t) = (crate::now_ms(), std::time::Instant::now());
+        let r = self.send(path, body, timeout);
+        // Listing models is polling, not work.
+        if let (Some(tape), Some(b)) = (&self.tape, body) {
+            let result = r.as_ref().map(Value::clone).map_err(|e| e.to_string());
+            crate::lock(tape).push(Call { path, at, ms: t.elapsed().as_millis() as u64, request: b.clone(), result, lines: vec![] });
+        }
+        r
+    }
+
+    fn send(&self, path: &str, body: Option<&Value>, timeout: u64) -> Result<Value, LmError> {
         let url = format!("{}{path}", self.base);
         let t = Some(Duration::from_secs(timeout));
         let res = match body {
@@ -76,7 +104,8 @@ impl Lm {
         let status = res.status().as_u16();
         let v: Value = res.body_mut().with_config().limit(32 << 20).read_json().map_err(|_| LmError::BadAnswer("not json"))?;
         if status != 200 {
-            let m = v["error"]["message"].as_str().or(v["error"].as_str()).unwrap_or("request failed");
+            // A complaint about a prompt may quote it, and errors are shown and kept. Only loading has nothing to quote.
+            let m = if path.starts_with("/api/") { v["error"]["message"].as_str().or(v["error"].as_str()).unwrap_or("request failed") } else { "request refused" };
             return Err(LmError::Model(format!("{status}: {}", m.chars().take(160).collect::<String>())));
         }
         Ok(v)
@@ -139,7 +168,11 @@ impl Lm {
             "line":{"type":"integer"},"value":{"type":"string"},
             "kind":{"type":"string","enum":["password","ssn","financial","key","other"]}},
             "required":["line","value","kind"]}}},"required":["findings"]});
-        let out = self.chat(model, json!([{"role":"system","content":SYS},{"role":"user","content":text}]), 2000, Some(schema), 90)?;
+        let out = self.chat(model, json!([{"role":"system","content":SYS},{"role":"user","content":text}]), 2000, Some(schema), 90);
+        if let Some(c) = self.tape.as_ref().map(crate::lock_tape).as_mut().and_then(|t| t.last_mut()) {
+            c.lines = numbered.iter().map(|x| x.0).collect();
+        }
+        let out = out?;
         let v: Value = serde_json::from_str(&out).map_err(|_| LmError::BadAnswer("not json"))?;
         let arr = v["findings"].as_array().ok_or(LmError::BadAnswer("no findings"))?;
         arr.iter()
@@ -177,7 +210,7 @@ impl Lm {
 }
 
 /// One numbered line per row, whatever the text contains.
-fn number(lines: &[(usize, &str)]) -> String {
+pub fn number(lines: &[(usize, &str)]) -> String {
     let flat = |t: &str| t.replace(|c: char| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'), " ");
     lines.iter().map(|(i, t)| format!("{i}: {}", flat(t))).collect::<Vec<_>>().join("\n")
 }
@@ -187,14 +220,14 @@ pub fn locate(lines: &[TextLine], line: usize, value: &str, kind: SecretKind) ->
     let value = value.trim();
     if value.is_empty() {
         return match lines.get(line) {
-            Some(l) => vec![Hit { line, range: 0..l.text.len(), kind }],
+            Some(l) => vec![Hit { line, range: 0..l.text.len(), kind, why: "model" }],
             None => vec![],
         };
     }
     let near = [Some(line), line.checked_sub(1), Some(line + 1)];
     for i in near.into_iter().flatten() {
         if let Some(l) = lines.get(i) {
-            let found: Vec<Hit> = l.text.match_indices(value).map(|(s, m)| Hit { line: i, range: s..s + m.len(), kind }).collect();
+            let found: Vec<Hit> = l.text.match_indices(value).map(|(s, m)| Hit { line: i, range: s..s + m.len(), kind, why: "model" }).collect();
             if !found.is_empty() {
                 return found;
             }
@@ -204,10 +237,10 @@ pub fn locate(lines: &[TextLine], line: usize, value: &str, kind: SecretKind) ->
     let mut out: Vec<Hit> = lines
         .iter()
         .enumerate()
-        .flat_map(|(i, l)| l.text.match_indices(value).map(move |(s, m)| Hit { line: i, range: s..s + m.len(), kind }))
+        .flat_map(|(i, l)| l.text.match_indices(value).map(move |(s, m)| Hit { line: i, range: s..s + m.len(), kind, why: "model" }))
         .collect();
     if let Some(l) = lines.get(line) {
-        out.push(Hit { line, range: 0..l.text.len(), kind });
+        out.push(Hit { line, range: 0..l.text.len(), kind, why: "model" });
     }
     out
 }
@@ -269,8 +302,8 @@ mod tests {
     fn locates_or_hides_whole_line() {
         let r = Rect { x: 0.0, y: 0.0, w: 1.0, h: 0.1 };
         let l: Vec<TextLine> = ["wifi", "marmalade-tuba-41", "x"].iter().map(|t| TextLine { text: (*t).into(), rect: r, tokens: vec![], code: false }).collect();
-        assert_eq!(locate(&l, 0, "tuba", SecretKind::Password), vec![Hit { line: 1, range: 10..14, kind: SecretKind::Password }]);
-        assert_eq!(locate(&l, 1, "not there", SecretKind::Other), vec![Hit { line: 1, range: 0..17, kind: SecretKind::Other }]);
+        assert_eq!(locate(&l, 0, "tuba", SecretKind::Password), vec![Hit { line: 1, range: 10..14, kind: SecretKind::Password, why: "model" }]);
+        assert_eq!(locate(&l, 1, "not there", SecretKind::Other), vec![Hit { line: 1, range: 0..17, kind: SecretKind::Other, why: "model" }]);
         assert!(locate(&l, 99, "nope", SecretKind::Other).is_empty());
     }
 
