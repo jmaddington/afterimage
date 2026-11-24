@@ -166,8 +166,8 @@ re!(QR_SECRET, r"(?is)otpauth(?:-migration)?://.*|\bWIFI:.*\bP:.*");
 // Query keys whose values are worth hunting for elsewhere on the screen.
 re!(SECRET_KEY, r"(?i)secret|token|pass|pwd|key|code|auth|sig|otp|pin|session|credential|^data$");
 // Dashes are often read as one long one. Certificates are hidden with keys: people keep both in the same files.
-re!(PEM_BEGIN, r"[-—–_=]+\s*BEGIN [A-Z0-9 ]*(?:PRIVATE KEY|SECRET|CERTIFICATE|PGP [A-Z ]*BLOCK)");
-re!(PEM_END, r"[-—–_=]+\s*END [A-Z0-9 ]*(?:PRIVATE KEY|SECRET|CERTIFICATE|PGP [A-Z ]*BLOCK)");
+re!(PEM_BEGIN, r"[-—–_=]+\s*BEGIN [A-Z0-9 ]*(PRIVATE KEY|SECRET|CERTIFICATE|PGP [A-Z ]*BLOCK)");
+re!(PEM_END, r"[-—–_=]+\s*END [A-Z0-9 ]*(PRIVATE KEY|SECRET|CERTIFICATE|PGP [A-Z ]*BLOCK)");
 
 /// A line of a base64 block: long, nothing but the base64 alphabet (a stray space or two from OCR aside), and mixed
 /// the way encoded bytes are. A path, a sentence or a hex hash is not.
@@ -294,10 +294,7 @@ fn assigned(key: &str, quoted: bool, v: &str, closed: bool) -> Option<SecretKind
     // However the capitals fall ("APIkey"), the name run together still ends the same way.
     let joined = w.concat();
     let run = |list: &[&str]| list.iter().any(|x| joined.ends_with(x)).then(|| w.len() - 1);
-    // "pass" is also a verb: "Tests pass: 150". It names a password alone or after what it's the password to.
-    const PASS_OF: &[&str] = &["db", "database", "root", "admin", "user", "my", "your", "wifi", "wi", "fi", "login", "mysql", "pg", "postgres", "redis", "ssh", "ftp", "sftp", "smtp", "imap", "mail", "email", "http", "proxy", "new", "old", "the", "app", "api", "vpn", "sudo", "master", "account", "router", "network"];
-    let pass = w.iter().position(|k| k == "pass").filter(|&i| i == 0 || PASS_OF.contains(&w[i - 1].as_str()));
-    let password = ends(&["password", "passwords", "passwd", "pwd", "passcode", "passphrase"]).or(is(&["pin", "otp"])).or(pass).or(run(&["password", "passwd", "passphrase", "passcode"]));
+    let password = ends(&["password", "passwords", "passwd", "pwd", "passcode", "passphrase"]).or(is(&["pass", "pin", "otp"])).or(run(&["password", "passwd", "passphrase", "passcode"]));
     let key_at = ends(&["secret", "secrets", "token", "apikey", "credential", "credentials"])
         .or(pair("api", &["key"])).or(pair("access", &["key"])).or(pair("private", &["key"])).or(pair("auth", &["key"]))
         .or(pair("recovery", &["key", "code"])).or(pair("backup", &["code"])).or((w == ["key"]).then_some(0))
@@ -460,12 +457,16 @@ fn scan_latin(text: &str, line: usize, hits: &mut Vec<Hit>) {
     while let Some(c) = ASSIGN.captures_at(text, from) {
         let (sep, v) = (c.get(2).unwrap(), c.get(4).unwrap());
         let quoted = !c[3].is_empty();
-        // "pass" alone is judged with the word before it: "db pass: x" is a password, "Tests pass: 150" is a verb.
-        let before = text[..c.get(1).unwrap().start()].split_whitespace().next_back().filter(|w| w.chars().all(char::is_alphabetic));
-        let name = match before {
-            Some(b) if c[1].eq_ignore_ascii_case("pass") => format!("{b} {}", &c[1]),
-            _ => c[1].to_owned(),
-        };
+        // AIDEV-NOTE: privacy-critical, narrow on purpose. "pass" is a password's name unless it stands alone as a
+        // AIDEV-NOTE: verb after one of a few known subjects ("Tests pass: 150"), and that subject is not itself the
+        // AIDEV-NOTE: value of an earlier pair. MONGO_PASS=, keyPass= and "db pass:" are untouched.
+        const PASSERS: &[&str] = &["tests", "test", "checks", "builds", "suites", "specs", "jobs", "cases", "assertions", "steps", "runs", "all", "they", "these", "those", "both"];
+        let head = text[..c.get(1).unwrap().start()].trim_end();
+        let subject = head.split_whitespace().next_back().unwrap_or("");
+        let verb = c[1].eq_ignore_ascii_case("pass")
+            && PASSERS.contains(&subject.to_lowercase().as_str())
+            && !head[..head.len() - subject.len()].trim_end().ends_with([':', '=', '>']);
+        let name = if verb { "verb".to_owned() } else { c[1].to_owned() };
         let judge = |whole: &str| {
             let balanced = |o: char, c: char| whole.matches(o).count() == whole.matches(c).count();
             let closed = !quoted && whole.ends_with([')', ']']) && balanced('(', ')') && balanced('[', ']');
@@ -571,7 +572,8 @@ fn scan_latin(text: &str, line: usize, hits: &mut Vec<Hit>) {
 /// Detect across a whole screen, using layout to pair standalone labels with their values.
 pub fn scan(lines: &[TextLine]) -> Vec<Hit> {
     let mut hits = Vec::new();
-    let mut in_pem = false;
+    // The kind of block that is open. Only an END of the same kind closes it.
+    let mut in_pem: Option<String> = None;
     let latin: Vec<String> = lines.iter().map(|l| latinised(&l.text, false).0).collect();
     // Three or more block lines in a row are key material whether or not a header is in view.
     let mut i = 0;
@@ -592,14 +594,19 @@ pub fn scan(lines: &[TextLine]) -> Vec<Hit> {
             }
             continue;
         }
-        if PEM_BEGIN.is_match(t) {
-            in_pem = true;
-        }
-        if in_pem {
+        let begin = PEM_BEGIN.captures_iter(t).last().map(|c| (c.get(0).unwrap().start(), c[1].to_owned()));
+        let end = PEM_END.captures_iter(t).filter(|c| in_pem.as_deref().is_none_or(|k| k == &c[1])).last().map(|c| c.get(0).unwrap().start());
+        if in_pem.is_some() || begin.is_some() {
             push(&mut hits, i, 0..l.text.len(), SecretKind::Key, "private-key");
         }
-        if PEM_END.is_match(t) {
-            in_pem = false;
+        if in_pem.is_some() && end.is_some() {
+            in_pem = None;
+        }
+        // A block opens here unless one is still open, or this line closed it again further along.
+        if let (None, Some((at, kind))) = (&in_pem, begin) {
+            if end.is_none_or(|e| at > e) {
+                in_pem = Some(kind);
+            }
         }
         scan_text(&l.text, i, &mut hits);
 
@@ -1421,7 +1428,8 @@ mod tests {
         for t in ["Tests pass: 150 Rust, 57 Swift", "- Tests pass: 150 Rust", "All checks pass: 12 of 12", "If they pass: merge it"] {
             assert_eq!(masked(t), t);
         }
-        for t in ["pass: hunter22", "db pass: hunter22", "root pass = hunter22", "wifi pass: hunter22", "mysql_pass=hunter22", "PASS=hunter22"] {
+        for t in ["pass: hunter22", "db pass: hunter22", "root pass = hunter22", "wifi pass: hunter22", "mysql_pass=hunter22", "PASS=hunter22", "MONGO_PASS=hunter22", "RABBITMQ_PASS=hunter22",
+                  "keyPass=hunter22", "tests_pass=hunter22", "dana pass: hunter22", "user: tests pass: hunter22", "login=all pass=hunter22"] {
             assert!(!masked(t).contains("hunter22"), "{t}");
         }
     }
@@ -1442,6 +1450,12 @@ mod tests {
         assert_eq!(hidden(&spaced), [0, 1, 2]);
         let dashes = vec![line("—BEGIN OPENSSH PRIVATE KEY—", 0.1, 0.1), line("b3BlbnNzaC1rZXk", 0.1, 0.2)];
         assert_eq!(hidden(&dashes), [0, 1]);
+        // A certificate's END inside a private key doesn't close the key, and a block reopened on the line that closed
+        // one stays open.
+        let nested = vec![line("-----BEGIN RSA PRIVATE KEY-----", 0.1, 0.1), line("-----END CERTIFICATE-----", 0.1, 0.2), line("still the key", 0.1, 0.3), line("-----END RSA PRIVATE KEY-----", 0.1, 0.4), line("free", 0.1, 0.5)];
+        assert_eq!(hidden(&nested), [0, 1, 2, 3]);
+        let chained = vec![line("-----BEGIN CERTIFICATE-----", 0.1, 0.1), line("-----END CERTIFICATE----- -----BEGIN PRIVATE KEY-----", 0.1, 0.2), line("the key body", 0.1, 0.3)];
+        assert_eq!(hidden(&chained), [0, 1, 2]);
         // Paths and sentences are not a block, however long and however many.
         for ok in [vec![line("/Users/dana/Library/Application Support/Afterimage/Shots/20416/one.heic", 0.1, 0.1), line("/Users/dana/Library/Application Support/Afterimage/Shots/20416/two.heic", 0.1, 0.2), line("/Users/dana/Library/Application Support/Afterimage/Shots/20416/six.heic", 0.1, 0.3)],
                    vec![line("thequickbrownfoxjumpsoverthelazydogthequickbrownfox", 0.1, 0.1), line("thequickbrownfoxjumpsoverthelazydogthequickbrownfox", 0.1, 0.2), line("thequickbrownfoxjumpsoverthelazydogthequickbrownfox", 0.1, 0.3)]] {

@@ -25,4 +25,10 @@ struct LibraryKeysTests {
         }
         #expect(act(0) == nil)
     }
+    @Test func agentSettingsAreValidJSONWithTheAddressAndToken() throws {
+        let j = try #require(JSONSerialization.jsonObject(with: Data(AppSettings.agentConfig(port: 4319, token: "tok-123").utf8)) as? [String: Any])
+        let a = try #require((j["mcpServers"] as? [String: Any])?["afterimage"] as? [String: Any])
+        #expect(a["url"] as? String == "http://127.0.0.1:4319/mcp")
+        #expect((a["headers"] as? [String: String])?["Authorization"] == "Bearer tok-123")
+    }
 }

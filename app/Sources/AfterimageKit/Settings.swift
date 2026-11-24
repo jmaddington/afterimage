@@ -91,6 +91,21 @@ import Observation
         "claude mcp add --transport http afterimage http://127.0.0.1:\(port)/mcp --header \"Authorization: Bearer $(cat '\(tokenFile)')\""
     }
 
+    /// Settings for an MCP client that takes JSON (Claude Desktop, Cursor and others).
+    public nonisolated static func agentConfig(port: Int, token: String) -> String {
+        """
+        {
+          "mcpServers": {
+            "afterimage": {
+              "type": "http",
+              "url": "http://127.0.0.1:\(port)/mcp",
+              "headers": { "Authorization": "Bearer \(token)" }
+            }
+          }
+        }
+        """
+    }
+
     public var exclusions: Exclusions {
         Exclusions(apps: excludedApps, sites: excludedSites, passwordManagers: hidePasswordManagers, privateWindows: hidePrivateWindows, unreadableBrowsers: hideUnreadable, tor: hideTor)
     }

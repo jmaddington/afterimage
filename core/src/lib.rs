@@ -1086,7 +1086,7 @@ fn describe_one(s: &Shared) -> Result<bool, String> {
         why
     };
     let img = s.host.model_image(shot.path.clone()).map_err(|e| fail(e.to_string()))?;
-    let (d, tags) = match l.describe(&c.model, &img, &shot.moment.app_name, &shot.moment.window_title) {
+    let (d, tags) = match l.describe(&c.model, &img, &shot.moment.app_name, &shot.moment.window_title, &body) {
         Ok(x) => x,
         Err(e @ lm::LmError::Offline) => return Err(e.to_string()),
         Err(e) => return Err(fail(e.to_string())),
