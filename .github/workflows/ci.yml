@@ -44,6 +44,9 @@ jobs:
       - name: Extension
         run: ./scripts/extension.sh
 
+      - name: Release script tests
+        run: python3 scripts/ci/test_unpack_app.py
+
       # Live model tests skip themselves without AFTERIMAGE_LIVE.
       - name: App tests
         run: |

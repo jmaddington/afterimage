@@ -3,7 +3,7 @@
   const api = globalThis.browser ?? globalThis.chrome;
   const watcher = new Watcher();
   const SOON = 200, REPEAT = 4000, MOST = 20000;
-  let timer = 0, last = '', sentAt = 0, dead = false;
+  let timer = 0, again = 0, last = '', sentAt = 0, dead = false;
 
   function shadow(el) {
     try {
@@ -48,7 +48,8 @@
         dead = true; // The extension was updated or removed underneath this page.
       }
     }
-    if (matters) setTimeout(soon, REPEAT);
+    clearTimeout(again);
+    if (matters) again = setTimeout(soon, REPEAT);
   }
   function soon() {
     if (!timer && !dead) timer = setTimeout(look, SOON);
@@ -56,7 +57,12 @@
 
   new MutationObserver(soon).observe(document, { subtree: true, childList: true, attributes: true, attributeFilter: ['type', 'style', 'class', 'hidden', 'name', 'id', 'autocomplete', 'src'] });
   for (const e of ['scroll', 'resize', 'focusin', 'focusout', 'input', 'load', 'transitionend']) addEventListener(e, soon, { capture: true, passive: true });
-  document.addEventListener('visibilitychange', () => {
+  let was = document.visibilityState;
+  document.addEventListener('visibilitychange', (e) => {
+    const now = document.visibilityState;
+    const back = e.isTrusted && was === 'hidden' && now === 'visible';
+    was = now;
+    if (!back) return;
     last = ''; // Back in sight: report at once, even if nothing changed.
     clearTimeout(timer);
     look();
