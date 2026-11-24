@@ -128,9 +128,25 @@ pub struct Status {
     pub describing: bool,
 }
 
+/// A request to forget a span of time.
+/// AIDEV-NOTE: privacy-critical. Frames are refused by arrival number, never by the clock: anything that arrived
+/// AIDEV-NOTE: before the request and falls in its span is refused, however its timestamp compares with "now".
+struct Forgot {
+    from: i64,
+    to: i64,
+    /// The last frame to have arrived when it was asked.
+    upto: u64,
+    /// When it was asked, for log entries, which have no arrival number.
+    asked: i64,
+}
+
 #[derive(Default)]
 struct Queue {
-    frames: VecDeque<Frame>,
+    /// Each with the number it arrived under.
+    frames: VecDeque<(u64, Frame)>,
+    arrived: u64,
+    /// The number of the frame being checked right now, if any.
+    in_hand: Option<u64>,
     stop: bool,
 }
 
@@ -146,7 +162,7 @@ struct Shared {
     /// Line neighbourhoods the model has already called clean. Keyed hash, RAM only.
     clean: Mutex<HashSet<u64>>,
     hasher: RandomState,
-    forgotten: Mutex<Vec<(i64, i64)>>,
+    forgotten: Mutex<Vec<Forgot>>,
     loaded_by_us: Mutex<HashSet<String>>,
     last_lm_use: Mutex<Instant>,
     lm_state: Mutex<LmState>,
@@ -321,7 +337,9 @@ impl Engine {
             q.frames.pop_front();
             self.s.discard("The model couldn't keep up");
         }
-        q.frames.push_back(frame);
+        q.arrived += 1;
+        let n = q.arrived;
+        q.frames.push_back((n, frame));
         drop(q);
         self.s.wake.notify_all();
     }
@@ -373,23 +391,16 @@ impl Engine {
 
     /// Delete a span of time, including frames still waiting in memory. Kept shots go too: the person asked.
     pub fn forget(&self, from: i64, to: i64) -> Result<u64, EngineError> {
-        // What's remembered about a forgetting reaches back, never forward: "everything" means everything so far,
-        // or nothing could be saved again until the app was reopened. What is deleted below has no such bound.
         // Order matters: mark first, so a frame mid-flight is refused at insert time.
+        let mut q = lock(&self.s.queue);
         let mut f = lock(&self.s.forgotten);
-        f.push((from, to.min(now_ms() + 1)));
-        // Never dropped while the app runs, only merged, so the list stays short without guessing what's in flight.
-        f.sort_unstable();
-        let mut merged: Vec<(i64, i64)> = Vec::new();
-        for (a, b) in f.drain(..) {
-            match merged.last_mut() {
-                Some(last) if a <= last.1 => last.1 = last.1.max(b),
-                _ => merged.push((a, b)),
-            }
-        }
-        *f = merged;
+        // A request only matters while something that arrived before it is still waiting or being checked.
+        let oldest = q.in_hand.or(q.frames.front().map(|x| x.0)).unwrap_or(u64::MAX);
+        f.retain(|x| x.upto >= oldest);
+        f.push(Forgot { from, to, upto: q.arrived, asked: now_ms() });
         drop(f);
-        lock(&self.s.queue).frames.retain(|f| !(from..to).contains(&f.moment.taken_at));
+        q.frames.retain(|(_, f)| !(from..to).contains(&f.moment.taken_at));
+        drop(q);
         let store = lock(&self.s.store);
         store.dev_forget(from, to)?;
         let ids = store.ids_matching(&Filter { from: Some(from), to: Some(to), ..Default::default() })?;
@@ -498,7 +509,7 @@ impl Shared {
         let forgotten = lock(&self.forgotten);
         for e in entries {
             // Forgotten while it was happening, or about a picture that's gone.
-            if !forgotten.iter().any(|(a, b)| (*a..*b).contains(&e.at)) {
+            if !forgotten.iter().any(|x| (x.from..x.to).contains(&e.at) && e.at <= x.asked) {
                 let _ = store.dev_add(&e);
             }
         }
@@ -642,9 +653,9 @@ impl Shared {
     }
 
     /// Redact and save one frame. Err(reason) means nothing was written.
-    fn process(&self, f: &mut Frame, require_ai: bool) -> Result<(), String> {
+    fn process(&self, f: &mut Frame, arrived: u64, require_ai: bool) -> Result<(), String> {
         let mut tape = lm::Tape::default();
-        let r = self.process_taped(f, require_ai, &mut tape);
+        let r = self.process_taped(f, arrived, require_ai, &mut tape);
         let calls = take(&tape);
         match &r {
             Ok(Some((id, hits, checked))) => self.note(devlog::checks(calls, &f.lines, checked.then_some(hits.as_slice()), Some(*id))),
@@ -654,7 +665,7 @@ impl Shared {
         r.map(|_| ())
     }
 
-    fn process_taped(&self, f: &mut Frame, require_ai: bool, tape: &mut lm::Tape) -> Result<Option<(i64, Vec<Hit>, bool)>, String> {
+    fn process_taped(&self, f: &mut Frame, arrived: u64, require_ai: bool, tape: &mut lm::Tape) -> Result<Option<(i64, Vec<Hit>, bool)>, String> {
         let c = lock(&self.config).clone();
         let mut hits = detect::scan(&f.lines);
         hits.extend(covered(&f.lines, &f.covers));
@@ -720,7 +731,7 @@ impl Shared {
         };
         let mut store = lock(&self.store);
         let at = m.taken_at;
-        if lock(&self.forgotten).iter().any(|(a, b)| (*a..*b).contains(&at)) {
+        if lock(&self.forgotten).iter().any(|x| arrived <= x.upto && (x.from..x.to).contains(&at)) {
             drop(store);
             remove();
             return Ok(None);
@@ -802,14 +813,15 @@ fn save_loop(s: Arc<Shared>) {
         if q.stop {
             return;
         }
-        let mut f = q.frames.pop_front().expect("queue is non-empty");
+        let (arrived, mut f) = q.frames.pop_front().expect("queue is non-empty");
+        q.in_hand = Some(arrived);
         drop(q);
         s.busy.store(true, SeqCst);
         let mut result = Err(String::new());
         // AIDEV-NOTE: rgba is taken by encode; only retry failures that happen before it (model errors).
         for attempt in 0..3 {
             let require = lock(&s.config).require_ai;
-            result = s.process(&mut f, require);
+            result = s.process(&mut f, arrived, require);
             if result.is_ok() || f.rgba.is_empty() || lock(&s.queue).stop {
                 break;
             }
@@ -825,6 +837,7 @@ fn save_loop(s: Arc<Shared>) {
                 s.host.library_changed();
             }
         }
+        lock(&s.queue).in_hand = None;
         s.busy.store(false, SeqCst);
     }
 }
@@ -1322,7 +1335,17 @@ mod tests {
             e.forget(i64::MIN, i64::MAX).unwrap();
         }
         assert_eq!(e.stats().unwrap().count, 0);
-        assert_eq!(lock(&e.s.forgotten).len(), 1);
+        assert!(lock(&e.s.forgotten).len() <= 2);
+        // A frame already waiting, stamped ahead of the clock, is refused by a forgetting that covers it...
+        e.set_config(config(true));
+        e.ingest(frame(now_ms() + 60_000));
+        e.forget(i64::MIN, i64::MAX).unwrap();
+        e.set_config(config(false));
+        std::thread::sleep(Duration::from_secs(4));
+        assert_eq!(e.stats().unwrap().count, 0);
+        // ...and one that arrives afterwards with the same stamp is kept.
+        e.ingest(frame(now_ms() + 60_000));
+        wait(|| e.stats().unwrap().count == 1);
         e.shutdown();
     }
 }
