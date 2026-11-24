@@ -240,8 +240,9 @@ pub fn embed_style(model: &str) -> EmbedStyle {
         // Scores unrelated text near 0.5.
         EmbedStyle { document: "search_document: ", query: "search_query: ", floor: 0.58, band: 0.09 }
     } else if m.contains("qwen") {
-        // Measured on Qwen3 Embedding: right answers near 0.56, unrelated near 0.33. Queries carry the task; documents don't.
-        EmbedStyle { document: "", query: "Instruct: Given what a person remembers seeing on their screen, retrieve the matching screenshot\nQuery: ", floor: 0.42, band: 0.12 }
+        // Measured on Qwen3 Embedding 0.6B and 4B: right answers 0.40 to 0.70, unrelated near 0.33. Queries carry the task;
+        // documents don't.
+        EmbedStyle { document: "", query: "Instruct: Given what a person remembers seeing on their screen, retrieve the matching screenshot\nQuery: ", floor: 0.38, band: 0.12 }
     } else {
         EmbedStyle { document: "", query: "", floor: 0.0, band: 0.08 }
     }
