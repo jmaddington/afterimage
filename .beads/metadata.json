@@ -1,0 +1,10 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_server_host": "100.72.164.86",
+  "dolt_server_port": 3307,
+  "dolt_server_user": "beads",
+  "dolt_database": "afterimage",
+  "project_id": "36cbf0ed-5aa9-4fbd-ba10-ca1c78613ec3"
+}
