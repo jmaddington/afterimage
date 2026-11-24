@@ -19,6 +19,14 @@ import Observation
     private var timer: Timer?
     private var observers: [(NotificationCenter, NSObjectProtocol)] = []
     private var tracker = FrontTracker()
+    /// The window the last successful capture was of: its title has passed every privacy check.
+    /// AIDEV-NOTE: privacy-critical. Bound to the window and the settings it passed under; withdrawn by any capture that didn't succeed.
+    private var approved: Approval?
+    private struct Approval: Equatable { let window: CGWindowID, title: String, rules: Exclusions }
+    /// Samples reach the engine in the order they were taken.
+    private let activityQueue = DispatchQueue(label: "afterimage.activity", qos: .utility)
+    private var lastActivity = Date.distantPast
+    private var logging = false
     private var pausedUntil: Date?
     private var asleep = false
     private var resumeAfter = Date.distantPast
@@ -125,19 +133,21 @@ import Observation
         let s = current()
         if s != state {
             // What happened before a pause isn't a reason to look after it.
-            if state == .watching { policy.clear() }
+            if state == .watching { policy.clear(); stopActivity() }
             state = s
         }
         guard s == .watching, !capturing else { return }
         policy.enabled = settings.triggers
         policy.interval = TimeInterval(settings.interval)
         pollWindow()
+        logActivity()
         guard let t = policy.due(at: now) else { return }
         // A timed look at a Mac nobody is using is a duplicate.
         if t == .interval && Session.idleSeconds > max(60, Double(settings.interval)) { return }
         policy.captured(at: now)
         capturing = true
         let all = settings.allDisplays, generation = policy.generation
+        let shown = frontNow()
         engine.setConditions(onPower: Session.onPower, calm: Session.calm)
         Task {
             let (r, refused) = await capturer.capture(t, allDisplays: all) { self.gate() }
@@ -155,19 +165,24 @@ import Observation
             }
             switch r {
             case .queued:
+                approved = shown == frontNow() ? shown : nil
                 failures = 0
                 lastCapture = Date()
                 lastNote = ""
                 flash += 1
             case .unchanged:
+                approved = shown == frontNow() ? shown : nil
                 failures = 0
                 lastNote = "Nothing has changed"
             case .skipped(let why):
+                approved = nil
                 lastNote = why
                 if current() == .watching { policy.missed(t, at: now, since: generation) }
             case .blocked(let why):
+                approved = nil
                 lastNote = why
             case .failed(let why):
+                approved = nil
                 failures += 1
                 lastNote = why
                 backoffUntil = Date().addingTimeInterval([5, 30, 60, 120, 300][min(failures - 1, 4)])
@@ -182,5 +197,41 @@ import Observation
         guard let app = NSWorkspace.shared.frontmostApplication else { return }
         let w = OnScreenWindow.front(of: app.processIdentifier, in: OnScreenWindow.all())
         if let t = tracker.see(pid: app.processIdentifier, window: w) { policy.event(t, at: now) }
+    }
+
+    /// The window in front and the settings in force, as an approval would record them.
+    private func frontNow() -> Approval? {
+        guard let app = NSWorkspace.shared.frontmostApplication, let w = OnScreenWindow.front(of: app.processIdentifier, in: OnScreenWindow.all()) else { return nil }
+        return Approval(window: w.id, title: TriggerPolicy.stableTitle(w.title), rules: settings.exclusions)
+    }
+
+    /// Once a second while watching: which window is in front and what else is open. The engine applies the privacy rules.
+    private func logActivity() {
+        guard settings.trackActivity else { return stopActivity() }
+        guard Date().timeIntervalSince(lastActivity) >= 1 else { return }
+        lastActivity = Date()
+        // Nobody at the keyboard for two minutes: the stretch ends where they left it.
+        if Session.idleSeconds > 120 { return stopActivity() }
+        guard let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier != getpid() else { return stopActivity() }
+        let all = OnScreenWindow.all().filter { $0.layer == 0 && $0.alpha > 0 && $0.bounds.width > 160 && $0.bounds.height > 160 }
+        let names = Dictionary(NSWorkspace.shared.runningApplications.map { ($0.processIdentifier, ($0.localizedName ?? "", $0.bundleIdentifier ?? "")) }, uniquingKeysWith: { a, _ in a })
+        let front = OnScreenWindow.front(of: app.processIdentifier, in: all)
+        func open(_ w: OnScreenWindow) -> OpenWindow { OpenWindow(app: names[w.pid]?.0 ?? "", bundleId: names[w.pid]?.1 ?? "", title: w.title) }
+        let sample = ActivitySample(
+            at: Int64(Date().timeIntervalSince1970 * 1000),
+            front: OpenWindow(app: app.localizedName ?? "", bundleId: app.bundleIdentifier ?? "", title: front?.title ?? ""),
+            titleOk: front.map { approved == Approval(window: $0.id, title: TriggerPolicy.stableTitle($0.title), rules: settings.exclusions) } ?? false,
+            others: all.filter { $0.id != front?.id && $0.pid != getpid() }.map(open))
+        logging = true
+        let ex = settings.exclusions
+        activityQueue.async { [engine] in
+            do { try engine.noteActivity(ex: ex, sample: sample) } catch { NSLog("activity not recorded: %@ [AIMG-ACTIVITY]", error.localizedDescription) }
+        }
+    }
+
+    private func stopActivity() {
+        guard logging else { return }
+        logging = false
+        activityQueue.async { [engine] in engine.endActivity() }
     }
 }

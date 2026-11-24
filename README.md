@@ -106,7 +106,7 @@ and turning the mode off deletes the log.
 With developer mode on, a second switch, "Let an AI agent read the library", starts an MCP server on this Mac.
 Copy Command gives a line to paste into a terminal to connect Claude Code. The server:
 
-- is read-only: an agent can list a timeline of a day, search by words or meaning, and read a saved picture and its
+- is read-only: an agent can list a timeline of a day, see which window was in front and for how long, search by words or meaning, and read a saved picture and its
   text, and cannot change or delete anything;
 - is local: it listens on a loopback address and refuses requests that come from a web page;
 - requires a token on every request, which you can replace to cut off an agent.

@@ -12,6 +12,8 @@ import Observation
     public var onTab: Bool { didSet { save("onTab", onTab) } }
     /// Seconds between timed captures; 0 is off.
     public var interval: Int { didSet { save("interval", interval) } }
+    /// Keep a log of which window is in front and what else is open.
+    public var trackActivity: Bool { didSet { save("trackActivity", trackActivity) } }
     public var allDisplays: Bool { didSet { save("allDisplays", allDisplays) } }
     public var skipSecureInput: Bool { didSet { save("skipSecureInput", skipSecureInput) } }
     public var hidePasswordManagers: Bool { didSet { save("hidePasswordManagers", hidePasswordManagers) } }
@@ -43,6 +45,7 @@ import Observation
         onLaunch = get("onLaunch", true)
         onTab = get("onTab", true)
         interval = get("interval", 120)
+        trackActivity = get("trackActivity", true)
         allDisplays = get("allDisplays", false)
         skipSecureInput = get("skipSecureInput", true)
         hidePasswordManagers = get("hidePasswordManagers", true)
