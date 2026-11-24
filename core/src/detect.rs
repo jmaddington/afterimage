@@ -108,7 +108,7 @@ re!(CVV_LABEL, r"(?i)^\s*(?:cvv2?|cvc2?|csc|security\s+code)\s*[:#]?\s*$");
 re!(ASSIGN, r#"([A-Za-z0-9_.\-\[\]'"]+)\s*(:=|=>|=|:)\s*(["']?)([^\s"',;&]+)"#);
 // "Secret key   8f14e4..." laid out in columns, with nothing but space between.
 re!(LABELLED, r"(?i)\b(?:api[\s_-]?key|secret(?:[\s_-]?key)?|client[\s_-]?secret|access[\s_-]?(?:key|token)|private[\s_-]?key|auth[\s_-]?token|token|password|passcode)\b\s{1,6}([A-Za-z0-9_\-+/=.~]{16,})");
-re!(PLACEHOLDER, r"(?i)^<[^>]*>$|^your[_\-]|^\$\{.*\}$|^\{\{.*\}\}$|^\$[A-Za-z_(]|^%\(|^changeme$|^placeholder$|^x{3,}$|\.\.\.$");
+re!(PLACEHOLDER, r"(?i)^<[^>]*>$|^your[_\-][a-z_\-]*$|^\$\{.*\}$|^\{\{.*\}\}$|^\$[A-Za-z_(]|^%\(|^changeme$|^placeholder$|^x{3,}$|\.\.\.$");
 re!(DOTTED, r"^(?:self|this|args|settings|os|config|cfg|env|opts|options|params|props|req|request|ctx|process|row|obj|data|state|user|form)(?:\.[A-Za-z_]\w*)+$");
 // A call or a lookup: getpass.getpass(), os.environ["X"].
 re!(CODE_START, r"^(?:[A-Za-z_][\w.]*[(\[]|\{)");

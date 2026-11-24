@@ -208,7 +208,11 @@ impl Engine {
     }
 
     pub fn set_config(&self, config: Config) {
-        *lock(&self.s.config) = config;
+        let was = std::mem::replace(&mut *lock(&self.s.config), config.clone()).developer;
+        // Developer mode off means no log, not a log nobody is looking at.
+        if was && !config.developer {
+            let _ = lock(&self.s.store).dev_clear();
+        }
         self.s.wake.notify_all();
     }
 
@@ -1177,7 +1181,13 @@ mod tests {
         e.note_capture("app".into(), "Nothing has changed".into());
         let l = e.dev_log(50, None).unwrap();
         assert_eq!((l.len(), l[0].kind.as_str(), l[0].request.as_str(), l[0].note.as_str()), (1, "capture", "app", "Nothing has changed"));
-        e.forget(i64::MIN, i64::MAX).unwrap();
+        e.forget(0, now_ms() + 1).unwrap();
+        assert!(e.dev_log(50, None).unwrap().is_empty());
+        // Turning it off takes the log with it.
+        std::thread::sleep(Duration::from_millis(5));
+        e.note_capture("app".into(), "Taken".into());
+        assert_eq!(e.dev_log(50, None).unwrap().len(), 1);
+        e.set_config(config(true));
         assert!(e.dev_log(50, None).unwrap().is_empty());
         e.shutdown();
     }

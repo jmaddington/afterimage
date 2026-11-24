@@ -17,6 +17,8 @@ public enum CaptureOutcome: Sendable, Equatable {
 public actor Capturer {
     private let engine: Engine
     private var busy = false
+    /// Why the last capture was refused on privacy grounds, for a log that mustn't name the app.
+    public private(set) var lastRefusal: HideReason?
     public init(engine: Engine) { self.engine = engine }
 
     /// Asked of the recorder each time: why not to look right now (nil to go ahead), and what is off-limits.
@@ -75,6 +77,7 @@ public actor Capturer {
         guard !busy else { return .blocked("Busy") }
         busy = true
         defer { busy = false }
+        lastRefusal = nil
 
         let front = await MainActor.run { NSWorkspace.shared.frontmostApplication.map { ($0.processIdentifier, $0.localizedName ?? "", $0.bundleIdentifier ?? "") } }
         guard let front else { return .skipped("No app is in front") }
@@ -82,7 +85,10 @@ public actor Capturer {
 
         let exclusions = await gate().exclusions
         var hiddenBefore = await hidden(exclusions)
-        if hiddenBefore.pids.contains(front.0) { return Self.refused(hiddenBefore.reasons[front.0], front.1) }
+        if hiddenBefore.pids.contains(front.0) {
+            lastRefusal = hiddenBefore.reasons[front.0] ?? .app
+            return Self.refused(hiddenBefore.reasons[front.0], front.1)
+        }
         let frontWindow = OnScreenWindow.front(of: front.0, in: OnScreenWindow.all())
 
         let content: SCShareableContent
@@ -91,7 +97,10 @@ public actor Capturer {
         } catch { return .failed(error.localizedDescription) }
         // Listing windows can take long enough for the facts to change.
         hiddenBefore = await hidden(exclusions)
-        if hiddenBefore.pids.contains(front.0) { return Self.refused(hiddenBefore.reasons[front.0], front.1) }
+        if hiddenBefore.pids.contains(front.0) {
+            lastRefusal = hiddenBefore.reasons[front.0] ?? .app
+            return Self.refused(hiddenBefore.reasons[front.0], front.1)
+        }
         let omit = content.applications.filter { hiddenBefore.pids.contains($0.processID) }
         let omitted = Set(omit.map(\.processID))
         let displays = pick(content.displays, front: frontWindow?.bounds, all: allDisplays)
@@ -218,6 +227,19 @@ public actor Capturer {
     }
     static func refused(_ r: HideReason?, _ app: String) -> CaptureOutcome {
         r == .unreadable || r == .noAnswer ? .skipped(phrase(r, app)) : .blocked(phrase(r, app))
+    }
+    /// The same reasons without saying which app: which apps a person excludes is their business.
+    public static func logPhrase(_ r: HideReason) -> String {
+        switch r {
+        case .passwordManager: "A password manager was in front"
+        case .site: "An excluded site was open"
+        case .privateWindow: "A private window was open"
+        case .unreadable: "A browser’s address couldn’t be read"
+        case .secretField: "A browser was showing a secret that couldn’t be placed"
+        case .noAnswer: "A browser’s extension didn’t answer"
+        case .systemPrompt: "macOS was asking for something"
+        case .app: "An excluded app was in front"
+        }
     }
     static func phrase(_ r: HideReason?, _ app: String) -> String {
         switch r {

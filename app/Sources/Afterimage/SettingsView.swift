@@ -174,7 +174,7 @@ private struct IntelligenceSettings: View {
                 Toggle("Developer mode", isOn: $settings.developer)
                 Button("Show Log") { openWindow(id: "devlog") }
             } footer: {
-                Text("Keeps every request to LM Studio and its answer for a week, with secrets removed, along with each decision to take a picture or not.").foregroundStyle(.secondary)
+                Text("Keeps every request to LM Studio and its answer for a week, with secrets removed, along with each decision to take a picture or not. Turning it off deletes the log.").foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)

@@ -143,11 +143,12 @@ import Observation
             let r = await capturer.capture(t, allDisplays: all) { self.gate() }
             capturing = false
             if settings.developer {
+                let refusal = await capturer.lastRefusal.map(Capturer.logPhrase)
                 let what: String = switch r {
                 case .queued(let n): n == 1 ? "Taken" : "Taken (\(n) displays)"
                 case .unchanged: "Nothing had changed"
-                case .skipped(let why): "Skipped, will retry: \(why)"
-                case .blocked(let why): "Not taken: \(why)"
+                case .skipped(let why): "Skipped, will retry: \(refusal ?? why)"
+                case .blocked(let why): "Not taken: \(refusal ?? why)"
                 case .failed(let why): "Failed: \(why)"
                 }
                 Task.detached { [engine] in engine.noteCapture(trigger: t.rawValue, outcome: what) }
