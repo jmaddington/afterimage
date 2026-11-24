@@ -178,3 +178,46 @@ import Testing
         #expect(s.recording && s.onboarded && AppSettings(d).recording && AppSettings(d).onboarded)
     }
 }
+
+@Suite struct BrowserLinkTests {
+    let dir = FileManager.default.temporaryDirectory.appending(path: "afterimage-link-\(UUID())")
+    func chrome() -> URL { dir.appending(path: "Google/Chrome") }
+
+    @Test func connectingWritesAHostFileTheBrowserWillAccept() throws {
+        try FileManager.default.createDirectory(at: chrome(), withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let link = BrowserLink(support: dir, bridge: "/Applications/Afterimage.app/Contents/MacOS/afterimage-bridge")
+        let b = try #require(link.browsers.first { $0.name == "Google Chrome" })
+        #expect(b.installed && !link.isConnected(b))
+        try link.connect(b)
+        #expect(link.isConnected(b))
+        let f = chrome().appending(path: "NativeMessagingHosts/com.jmaddington.afterimage.json")
+        let j = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: f)) as? [String: Any])
+        #expect(j["name"] as? String == "com.jmaddington.afterimage" && j["type"] as? String == "stdio")
+        #expect(j["path"] as? String == "/Applications/Afterimage.app/Contents/MacOS/afterimage-bridge")
+        #expect(j["allowed_origins"] as? [String] == ["chrome-extension://\(BrowserLink.chromeExtensionID)/"])
+        // Moved app: the old path no longer counts.
+        #expect(!BrowserLink(support: dir, bridge: "/elsewhere/afterimage-bridge").isConnected(b))
+        try link.disconnect(b)
+        #expect(!link.isConnected(b) && !FileManager.default.fileExists(atPath: f.path))
+    }
+    @Test func firefoxNamesTheExtensionNotAnOrigin() throws {
+        try FileManager.default.createDirectory(at: dir.appending(path: "Mozilla"), withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let link = BrowserLink(support: dir, bridge: "/x/afterimage-bridge")
+        let b = try #require(link.browsers.first { $0.name == "Firefox" })
+        try link.connect(b)
+        let j = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: dir.appending(path: "Mozilla/NativeMessagingHosts/com.jmaddington.afterimage.json"))) as? [String: Any])
+        #expect(j["allowed_extensions"] as? [String] == ["afterimage@jmaddington.com"] && j["allowed_origins"] == nil)
+    }
+    @Test func browsersThatAreNotThereAreNotOffered() {
+        let link = BrowserLink(support: dir, bridge: "/x/afterimage-bridge")
+        #expect(link.browsers.allSatisfy { !$0.installed })
+        #expect(throws: (any Error).self) { try link.connect(link.browsers[0]) }
+    }
+    @Test func theIDMatchesTheExtensionsKey() throws {
+        let m = URL(fileURLWithPath: #filePath).deletingLastPathComponent().appending(path: "../../../extension/host.chrome.json").standardizedFileURL
+        let j = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: m)) as? [String: Any])
+        #expect(j["allowed_origins"] as? [String] == ["chrome-extension://\(BrowserLink.chromeExtensionID)/"])
+    }
+}

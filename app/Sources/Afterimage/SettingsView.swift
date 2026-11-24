@@ -102,6 +102,7 @@ private struct PrivacySettings: View {
             } header: { Text("Sites") } footer: {
                 Text("If one of these is showing in any window, that browser is left out of the picture.").foregroundStyle(.secondary)
             }
+            BrowserSection()
         }
         .formStyle(.grouped)
         .fileImporter(isPresented: $choosing, allowedContentTypes: [.application], allowsMultipleSelection: true) { r in
@@ -128,6 +129,7 @@ private struct PrivacySettings: View {
 private struct IntelligenceSettings: View {
     @Environment(AppModel.self) private var model
     @Environment(AppSettings.self) private var settings
+    @Environment(\.openWindow) private var openWindow
     @State private var models: [ModelInfo] = []
 
     var body: some View {
@@ -164,9 +166,15 @@ private struct IntelligenceSettings: View {
                     Text("Always").tag("always")
                     Text("Never").tag("never")
                 }
-                ModelPicker(models: models, vision: false, selection: $settings.embedModel).labelsHidden(false)
+                LabeledContent("Search model") { ModelPicker(models: models, vision: false, selection: $settings.embedModel).labelsHidden() }
             } footer: {
                 Text("Descriptions and search by meaning are made after secrets are hidden. The model is released after five idle minutes.").foregroundStyle(.secondary)
+            }
+            Section {
+                Toggle("Developer mode", isOn: $settings.developer)
+                Button("Show Log") { openWindow(id: "devlog") }
+            } footer: {
+                Text("Keeps every request to LM Studio and its answer for a week, with secrets removed, along with each decision to take a picture or not.").foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
@@ -243,5 +251,52 @@ private struct StorageSettings: View {
             _ = try? await Task.detached { [e = model.engine] in e.setConfig(config: c); return try e.applyRetention() }.value
             model.reload()
         }
+    }
+}
+
+/// Connects browsers to the extension that tells Afterimage where secret fields are.
+private struct BrowserSection: View {
+    @Environment(AppModel.self) private var model
+    @State private var link = BrowserLink()
+    @State private var heard: Set<String> = []
+    @State private var changed = 0
+    @State private var problem: String?
+
+    var body: some View {
+        let browsers = link.browsers.filter(\.installed)
+        Section {
+            if browsers.isEmpty { Text("No supported browser found.").foregroundStyle(.secondary) }
+            ForEach(browsers) { b in
+                let connected = changed >= 0 && link.isConnected(b)
+                HStack {
+                    AppIcon(bundleId: b.bundleId, size: 20)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(b.name)
+                        Text(heard.contains(b.bundleId) ? "Connected" : connected ? "Now add the extension in \(b.name)" : "Not connected").font(.callout).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if connected {
+                        Button("Show Extension") { NSWorkspace.shared.activateFileViewerSelecting([BrowserLink.extensionFolder(gecko: link.isGecko(b))]) }
+                        Button("Disconnect") { act { try link.disconnect(b) } }
+                    } else {
+                        Button("Connect") { act { try link.connect(b) } }
+                    }
+                }
+            }
+            if let p = problem { Text(p).foregroundStyle(.red) }
+        } header: { Text("Browser Extension") } footer: {
+            Text("The extension tells Afterimage where password, card and account boxes are, including ones inside a page, so only those are frosted. It sends places, never what’s typed, and only to this Mac. After connecting, open the browser’s extensions page, turn on Developer mode, choose Load unpacked and pick the folder shown.").foregroundStyle(.secondary)
+        }
+        .task {
+            while !Task.isCancelled {
+                let running = browsers.flatMap { b in NSRunningApplication.runningApplications(withBundleIdentifier: b.bundleId).map { (b.bundleId, $0.processIdentifier) } }
+                heard = await Task.detached { [e = model.engine] in Set(running.filter { e.extensionHeard(pid: $0.1) }.map(\.0)) }.value
+                try? await Task.sleep(for: .seconds(2))
+            }
+        }
+    }
+    private func act(_ f: () throws -> Void) {
+        do { try f(); problem = nil } catch { problem = error.localizedDescription }
+        changed += 1
     }
 }

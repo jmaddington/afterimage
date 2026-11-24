@@ -249,6 +249,11 @@ impl Engine {
         }
     }
 
+    /// Has this browser's extension said anything lately?
+    pub fn extension_heard(&self, pid: i32) -> bool {
+        !lock(&self.s.pages).sources(pid, Instant::now()).is_empty()
+    }
+
     pub fn page_hint(&self, pid: i32) -> pages::PageHint {
         lock(&self.s.pages).hint(pid, Instant::now())
     }

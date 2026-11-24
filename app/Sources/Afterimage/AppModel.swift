@@ -218,6 +218,18 @@ extension Shot {
     }
 
     var openShot: Shot? { open.flatMap { id in shots.first { $0.id == id } } }
+    func canStep(_ by: Int) -> Bool {
+        guard let id = open, let i = shots.firstIndex(where: { $0.id == id }) else { return false }
+        return shots.indices.contains(i + by)
+    }
+    /// From the developer log: show this picture wherever the person was.
+    func show(_ id: Int64) {
+        query = ""
+        place = .all
+        selection = [id]
+        open = id
+        reload()
+    }
     func step(_ by: Int) {
         guard let id = open, let i = shots.firstIndex(where: { $0.id == id }), shots.indices.contains(i + by) else { return }
         open = shots[i + by].id

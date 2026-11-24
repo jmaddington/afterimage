@@ -27,6 +27,7 @@ import Observation
     public var port: Int { didSet { save("port", port) } }
     public var keepDays: Int { didSet { save("keepDays", keepDays) } }
     public var keepGB: Int { didSet { save("keepGB", keepGB) } }
+    public var developer: Bool { didSet { save("developer", developer) } }
     public var onboarded: Bool { didSet { save("onboarded", onboarded) } }
     public var recording: Bool { didSet { save("recording", recording) } }
 
@@ -52,6 +53,7 @@ import Observation
         port = get("port", 1234)
         keepDays = get("keepDays", 30)
         keepGB = get("keepGB", 20)
+        developer = get("developer", false)
         onboarded = get("onboarded", false)
         recording = get("recording", true)
     }
@@ -81,6 +83,6 @@ import Observation
     public var config: Config {
         Config(lmUrl: "http://127.0.0.1:\(port)", model: model, embedModel: embedModel, requireAi: requireAI,
                describe: describe == "always" ? .always : describe == "never" ? .never : .pluggedIn,
-               maxAgeDays: UInt32(max(0, keepDays)), maxBytes: UInt64(max(0, keepGB)) * 1_000_000_000, unloadAfterSecs: 300)
+               maxAgeDays: UInt32(max(0, keepDays)), maxBytes: UInt64(max(0, keepGB)) * 1_000_000_000, unloadAfterSecs: 300, developer: developer)
     }
 }

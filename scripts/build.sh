@@ -28,5 +28,7 @@ if [[ ! -f build/AppIcon.icns || scripts/make-icon.swift -nt build/AppIcon.icns 
   rm -rf build/AppIcon.iconset; swift scripts/make-icon.swift build/AppIcon.iconset; iconutil -c icns build/AppIcon.iconset -o build/AppIcon.icns
 fi
 cp build/AppIcon.icns "$APP/Contents/Resources/"
+step "Extension" ./scripts/extension.sh
+cp -R build/extension "$APP/Contents/Resources/extension"
 
 ./scripts/sign.sh "$APP"
