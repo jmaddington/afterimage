@@ -89,7 +89,19 @@ pub fn register_browsers(bundle_ids: Vec<String>) {
     *OTHER_BROWSERS.write().unwrap_or_else(|e| e.into_inner()) = bundle_ids.into_iter().map(|b| b.to_lowercase()).collect();
 }
 
+/// Registered apps that have actually shown a web page. Terminals and the like register for links and never do.
+static SHOWN_PAGES: std::sync::LazyLock<std::sync::RwLock<std::collections::HashSet<String>>> = std::sync::LazyLock::new(Default::default);
+
+fn only_registered(bundle: &str) -> bool {
+    family_of(bundle, false).is_none() && family_of(bundle, true).is_some()
+}
+
 fn family(bundle: &str) -> Option<Family> {
+    family_of(bundle, true)
+}
+
+/// `registered`: also count apps this Mac says can open web pages.
+fn family_of(bundle: &str, registered: bool) -> Option<Family> {
     let b = bundle.to_lowercase();
     let p = |list: &[&str]| list.iter().any(|x| b == *x || b.starts_with(&format!("{x}.")));
     if is_tor(&b) {
@@ -105,7 +117,7 @@ fn family(bundle: &str) -> Option<Family> {
     } else if p(&["company.thebrowser.browser", "company.thebrowser.dia", "com.sigmaos.sigmaos.macos", "ai.perplexity.comet",
                   "com.perplexity.comet", "com.openai.atlas", "com.duckduckgo.macos.browser"]) {
         Some(Family::Other)
-    } else if OTHER_BROWSERS.read().unwrap_or_else(|e| e.into_inner()).contains(&b) {
+    } else if registered && OTHER_BROWSERS.read().unwrap_or_else(|e| e.into_inner()).contains(&b) {
         Some(Family::Other)
     } else {
         None
@@ -120,7 +132,8 @@ pub fn is_browser(bundle_id: &str) -> bool {
 /// Firefox describes its pages to accessibility only once asked to.
 #[uniffi::export]
 pub fn needs_waking(bundle_id: &str) -> bool {
-    family(bundle_id) == Some(Family::Firefox)
+    // An unfamiliar browser may be built on Firefox; asking does no harm to one that isn't.
+    family(bundle_id) == Some(Family::Firefox) || only_registered(bundle_id)
 }
 
 fn is_tor(bundle_id: &str) -> bool {
@@ -412,6 +425,15 @@ pub fn hide_browser(ex: &Exclusions, bundle_id: &str, windows: &[BrowserWindow],
     let rules: Vec<Rule> = ex.sites.iter().filter_map(|s| Rule::parse(s)).collect();
     if ex.tor && is_tor(bundle_id) {
         return Some(HideReason::App);
+    }
+    if only_registered(bundle_id) {
+        let b = bundle_id.to_lowercase();
+        if windows.iter().any(|w| !w.urls.is_empty()) {
+            SHOWN_PAGES.write().unwrap_or_else(|e| e.into_inner()).insert(b.clone());
+        }
+        if !SHOWN_PAGES.read().unwrap_or_else(|e| e.into_inner()).contains(&b) {
+            return None;
+        }
     }
     let mut unreadable = !complete;
     let mut evasive = false;
@@ -851,14 +873,20 @@ mod tests {
     }
 
     #[test]
-    fn any_app_that_opens_web_pages_is_treated_as_a_browser() {
+    fn an_app_that_opens_web_pages_is_a_browser_once_it_shows_one() {
         assert!(!is_browser("net.mullvad.mullvadbrowser"));
-        register_browsers(vec!["net.Mullvad.MullvadBrowser".into(), "one.ablaze.floorp".into()]);
-        assert!(is_browser("net.mullvad.mullvadbrowser") && is_browser("one.ablaze.floorp") && !is_browser("com.apple.finder"));
+        register_browsers(vec!["net.Mullvad.MullvadBrowser".into(), "one.ablaze.floorp".into(), "com.example.terminal".into()]);
+        assert!(is_browser("net.mullvad.mullvadbrowser") && is_browser("one.ablaze.floorp") && !is_browser("com.apple.finder") && needs_waking("one.ablaze.floorp"));
         let e = sites(&["chase.com"]);
+        // A terminal also says it opens links. With no page in it, it's an ordinary app, readable or not.
+        let plain = BrowserWindow { urls: vec![], ..win("x") };
+        assert_eq!(hide_browser(&e, "com.example.terminal", &[plain.clone()], true), None);
+        assert_eq!(hide_browser(&e, "com.example.terminal", &[], false), None);
+        // One page seen, and from then on it is held to a browser's rules.
         assert_eq!(hide_browser(&e, "net.mullvad.mullvadbrowser", &[win("https://chase.com/")], true), Some(HideReason::Site));
-        assert_eq!(hide_browser(&e, "one.ablaze.floorp", &[], false), Some(HideReason::Unreadable));
+        assert_eq!(hide_browser(&e, "net.mullvad.mullvadbrowser", &[], false), Some(HideReason::Unreadable));
+        assert_eq!(hide_browser(&e, "net.mullvad.mullvadbrowser", &[plain], true), Some(HideReason::Unreadable));
         let private = BrowserWindow { title: Some("Chase — Private Browsing".into()), ..win("https://a.com") };
-        assert_eq!(hide_browser(&ex(), "net.mullvad.mullvadbrowser", &[private], true), Some(HideReason::PrivateWindow));
+        assert_eq!(hide_browser(&ex(), "one.ablaze.floorp", &[private], true), Some(HideReason::PrivateWindow));
     }
 }
