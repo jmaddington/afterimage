@@ -23,7 +23,7 @@ shutil.rmtree("build/extension/chrome-store", ignore_errors=True)
 shutil.copytree("build/extension/chrome", "build/extension/chrome-store")
 json.dump(d, open("build/extension/chrome-store/manifest.json", "w"), indent=2)
 PY
-rm -f build/dist-extension/*.zip
+rm -f build/dist-extension/afterimage-chrome.zip build/dist-extension/afterimage-firefox.zip
 (cd build/extension/chrome-store && zip -qr ../../dist-extension/afterimage-chrome.zip .)
 (cd build/extension/firefox && zip -qr ../../dist-extension/afterimage-firefox.zip .)
 rm -rf build/extension/chrome-store
