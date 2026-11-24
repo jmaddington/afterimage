@@ -64,6 +64,12 @@ func saveAndReread(_ name: String, config: Config = rulesOnly()) async throws ->
         #expect(r.shot.regions.isEmpty)
         #expect(r.seen.contains("Password reset page redesign"))
     }
+    @Test func twoFactorAndWifiCodesAreHidden() async throws {
+        let r = try await saveAndReread("qr")
+        #expect(r.shot.regions.count >= 2)
+        for s in ["JBSWY3DPEHPK3PXP", "otpauth", "marmalade"] { #expect(!r.seen.contains(s)); #expect(!r.indexed.contains(s)) }
+        #expect(r.seen.contains("Scan to set up")); #expect(r.indexed.contains("example.com/menu"))   // a harmless code stays
+    }
     @Test func savedFilesArePrivate() async throws {
         let dir = FileManager.default.temporaryDirectory.appending(path: "afterimage-\(UUID())")
         defer { try? FileManager.default.removeItem(at: dir) }

@@ -1,5 +1,40 @@
+// Developer tool.  seed <dir> [fixtures]: fill a demo library from synthetic pictures.  ocr <png>: show what OCR reads.
+import AfterimageEngine
 import AfterimageKit
 import Foundation
-let path = CommandLine.arguments[1]
-let img = Pixels.load(path)!
-for i in 0..<4 { let t = Date(); let l = try Recognizer.lines(in: img); print(i, l.count, Date().timeIntervalSince(t)) }
+
+let args = CommandLine.arguments
+guard args.count >= 3 else { print("usage: afterimage-checks seed <dir> [fixtures] | ocr <png>"); exit(2) }
+if args[1] == "ocr" {
+    guard let i = Pixels.load(args[2]) else { print("can't read \(args[2])"); exit(1) }
+    for l in try Recognizer.lines(in: i) { print(String(format: "%.3f %.3f  ", l.rect.x, l.rect.y) + l.text) }
+    exit(0)
+}
+let fixtures = args.count > 3 ? args[3] : "fixtures"
+let live = ProcessInfo.processInfo.environment["AFTERIMAGE_LIVE"] != nil
+let config = Config(lmUrl: live ? "http://127.0.0.1:1234" : "http://127.0.0.1:9", model: "gemma-4-26b-a4b-it-qat-mlx", embedModel: live ? "text-embedding-nomic-embed-text-v1.5" : "",
+                    requireAi: live, describe: live ? .always : .never, maxAgeDays: 0, maxBytes: 0, unloadAfterSecs: 0)
+let engine = try Engine(root: args[2], config: config, host: ImageHost())
+let cast: [(String, String, String, String)] = [
+    ("onboarding", "Numbers", "com.apple.Numbers", "Employee record"), ("terminal", "Terminal", "com.apple.Terminal", "deploy — zsh"),
+    ("notes", "Notes", "com.apple.Notes", "House stuff"), ("checkout", "Safari", "com.apple.Safari", "Checkout"), ("clean", "Pages", "com.apple.Pages", "Quarterly plan"),
+]
+let running = cast.map { AppRef(name: $0.1, bundleId: $0.2) }
+let triggers = ["app", "window", "tab", "interval", "launch"]
+let start = Date()
+var n: UInt64 = 0
+for round in 0..<4 {
+    for (i, c) in cast.enumerated() {
+        guard let img = Pixels.load("\(fixtures)/\(c.0).png"), let b = Pixels.bitmap(img) else { continue }
+        let at = start.addingTimeInterval(-Double(round * 5 + i) * 3700 - Double(round) * 30000)
+        let m = Moment(takenAt: Int64(at.timeIntervalSince1970 * 1000), trigger: triggers[(i + round) % 5], display: "Built-in Display", appName: c.1, bundleId: c.2, windowTitle: c.3,
+                       url: c.0 == "checkout" ? "https://shop.example/checkout?session=abc" : "", userName: "dana", fullName: "Dana Whitfield", host: "Demo Mac", sessions: ["dana (console)"], runningApps: running)
+        engine.ingest(frame: Frame(rgba: b.data, width: UInt32(b.width), height: UInt32(b.height), stride: UInt32(b.stride), lines: try Recognizer.lines(in: img), moment: m, displayKey: "\(round)-\(i)"))
+        n += 1
+        while try engine.stats().count < n && engine.status().discarded == 0 { Thread.sleep(forTimeInterval: 0.1) }
+        if engine.status().discarded > 0 { print("discarded: \(engine.status().discardReason)"); exit(1) }
+    }
+}
+if live { while try engine.stats().pending > 0 { Thread.sleep(forTimeInterval: 0.5) } }
+engine.shutdown()
+print("seeded \(n) pictures")

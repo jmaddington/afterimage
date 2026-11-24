@@ -128,6 +128,8 @@ re!(KNOWN, r"(?x)
   | \bdop_v1_[a-f0-9]{16,}
   | \beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-.]*
 ");
+// Payloads of setup QR codes, which the recogniser hands over as lines of text.
+re!(QR_SECRET, r"(?i)otpauth(?:-migration)?://.*|\bWIFI:[^\n]*\bP:.*");
 re!(PEM_BEGIN, r"-{2,}\s*BEGIN [A-Z0-9 ]*(?:PRIVATE KEY|SECRET)");
 re!(PEM_END, r"-{2,}\s*END [A-Z0-9 ]*(?:PRIVATE KEY|SECRET)");
 re!(LONG_TOKEN, r"[A-Za-z0-9_+/=\-]{24,}");
@@ -276,6 +278,9 @@ pub fn scan_text(text: &str, line: usize, hits: &mut Vec<Hit>) {
     }
     for c in URL_CRED.captures_iter(text) {
         push(hits, line, c.get(1).unwrap().range(), Password);
+    }
+    for m in QR_SECRET.find_iter(text) {
+        push(hits, line, m.range(), Key);
     }
     for m in KNOWN.find_iter(text) {
         push(hits, line, m.range(), Key);
@@ -472,6 +477,9 @@ mod tests {
             ("{\"password\": \"hunter2!\"}", "hunter2"),
             ("POSTGRES://a:topsecret@h/db", "topsecret"),
             ("shpat_abcdefghijklmnop12", "shpat"),
+            ("otpauth://totp/Acme:dana?secret=JBSWY3DPEHPK3PXP&issuer=Acme", "JBSWY"),
+            ("otpauth-migration://offline?data=CjEKCkhl", "CjEK"),
+            ("WIFI:T:WPA;S:BlueHeron;P:marmalade tuba;;", "marmalade"),
         ] {
             assert!(!masked(t).contains(secret), "leaked from {t:?}: {}", masked(t));
         }

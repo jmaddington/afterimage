@@ -11,9 +11,12 @@ public enum Recognizer {
         // Correction "fixes" passwords and code into dictionary words.
         req.usesLanguageCorrection = false
         req.automaticallyDetectsLanguage = true
-        try autoreleasepool { try VNImageRequestHandler(cgImage: image, options: [:]).perform([req]) }
-        guard let found = req.results else { throw CocoaError(.featureUnsupported) }
-        return readingOrder(found.compactMap(line))
+        // A two-step sign-in or Wi-Fi code is a secret no OCR can see; its payload joins the text so the same rules apply.
+        let codes = VNDetectBarcodesRequest()
+        try autoreleasepool { try VNImageRequestHandler(cgImage: image, options: [:]).perform([req, codes]) }
+        guard let found = req.results, let boxes = codes.results else { throw CocoaError(.featureUnsupported) }
+        let payloads = boxes.compactMap { b in b.payloadStringValue.map { TextLine(text: $0, rect: rect(b.boundingBox), tokens: []) } }
+        return readingOrder(found.compactMap(line)) + payloads
     }
 
     private static func line(_ o: VNRecognizedTextObservation) -> TextLine? {

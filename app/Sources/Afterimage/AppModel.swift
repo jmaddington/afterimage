@@ -104,6 +104,9 @@ extension Shot {
         }
         reload()
         if settings.onboarded { recorder.start() }
+        #if DEBUG
+        stage(ProcessInfo.processInfo.environment["AFTERIMAGE_STAGE"] ?? "")
+        #endif
         Task { [weak self] in
             while let self {
                 await self.probe()
@@ -126,6 +129,17 @@ extension Shot {
         let s = await Task.detached { [engine] in engine.probe() }.value
         status = s
     }
+
+    #if DEBUG
+    /// Puts the window in a given state so screenshots of the UI need no clicking.
+    private func stage(_ s: String) {
+        Task {
+            try? await Task.sleep(for: .seconds(2))
+            if s.hasPrefix("search:") { query = String(s.dropFirst(7)) }
+            if s.hasPrefix("open:") { query = String(s.dropFirst(5)); try? await Task.sleep(for: .seconds(2)); open = shots.first?.id; selection = Set(shots.prefix(1).map(\.id)) }
+        }
+    }
+    #endif
 
     // MARK: Library
 
