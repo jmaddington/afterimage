@@ -18,7 +18,7 @@ public actor Capturer {
     private let engine: Engine
     private var busy = false
     /// Why the last capture was refused on privacy grounds, for a log that mustn't name the app.
-    public private(set) var lastRefusal: HideReason?
+    private var lastRefusal: HideReason?
     public init(engine: Engine) { self.engine = engine }
 
     /// Asked of the recorder each time: why not to look right now (nil to go ahead), and what is off-limits.
@@ -72,12 +72,18 @@ public actor Capturer {
         _ = try? Recognizer.lines(in: i)
     }
 
-    public func capture(_ trigger: Trigger, allDisplays: Bool, gate: @escaping Gate) async -> CaptureOutcome {
+    /// The outcome, and when it was a privacy refusal, which kind (for a log that mustn't name the app).
+    public func capture(_ trigger: Trigger, allDisplays: Bool, gate: @escaping Gate) async -> (outcome: CaptureOutcome, refusal: HideReason?) {
         // Actors are re-entrant across awaits; without this two cycles could mix one's pixels with the other's facts.
-        guard !busy else { return .blocked("Busy") }
+        guard !busy else { return (.blocked("Busy"), nil) }
         busy = true
         defer { busy = false }
         lastRefusal = nil
+        let outcome = await run(trigger, allDisplays: allDisplays, gate: gate)
+        return (outcome, lastRefusal)
+    }
+
+    private func run(_ trigger: Trigger, allDisplays: Bool, gate: @escaping Gate) async -> CaptureOutcome {
 
         let front = await MainActor.run { NSWorkspace.shared.frontmostApplication.map { ($0.processIdentifier, $0.localizedName ?? "", $0.bundleIdentifier ?? "") } }
         guard let front else { return .skipped("No app is in front") }

@@ -140,10 +140,10 @@ import Observation
         let all = settings.allDisplays, generation = policy.generation
         engine.setConditions(onPower: Session.onPower, calm: Session.calm)
         Task {
-            let r = await capturer.capture(t, allDisplays: all) { self.gate() }
+            let (r, refused) = await capturer.capture(t, allDisplays: all) { self.gate() }
             capturing = false
             if settings.developer {
-                let refusal = await capturer.lastRefusal.map(Capturer.logPhrase)
+                let refusal = refused.map(Capturer.logPhrase)
                 let what: String = switch r {
                 case .queued(let n): n == 1 ? "Taken" : "Taken (\(n) displays)"
                 case .unchanged: "Nothing had changed"

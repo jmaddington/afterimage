@@ -189,6 +189,11 @@ impl Engine {
     pub fn new(root: String, config: Config, host: Arc<dyn HostServices>) -> Result<Arc<Self>, EngineError> {
         let root = PathBuf::from(root);
         let store = Store::open(&root)?;
+        if !config.developer {
+            if let Err(e) = store.dev_clear() {
+                log::error!("the developer log couldn't be cleared: {e} [AIMG-DEVCLEAR0]");
+            }
+        }
         if let Err(e) = store.sweep_orphans() {
             log::error!("orphan sweep failed: {e} [AIMG-ORPHAN]");
         }
@@ -208,11 +213,15 @@ impl Engine {
     }
 
     pub fn set_config(&self, config: Config) {
-        let was = std::mem::replace(&mut *lock(&self.s.config), config.clone()).developer;
-        // Developer mode off means no log, not a log nobody is looking at.
-        if was && !config.developer {
-            let _ = lock(&self.s.store).dev_clear();
+        // AIDEV-NOTE: lock order is store, then config. Held together so no entry can slip in between "off" and the clear.
+        let store = lock(&self.s.store);
+        *lock(&self.s.config) = config.clone();
+        if !config.developer {
+            if let Err(e) = store.dev_clear() {
+                log::error!("the developer log couldn't be cleared: {e} [AIMG-DEVCLEAR]");
+            }
         }
+        drop(store);
         self.s.wake.notify_all();
     }
 
@@ -465,10 +474,13 @@ impl Shared {
     }
 
     fn note(&self, entries: Vec<DevEntry>) {
-        if entries.is_empty() || !lock(&self.config).developer {
+        if entries.is_empty() {
             return;
         }
         let store = lock(&self.store);
+        if !lock(&self.config).developer {
+            return;
+        }
         let forgotten = lock(&self.forgotten);
         for e in entries {
             // Forgotten while it was happening, or about a picture that's gone.
@@ -511,7 +523,8 @@ impl Shared {
     fn retain(&self) -> Result<u64, rusqlite::Error> {
         let c = lock(&self.config).clone();
         let mut st = lock(&self.store);
-        st.dev_trim(now_ms(), 7, 5000)?;
+        // The state, not the moment it changed: with developer mode off there is no log.
+        if c.developer { st.dev_trim(now_ms(), 7, 5000)? } else { st.dev_clear()? }
         let ids = st.expired(now_ms(), c.max_age_days, c.max_bytes)?;
         if ids.is_empty() {
             return Ok(0);
