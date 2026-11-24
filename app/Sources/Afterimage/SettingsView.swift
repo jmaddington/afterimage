@@ -190,8 +190,11 @@ private struct IntelligenceSettings: View {
                             }
                             LabeledContent("Connect another app") {
                                 Button("Copy Settings") {
-                                    NSPasteboard.general.clearContents()
-                                    NSPasteboard.general.setString(AppSettings.agentConfig(port: port, token: settings.agentToken), forType: .string)
+                                    // It holds the token: kept off other devices and out of clipboard managers' histories.
+                                    let board = NSPasteboard.general
+                                    board.prepareForNewContents(with: .currentHostOnly)
+                                    board.setString(AppSettings.agentConfig(port: port, token: settings.agentToken), forType: .string)
+                                    board.setString("", forType: NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType"))
                                 }.help("Contains the token. Paste it only into the app’s own settings.")
                             }
                             LabeledContent("Address", value: "http://127.0.0.1:\(port)/mcp")
