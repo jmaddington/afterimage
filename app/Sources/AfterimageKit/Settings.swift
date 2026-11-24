@@ -59,6 +59,12 @@ import Observation
         changed?()
     }
 
+    /// Pressing Start means start, whatever was chosen before.
+    public func finishOnboarding() {
+        recording = true
+        onboarded = true
+    }
+
     public var exclusions: Exclusions {
         Exclusions(apps: excludedApps, sites: excludedSites, passwordManagers: hidePasswordManagers, privateWindows: hidePrivateWindows, unreadableBrowsers: hideUnreadable)
     }

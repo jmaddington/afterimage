@@ -116,7 +116,7 @@ extension Shot {
     }
 
     func finishOnboarding() {
-        settings.onboarded = true
+        settings.finishOnboarding()
         recorder.start()
     }
 

@@ -149,6 +149,7 @@ import Observation
                 lastNote = "Nothing has changed"
             case .skipped(let why):
                 lastNote = why
+                policy.missed(t, at: now)
             case .failed(let why):
                 failures += 1
                 lastNote = why
@@ -163,7 +164,7 @@ import Observation
         guard Date().timeIntervalSince(lastWindowPoll) >= 1 else { return }
         lastWindowPoll = Date()
         guard let app = NSWorkspace.shared.frontmostApplication,
-              let w = OnScreenWindow.all().first(where: { $0.pid == app.processIdentifier && $0.layer == 0 }) else { return }
+              let w = OnScreenWindow.front(of: app.processIdentifier, in: OnScreenWindow.all()) else { return }
         let title = TriggerPolicy.stableTitle(w.title)
         if let f = front, f.pid == app.processIdentifier {
             if f.window != w.id { policy.event(.window, at: now) } else if f.title != title { policy.event(.tab, at: now) }

@@ -27,6 +27,7 @@ pub enum HideReason {
     Site,
     PrivateWindow,
     Unreadable,
+    SystemPrompt,
 }
 
 /// Desktop password managers. Matched whole, or as a dotted prefix ("com.1password" covers "com.1password.safari").
@@ -35,6 +36,11 @@ const MANAGER_APPS: &[&str] = &[
     "com.callpod", "com.keepersecurity", "com.lastpass", "org.keepassxc", "com.hicknhacksoftware.macpass", "com.dashlane",
     "me.proton.pass", "in.sinew", "com.nordpass", "com.nordsec.nordpass", "com.siber.roboform", "com.markmcguill.strongbox",
     "com.outercorner.secrets", "com.enpass", "com.authy", "com.yubico", "com.2fas",
+];
+
+/// macOS asking for a password, a fingerprint or a permission. Never in the picture, whatever the settings.
+const SYSTEM_PROMPTS: &[&str] = &[
+    "com.apple.localauthentication.uiagent", "com.apple.localauthenticationremoteservice", "com.apple.securityagent", "com.apple.usernotificationcenter",
 ];
 
 /// Web vaults, as site rules. Whole hosts where the vault's path varies by locale.
@@ -98,6 +104,9 @@ pub fn hide_app(ex: &Exclusions, bundle_id: &str) -> Option<HideReason> {
     let b = bundle_id.to_lowercase();
     if b.is_empty() {
         return None;
+    }
+    if SYSTEM_PROMPTS.contains(&b.as_str()) {
+        return Some(HideReason::SystemPrompt);
     }
     if ex.apps.iter().any(|a| a.to_lowercase() == b) {
         return Some(HideReason::App);
@@ -756,5 +765,14 @@ mod tests {
         }
         let deep = Exclusions { sites: vec!["chase.com/*/secret".into()], ..lax };
         assert!(hid(&deep, &format!("{base}https://chase.com/{}/secret", "a".repeat(3000))).is_some());
+    }
+
+    #[test]
+    fn system_prompts_are_always_hidden() {
+        let off = Exclusions { password_managers: false, private_windows: false, unreadable_browsers: false, apps: vec![], sites: vec![] };
+        for b in ["com.apple.LocalAuthentication.UIAgent", "com.apple.SecurityAgent", "com.apple.UserNotificationCenter", "com.apple.LocalAuthenticationRemoteService"] {
+            assert_eq!(hide_app(&off, b), Some(HideReason::SystemPrompt), "{b}");
+        }
+        assert_eq!(hide_app(&off, "com.apple.finder"), None);
     }
 }

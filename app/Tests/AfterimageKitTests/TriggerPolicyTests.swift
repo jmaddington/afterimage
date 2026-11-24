@@ -1,3 +1,5 @@
+import CoreGraphics
+import Foundation
 import Testing
 @testable import AfterimageKit
 
@@ -67,5 +69,52 @@ import Testing
         #expect(TriggerPolicy.stableTitle("Building 41%") == TriggerPolicy.stableTitle("Building 42%"))
         #expect(TriggerPolicy.stableTitle("Inbox") != TriggerPolicy.stableTitle("Sent"))
         #expect(TriggerPolicy.stableTitle("日本語") != TriggerPolicy.stableTitle("中文"))
+    }
+    @Test func aMissedCaptureIsTriedAgainButNotForever() {
+        var p = TriggerPolicy(); p.interval = 0
+        p.event(.tab, at: 100); p.captured(at: 101); p.missed(.tab, at: 101.5)
+        #expect(p.due(at: 102) == nil)
+        #expect(p.due(at: 105.1) == .tab)         // a retry waits the ordinary gap, not the title one
+        p.captured(at: 105.1); p.missed(.tab, at: 106)
+        #expect(p.due(at: 109.2) == .tab)
+        p.captured(at: 109.2); p.missed(.tab, at: 110)
+        #expect(p.due(at: 200) == nil)
+        p.event(.app, at: 201); p.captured(at: 202); p.missed(.app, at: 202.5)
+        #expect(p.due(at: 206.1) == .app)         // a new event earns new tries
+        p.clear(); #expect(p.due(at: 300) == nil)
+        p.missed(.interval, at: 301); #expect(p.due(at: 400) == nil)
+    }
+    @Test func aNewerEventOutranksARetry() {
+        var p = TriggerPolicy(); p.captured(at: 100)
+        p.event(.app, at: 100.5); p.missed(.tab, at: 101)
+        #expect(p.due(at: 104.1) == .app)
+    }
+}
+
+@Suite struct FrontWindowTests {
+    func w(_ id: CGWindowID, _ title: String, _ width: Double = 900, _ height: Double = 700, layer: Int = 0, alpha: Double = 1, pid: pid_t = 5) -> OnScreenWindow {
+        OnScreenWindow(id: id, pid: pid, title: title, layer: layer, bounds: CGRect(x: 0, y: 0, width: width, height: height), alpha: alpha)
+    }
+    @Test func popupsAreNotTheFrontWindow() {
+        let page = w(9, "apples page")
+        #expect(OnScreenWindow.front(of: 5, in: [w(1, "", 1038, 218), page])?.id == 9)     // address bar suggestions
+        #expect(OnScreenWindow.front(of: 5, in: [w(1, "x", 270, 80), page])?.id == 9)      // tab hover card
+        #expect(OnScreenWindow.front(of: 5, in: [w(1, "x", layer: 101), w(2, "x", alpha: 0), w(3, "x", pid: 6), page])?.id == 9)
+        #expect(OnScreenWindow.front(of: 5, in: [w(8, "second"), page])?.id == 8)
+        #expect(OnScreenWindow.front(of: 5, in: [w(1, "", 1038, 218)])?.id == 1)           // nothing better
+        #expect(OnScreenWindow.front(of: 5, in: [w(1, "", 100, 50)])?.id == 1)
+        #expect(OnScreenWindow.front(of: 5, in: []) == nil)
+    }
+}
+
+@MainActor @Suite struct SettingsTests {
+    @Test func startingTurnsRecordingOn() throws {
+        let name = "afterimage.tests.\(UUID())"
+        let d = try #require(UserDefaults(suiteName: name))
+        defer { d.removePersistentDomain(forName: name) }
+        let s = AppSettings(d)
+        s.recording = false
+        s.finishOnboarding()
+        #expect(s.recording && s.onboarded && AppSettings(d).recording && AppSettings(d).onboarded)
     }
 }

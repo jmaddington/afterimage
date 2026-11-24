@@ -74,7 +74,7 @@ public actor Capturer {
         let exclusions = await gate().exclusions
         var hiddenBefore = await hidden(exclusions)
         if hiddenBefore.pids.contains(front.0) { return .skipped(Self.phrase(hiddenBefore.reasons[front.0], front.1)) }
-        let frontWindow = OnScreenWindow.all().first { $0.pid == front.0 && $0.layer == 0 }
+        let frontWindow = OnScreenWindow.front(of: front.0, in: OnScreenWindow.all())
 
         let content: SCShareableContent
         do {
@@ -183,6 +183,7 @@ public actor Capturer {
         case .site: "A site you excluded is open in \(app)"
         case .privateWindow: "\(app) has a private window open"
         case .unreadable: "\(app)’s address couldn’t be read"
+        case .systemPrompt: "macOS is asking for something"
         case .app, nil: "\(app) is excluded"
         }
     }

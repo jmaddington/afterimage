@@ -46,6 +46,12 @@ public enum Session {
 /// What the window server says is on screen. Needs no permission for owners and bounds.
 public struct OnScreenWindow: Sendable {
     public let id: CGWindowID, pid: pid_t, title: String, layer: Int, bounds: CGRect, alpha: Double
+    /// The window a person would say they're in. Suggestion lists and hover cards sit in front of it.
+    public static func front(of pid: pid_t, in list: [OnScreenWindow]) -> OnScreenWindow? {
+        let mine = list.filter { $0.pid == pid && $0.layer == 0 && $0.alpha > 0 }
+        let real = mine.filter { $0.bounds.width > 160 && $0.bounds.height > 160 }
+        return real.first { !$0.title.isEmpty } ?? real.first ?? mine.first
+    }
     public static func all() -> [OnScreenWindow] {
         let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
         return list.compactMap { d in

@@ -71,7 +71,7 @@ private struct PrivacySettings: View {
                 Toggle("Anything while a password is being typed", isOn: $settings.skipSecureInput)
                 Toggle("Browsers whose address can’t be read", isOn: $settings.hideUnreadable)
             } header: { Text("Never capture") } footer: {
-                Text("Password managers includes Bitwarden, Keeper, 1Password, Passwords and others, along with their websites and browser extensions.").foregroundStyle(.secondary)
+                Text("Covers Bitwarden, Keeper, 1Password, Passwords and others, along with their websites and browser extensions.").foregroundStyle(.secondary)
             }
             Section("Apps") {
                 ForEach(settings.excludedApps, id: \.self) { b in
