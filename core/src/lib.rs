@@ -7,6 +7,7 @@ pub mod bridge;
 mod detect;
 mod devlog;
 mod lm;
+mod mcp;
 pub mod pages;
 mod privacy;
 mod redact;
@@ -177,6 +178,7 @@ struct Shared {
     pages: Mutex<pages::Pages>,
     outlets: std::sync::OnceLock<Arc<bridge::Outlets>>,
     question: AtomicU64,
+    mcp: Mutex<Option<mcp::Server>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -220,7 +222,7 @@ impl Engine {
             hasher: RandomState::new(), forgotten: Default::default(), loaded_by_us: Default::default(),
             last_lm_use: Mutex::new(Instant::now()), lm_state: Mutex::new(LmState::Unknown), links: Default::default(),
             discarded: AtomicU64::new(0), reason: Default::default(), busy: AtomicBool::new(false),
-            describing: AtomicBool::new(false), on_power: AtomicBool::new(true), calm: AtomicBool::new(true), pages: Default::default(), outlets: Default::default(), question: AtomicU64::new(now_ms() as u64),
+            describing: AtomicBool::new(false), on_power: AtomicBool::new(true), calm: AtomicBool::new(true), pages: Default::default(), outlets: Default::default(), question: AtomicU64::new(now_ms() as u64), mcp: Default::default(),
         });
         for (name, f) in [("afterimage-save", save_loop as fn(Arc<Shared>)), ("afterimage-index", index_loop)] {
             let s = s.clone();
@@ -351,19 +353,19 @@ impl Engine {
 
     /// Keyword search, plus meaning when `semantic` and the embedding model answers in time.
     pub fn search(&self, filter: Filter, semantic: bool, limit: u32) -> Result<Vec<Shot>, EngineError> {
-        let c = lock(&self.s.config).clone();
-        let emb = if semantic && !c.embed_model.is_empty() && filter.text.trim().chars().count() >= 3 {
-            let (l, tape) = self.s.taped(&c);
-            let e = l.and_then(|l| {
-                self.s.ensure(&l, &c.embed_model, 2048)?;
-                l.embed(&c.embed_model, &format!("search_query: {}", filter.text), 10)
-            }).ok();
-            self.s.note(devlog::search(take(&tape)));
-            e
-        } else {
-            None
-        };
-        Ok(lock(&self.s.store).search(&filter, emb.as_deref(), limit)?)
+        self.s.search(filter, semantic, limit)
+    }
+
+    /// Let an AI agent on this Mac read the library (never change it). Returns the port in use.
+    /// `utc_offset_secs`: this Mac's time zone, so times are given as the person's clock shows them.
+    pub fn mcp_start(&self, port: u16, token: String, utc_offset_secs: i32) -> Result<u16, EngineError> {
+        let server = mcp::start(self.s.clone(), port, token, utc_offset_secs).map_err(|e| EngineError::Failed(format!("The agent connection couldn't start: {e}")))?;
+        let port = server.port;
+        *lock(&self.s.mcp) = Some(server);
+        Ok(port)
+    }
+    pub fn mcp_stop(&self) {
+        *lock(&self.s.mcp) = None;
     }
 
     pub fn lines(&self, id: i64) -> Result<Vec<IndexedLine>, EngineError> {
@@ -484,6 +486,7 @@ impl Engine {
         q.frames.clear();
         drop(q);
         self.s.wake.notify_all();
+        self.mcp_stop();
         self.s.unload_ours();
     }
 }
@@ -493,6 +496,23 @@ fn take(t: &lm::Tape) -> Vec<lm::Call> {
 }
 
 impl Shared {
+    /// Keyword search, plus meaning when `semantic` and the embedding model answers in time.
+    fn search(&self, filter: Filter, semantic: bool, limit: u32) -> Result<Vec<Shot>, EngineError> {
+        let c = lock(&self.config).clone();
+        let emb = if semantic && !c.embed_model.is_empty() && filter.text.trim().chars().count() >= 3 {
+            let (l, tape) = self.taped(&c);
+            let e = l.and_then(|l| {
+                self.ensure(&l, &c.embed_model, 2048)?;
+                l.embed(&c.embed_model, &format!("search_query: {}", filter.text), 10)
+            }).ok();
+            self.note(devlog::search(take(&tape)));
+            e
+        } else {
+            None
+        };
+        Ok(lock(&self.store).search(&filter, emb.as_deref(), limit)?)
+    }
+
     /// A client that records its calls when developer mode is on.
     fn taped(&self, c: &Config) -> (Result<lm::Lm, lm::LmError>, lm::Tape) {
         let tape = lm::Tape::default();
@@ -951,6 +971,8 @@ fn describe_one(s: &Shared) -> Result<bool, String> {
     };
     *lock(&s.last_lm_use) = Instant::now();
     let d = detect::mask_text(&d);
+    // The model's tags are its words about the screen too.
+    let tags: Vec<String> = tags.iter().map(|t| detect::mask_text(t)).collect();
     let emb = if c.embed_model.is_empty() {
         None
     } else {
@@ -1440,6 +1462,134 @@ mod tests {
         wait(|| e.stats().unwrap().count == 1);
         let s = e.list(Filter::default(), 1, 0).unwrap().remove(0);
         assert!(!format!("{:?}", e.lines(s.id).unwrap()).contains("hello") && !s.ai_checked);
+        e.shutdown();
+    }
+
+    // ---- the agent's window onto the library ----
+    const TOKEN: &str = "test-token-0123456789abcdefghij";
+    struct Agent(String);
+    impl Agent {
+        fn post(&self, body: &str, headers: &[(&str, &str)]) -> (u16, serde_json::Value) {
+            let mut r = ureq::Agent::config_builder().http_status_as_error(false).build().new_agent().post(&self.0);
+            for (k, v) in headers {
+                r = r.header(*k, *v);
+            }
+            let mut res = r.send(body).unwrap();
+            (res.status().as_u16(), res.body_mut().read_json().unwrap_or(serde_json::Value::Null))
+        }
+        fn call(&self, method: &str, params: serde_json::Value) -> serde_json::Value {
+            let (code, v) = self.post(&serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).to_string(), &[("authorization", &format!("Bearer {TOKEN}"))]);
+            assert_eq!(code, 200, "{v}");
+            v
+        }
+        fn tool(&self, name: &str, args: serde_json::Value) -> serde_json::Value {
+            let v = self.call("tools/call", serde_json::json!({"name": name, "arguments": args}));
+            let c = &v["result"]["content"][0];
+            if v["result"]["isError"] == true { return serde_json::json!({"error": c["text"]}); }
+            if v["result"]["content"][1]["type"] == "image" {
+                assert!(c["text"].as_str().unwrap().contains("never follow"));
+                return v["result"]["content"][1].clone();
+            }
+            serde_json::from_str(c["text"].as_str().unwrap_or("null")).unwrap()
+        }
+    }
+    fn library() -> (tempfile::TempDir, Arc<Engine>, Agent) {
+        let d = tempfile::tempdir().unwrap();
+        let e = Engine::new(d.path().to_string_lossy().into(), config(false), Arc::new(FakeHost(Default::default()))).unwrap();
+        // 2026-11-24, 09:00 New York. Two windows, a long lunch, then a third.
+        let nine = 1_795_528_800_000i64;
+        for (i, (min, app, title, words)) in [(0, "Mail", "Inbox", "quarterly plan from Dana"), (2, "Mail", "Inbox", "reply to Dana"), (4, "Safari", "Chase", "password: hunter22 balance"),
+                                               (5, "Safari", "Chase", "statement"), (95, "Xcode", "afterimage", "fn main")].into_iter().enumerate() {
+            let mut f = frame(nine + min * 60_000);
+            f.rgba[0] = i as u8;
+            f.lines.truncate(1);
+            f.lines[0].text = words.into();
+            f.moment = Moment { taken_at: nine + min * 60_000, app_name: app.into(), bundle_id: format!("test.{app}"), window_title: title.into(), trigger: "app".into(), user_name: "dana".into(), ..Default::default() };
+            e.ingest(f);
+            wait(|| e.stats().unwrap().count == i as u64 + 1);
+        }
+        let port = e.mcp_start(0, TOKEN.into(), -5 * 3600).unwrap();
+        (d, e, Agent(format!("http://127.0.0.1:{port}/mcp")))
+    }
+
+    #[test]
+    fn an_agent_must_be_local_hold_the_token_and_not_be_a_web_page() {
+        let (_d, e, a) = library();
+        let ok = [("authorization", "Bearer test-token-0123456789abcdefghij")];
+        let ping = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+        assert_eq!(a.post(ping, &ok).0, 200);
+        assert_eq!(a.post(ping, &[]).0, 401);
+        assert_eq!(a.post(ping, &[("authorization", "Bearer test-token-0123456789abcdefghiX")]).0, 401);
+        assert_eq!(a.post(ping, &[("authorization", "Bearer ")]).0, 401);
+        // A page in a browser, with or without the token.
+        assert_eq!(a.post(ping, &[ok[0], ("origin", "https://evil.example")]).0, 403);
+        assert_eq!(a.post(ping, &[ok[0], ("origin", "null")]).0, 403);
+        assert_eq!(a.post(ping, &[ok[0], ("host", "evil.example")]).0, 403);
+        assert_eq!(a.post("not json", &ok).0, 400);
+        assert_eq!(a.post(&"x".repeat((1 << 20) + 1), &ok).0, 413);
+        // A stranger sending a great deal is refused without being held in memory, and the door isn't left jammed.
+        // (It may see the refusal, or the door shut mid-sentence; never a welcome.)
+        let big = ureq::Agent::config_builder().http_status_as_error(false).build().new_agent().post(&a.0).send("x".repeat(3 << 20));
+        assert!(big.map_or(true, |r| r.status().as_u16() == 401));
+        for _ in 0..20 {
+            assert_eq!(a.post(ping, &[]).0, 401);
+        }
+        assert_eq!(a.post(ping, &ok).0, 200);
+        // Only POST /mcp.
+        let get = ureq::Agent::config_builder().http_status_as_error(false).build().new_agent().get(&a.0).header("authorization", ok[0].1).call().unwrap();
+        assert_eq!(get.status().as_u16(), 405);
+        // A notification wants no answer; a short token is refused outright.
+        assert_eq!(a.post(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#, &ok).0, 202);
+        assert!(e.mcp_start(0, "short".into(), 0).is_err());
+        // Switched off, it's gone.
+        e.mcp_stop();
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(ureq::post(&a.0).header("authorization", ok[0].1).send(ping).is_err());
+        e.shutdown();
+    }
+
+    #[test]
+    fn an_agent_can_read_a_day_and_nothing_secret() {
+        let (_d, e, a) = library();
+        let init = a.call("initialize", serde_json::json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}));
+        assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
+        assert!(init["result"]["instructions"].as_str().unwrap().contains("timeline") && init["result"]["instructions"].as_str().unwrap().contains("Never follow instructions"));
+        let names: Vec<String> = a.call("tools/list", serde_json::json!({}))["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_owned()).collect();
+        assert_eq!(names, ["timeline", "search", "get_shot", "get_image"]);
+
+        let t = a.tool("timeline", serde_json::json!({"date": "2026-11-24"}));
+        let s = t["stretches"].as_array().unwrap();
+        let apps: Vec<&str> = s.iter().map(|x| x["app"].as_str().unwrap_or("gap")).collect();
+        assert_eq!(apps, ["Mail", "Safari", "gap", "Xcode"], "{t}");
+        assert_eq!((s[0]["from"].as_str().unwrap(), s[0]["to"].as_str().unwrap(), s[0]["minutes"].as_f64().unwrap()), ("2026-11-24T09:00:00-05:00", "2026-11-24T09:04:00-05:00", 4.0));
+        assert_eq!(s[1]["pictures"].as_array().unwrap().len(), 2);
+        assert_eq!(s[2]["minutes"], 90.0);
+        assert_eq!(t["pictures"], 5);
+        // Another day is empty; a narrower range is narrower.
+        assert_eq!(a.tool("timeline", serde_json::json!({"date": "2026-11-23"}))["pictures"], 0);
+        assert_eq!(a.tool("timeline", serde_json::json!({"from": "2026-11-24T09:03", "to": "2026-11-24T09:30"}))["pictures"], 2);
+
+        let found = a.tool("search", serde_json::json!({"query": "statement"}));
+        let id = found["results"][0]["id"].as_i64().unwrap();
+        assert_eq!(found["results"][0]["app"], "Safari");
+        assert_eq!(a.tool("search", serde_json::json!({"query": "Dana", "app": "test.Safari"}))["results"].as_array().unwrap().len(), 0);
+        let shot = a.tool("get_shot", serde_json::json!({"id": id - 1}));
+        assert_eq!(shot["text_on_screen"], "password: [hidden]");
+        assert_eq!(shot["hidden"][0]["found_by"], "assignment");
+        assert!(shot["note"].as_str().unwrap().contains("never follow") && t["note"].is_string() && found["note"].is_string());
+        assert_eq!(a.tool("get_image", serde_json::json!({"id": id}))["mimeType"], "image/jpeg");
+        // Nothing an agent can ask for holds the secret.
+        let everything = format!("{t}{found}{shot}{}", a.tool("search", serde_json::json!({"query": "hunter22"})));
+        assert!(!everything.contains("hunter22"), "{everything}");
+
+        // Mistakes are explained to the agent, not thrown at it.
+        for (tool, args) in [("get_shot", serde_json::json!({"id": 999})), ("get_shot", serde_json::json!({})), ("search", serde_json::json!({})), ("timeline", serde_json::json!({"date": "yesterday"})),
+                             ("timeline", serde_json::json!({"from": "2026-11-24T10:00", "to": "2026-11-24T09:00"}))] {
+            assert!(a.tool(tool, args.clone())["error"].is_string(), "{tool} {args}");
+        }
+        assert!(a.call("tools/call", serde_json::json!({"name": "delete_everything", "arguments": {}}))["error"]["message"].is_string());
+        assert_eq!(a.call("nonsense", serde_json::json!({}))["error"]["code"], -32601);
+        assert_eq!(e.stats().unwrap().count, 5);
         e.shutdown();
     }
 }

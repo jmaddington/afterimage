@@ -352,6 +352,10 @@ impl Store {
         Ok(())
     }
 
+    pub fn get(&self, id: i64) -> Res<Option<Shot>> {
+        self.db.query_row(&format!("SELECT {COLS} FROM shots s WHERE s.id=?"), [id], |r| row_to_shot(&self.root, r)).optional()
+    }
+
     pub fn ids_matching(&self, f: &Filter) -> Res<Vec<i64>> {
         let (w, a) = Self::clauses(f);
         let mut st = self.db.prepare(&format!("SELECT s.id FROM shots s WHERE {w}"))?;

@@ -199,7 +199,8 @@ impl Lm {
             {"type":"image_url","image_url":{"url":format!("data:image/jpeg;base64,{b}")}}]}]), 600, Some(schema), 180)?;
         let v: Value = serde_json::from_str(&out).map_err(|_| LmError::BadAnswer("not json"))?;
         let d = v["description"].as_str().ok_or(LmError::BadAnswer("description"))?.trim().to_owned();
-        let tags = v["tags"].as_array().into_iter().flatten().filter_map(|t| t.as_str()).map(|t| t.trim().to_lowercase()).filter(|t| !t.is_empty()).take(6).collect();
+        let tags = v["tags"].as_array().into_iter().flatten().filter_map(|t| t.as_str()).map(|t| crate::detect::mask_text(t.trim()).to_lowercase()).filter(|t| !t.is_empty()).take(6).collect();
+        // (Masked before lowering: the rules for keys care about capitals.)
         Ok((d, tags))
     }
 
