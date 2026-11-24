@@ -37,15 +37,16 @@ const MANAGER_APPS: &[&str] = &[
     "com.outercorner.secrets", "com.enpass", "com.authy", "com.yubico", "com.2fas",
 ];
 
-/// Web vaults, as site rules.
+/// Web vaults, as site rules. Whole hosts where the vault's path varies by locale.
 const MANAGER_SITES: &[&str] = &[
-    "vault.bitwarden.com", "vault.bitwarden.eu", "keepersecurity.com/vault", "keepersecurity.eu/vault", "keepersecurity.com.au/vault",
-    "keepersecurity.ca/vault", "keepersecurity.jp/vault", "my.1password.com", "*.1password.com", "*.1password.eu", "*.1password.ca",
-    "lastpass.com/vault", "app.dashlane.com", "pass.proton.me", "app.nordpass.com", "passwords.google.com",
+    "vault.bitwarden.com", "vault.bitwarden.eu", "keepersecurity.com", "keepersecurity.eu", "keepersecurity.com.au", "keepersecurity.ca",
+    "keepersecurity.jp", "keepersecurity.us", "govcloud.keepersecurity.us", "my.1password.com", "*.1password.com", "*.1password.eu",
+    "*.1password.ca", "lastpass.com", "lastpass.eu", "app.dashlane.com", "pass.proton.me", "app.nordpass.com", "nordpass.com/vault",
+    "passwords.google.com", "online.roboform.com", "vault.zoho.com", "vault.enpass.io", "app.passbolt.com", "app.logmeonce.com",
 ];
 
 /// Browser-extension ids: their popups belong to the browser, so hiding the desktop app alone would miss them.
-/// AIDEV-NOTE: Chromium store ids; Safari/Firefox ids are per-install and are caught by name in `manager_url`.
+/// AIDEV-NOTE: Chromium store ids; Safari/Firefox ids are per-install and are handled by scheme in `manager_url`.
 const MANAGER_EXTENSIONS: &[&str] = &[
     "nngceckbapebfimnlniiiahkandclblb", "jbkfoedolllekgbhcbcoahefnbanhhlh", // Bitwarden (Chrome, Edge)
     "bfogiafebfohielmmehodmfbbebbbpei", "lfochlioelphaglamdcakfjemolpichk", // Keeper
@@ -124,38 +125,110 @@ fn host_of(u: &url::Url) -> String {
     u.host_str().unwrap_or("").to_lowercase().trim_end_matches('.').to_owned()
 }
 
-/// A rule is host[:port][/path]. A plain host covers its subdomains; a path covers everything beneath it.
-fn site_matches(rule: &str, u: &url::Url) -> bool {
-    let (hostport, path) = rule.split_once('/').map_or((rule, ""), |(h, p)| (h, p));
-    let (host, port) = match hostport.rsplit_once(':') {
-        Some((h, p)) if p.parse::<u16>().is_ok() => (h, p.parse().ok()),
-        _ => (hostport, None),
-    };
-    let h = host_of(u);
-    if h.is_empty() {
-        return false;
-    }
-    let host_ok = if host.contains('*') { glob(host, &h) } else { h == host || h.ends_with(&format!(".{host}")) };
-    let port_ok = port.is_none_or(|p: u16| u.port_or_known_default() == Some(p));
-    let up = u.path().to_lowercase();
-    let up = up.trim_matches('/');
-    let path_ok = path.is_empty() || up == path || up.starts_with(&format!("{path}/"));
-    host_ok && port_ok && path_ok
+/// host[:port][/path], canonicalised by the same parser that reads page addresses.
+struct Rule {
+    host: String,
+    port: Option<u16>,
+    path: String,
 }
 
-fn manager_url(u: &url::Url) -> bool {
-    match u.scheme() {
-        "http" | "https" => MANAGER_SITES.iter().any(|r| site_matches(r, u)),
-        "chrome" | "edge" | "brave" | "vivaldi" => {
-            let s = u.as_str().to_lowercase();
-            s.contains("://password-manager") || s.contains("://settings/password") || s.contains("://wallet/passwords")
+impl Rule {
+    fn parse(raw: &str) -> Option<Rule> {
+        let s = raw.trim().to_lowercase();
+        if s.is_empty() || s.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return None;
         }
-        "about" => u.path().eq_ignore_ascii_case("logins"),
-        s if s.ends_with("extension") => {
-            let t = u.as_str().to_lowercase();
+        let s = s.split_once("://").map_or(s.as_str(), |(_, r)| r).trim_start_matches('/');
+        let s = s.split(['?', '#']).next().unwrap_or("");
+        let (auth, path) = s.split_once('/').unwrap_or((s, ""));
+        let auth = auth.rsplit('@').next().unwrap_or("");
+        let after_bracket = auth.rfind(']').map_or(0, |i| i + 1);
+        let (host, port) = match auth[after_bracket..].rfind(':').map(|i| i + after_bracket) {
+            Some(i) => (&auth[..i], Some(auth[i + 1..].parse::<u16>().ok()?)),
+            None => (auth, None),
+        };
+        let host = host.trim_matches('.');
+        let host = host.strip_prefix("www.").unwrap_or(host);
+        let host = if host.contains('*') {
+            let sane = host.chars().all(|c| c.is_alphanumeric() || ".-*".contains(c)) && host.chars().any(char::is_alphanumeric);
+            (sane && !host.contains("..")).then(|| host.to_owned())?
+        } else {
+            (!host.contains("..")).then(|| url::Host::parse(host).ok().map(|h| h.to_string()))??
+        };
+        let path = url::Url::parse(&format!("http://x/{path}")).ok()?.path().to_lowercase();
+        let path = path.trim_end_matches('*').trim_matches('/').to_owned();
+        Some(Rule { host, port, path })
+    }
+
+    /// A plain host covers its subdomains; a path covers everything beneath it.
+    fn matches(&self, u: &url::Url) -> bool {
+        let h = host_of(u);
+        if h.is_empty() {
+            return false;
+        }
+        let host_ok = if self.host.contains('*') { glob(&self.host, &h) } else { h == self.host || h.ends_with(&format!(".{}", self.host)) };
+        let port_ok = self.port.is_none_or(|p| u.port_or_known_default() == Some(p));
+        let up = u.path().to_lowercase();
+        let up = up.trim_matches('/');
+        let path_ok = self.path.is_empty() || glob(&self.path, up) || glob(&format!("{}/*", self.path), up);
+        host_ok && port_ok && path_ok
+    }
+}
+
+impl std::fmt::Display for Rule {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}", self.host)?;
+        if let Some(p) = self.port {
+            write!(f, ":{p}")?;
+        }
+        if !self.path.is_empty() {
+            write!(f, "/{}", self.path)?;
+        }
+        Ok(())
+    }
+}
+
+static MANAGER_RULES: std::sync::LazyLock<Vec<Rule>> = std::sync::LazyLock::new(|| MANAGER_SITES.iter().filter_map(|s| Rule::parse(s)).collect());
+
+/// The page behind view-source:, blob:, reader mode and similar wrappers.
+fn unwrap(mut u: url::Url) -> url::Url {
+    for _ in 0..4 {
+        let inner = match u.scheme() {
+            "view-source" | "blob" | "feed" => url::Url::parse(u.as_str().split_once(':').map_or("", |x| x.1)).ok(),
+            "http" | "https" | "file" => None,
+            _ => u.query_pairs().find(|(k, _)| k == "url").and_then(|(_, v)| url::Url::parse(&v).ok()),
+        };
+        match inner {
+            Some(i) => u = i,
+            None => break,
+        }
+    }
+    u
+}
+
+/// Could this address be showing a site we can't identify?
+fn opaque(u: &url::Url) -> bool {
+    match u.scheme() {
+        "file" | "chrome" | "edge" | "brave" | "vivaldi" | "opera" | "arc" | "comet" | "favorites" | "topsites" | "bookmarks" | "history" => false,
+        "about" => matches!(u.path(), "blank" | "srcdoc" | "reader"),
+        _ => host_of(u).is_empty(),
+    }
+}
+
+fn manager_url(u: &url::Url, title: &str) -> bool {
+    match u.scheme() {
+        "http" | "https" => MANAGER_RULES.iter().any(|r| r.matches(u)),
+        "file" => false,
+        "chrome-extension" => {
+            let t = format!("{u} {title}").to_lowercase();
             MANAGER_EXTENSIONS.contains(&host_of(u).as_str()) || MANAGER_NAMES.iter().any(|n| t.contains(n))
         }
-        _ => false,
+        // Safari and Firefox give every install a random id, so there is nothing to recognise: assume the worst.
+        s if s.ends_with("extension") => true,
+        _ => {
+            let t = u.as_str().to_lowercase();
+            t.contains("password") || t.starts_with("about:logins")
+        }
     }
 }
 
@@ -184,18 +257,24 @@ fn norm(s: &str) -> String {
 }
 
 fn is_private(f: Family, w: &BrowserWindow) -> bool {
-    let (title, label, field): (Vec<&str>, Vec<&str>, &[&str]) = match f {
-        Family::Chromium => (INCOGNITO.to_vec(), INCOGNITO.to_vec(), &[]),
-        Family::Safari => (PRIVATE_BROWSING.to_vec(), PRIVATE_LABELS.to_vec(), PRIVATE_FIELD),
-        Family::Firefox => (PRIVATE_BROWSING.to_vec(), PRIVATE_BROWSING.to_vec(), PRIVATE_BROWSING),
-        // Unmeasured browsers: accept any family's marker.
-        Family::Other => ([INCOGNITO, PRIVATE_BROWSING].concat(), [INCOGNITO, PRIVATE_BROWSING].concat(), PRIVATE_FIELD),
+    // Labels are whole-control text, so every vendor's word is safe to accept. Titles contain page text, so be stricter.
+    let label = [INCOGNITO, PRIVATE_LABELS, PRIVATE_BROWSING].concat();
+    let title: &[&str] = match f {
+        Family::Chromium => INCOGNITO,
+        Family::Safari | Family::Firefox => PRIVATE_BROWSING,
+        Family::Other => &[INCOGNITO, PRIVATE_BROWSING].concat(),
     };
-    let title_hit = w.title.as_deref().is_some_and(|t| {
-        t.split(|c: char| "()[]—–-,|·•".contains(c)).map(norm).any(|p| title.iter().any(|m| p == *m || p.ends_with(&format!(" {m}"))))
-    });
-    title_hit
-        || w.control_labels.iter().map(|l| norm(l)).any(|l| label.contains(&l.as_str()))
+    let field = [PRIVATE_FIELD, PRIVATE_BROWSING].concat();
+    let t = norm(w.title.as_deref().unwrap_or(""));
+    let piece = t.split(|c: char| "()[]—–-,|·•".contains(c)).map(norm).any(|p| title.iter().any(|m| p == *m || p.ends_with(&format!(" {m}"))));
+    // "News - Brave (Private)": a bracketed suffix is the browser's, not the page's.
+    let suffix = t.strip_suffix(')').and_then(|x| x.rsplit_once('(')).is_some_and(|(_, x)| label.contains(&x.trim()));
+    piece
+        || suffix
+        || w.control_labels.iter().map(|l| norm(l)).any(|l| {
+            let bare = l.split(" (").next().unwrap_or("").trim();
+            label.contains(&bare) || l.starts_with("private with tor") || l.starts_with("private window")
+        })
         || w.field_descriptions.iter().map(|d| norm(d)).any(|d| field.iter().any(|m| d.contains(m)))
 }
 
@@ -205,11 +284,15 @@ fn is_private(f: Family, w: &BrowserWindow) -> bool {
 pub fn hide_browser(ex: &Exclusions, bundle_id: &str, windows: Option<Vec<BrowserWindow>>) -> Option<HideReason> {
     let f = family(bundle_id)?;
     let Some(windows) = windows else { return ex.unreadable_browsers.then_some(HideReason::Unreadable) };
+    let rules: Vec<Rule> = ex.sites.iter().filter_map(|s| Rule::parse(s)).collect();
     let mut unreadable = false;
     let mut found = None;
     for w in &windows {
-        if ex.private_windows && is_private(f, w) {
-            found = found.or(Some(HideReason::PrivateWindow));
+        if ex.private_windows {
+            if is_private(f, w) {
+                found = found.or(Some(HideReason::PrivateWindow));
+            }
+            unreadable |= w.title.is_none() && w.control_labels.is_empty() && w.field_descriptions.is_empty();
         }
         unreadable |= w.urls.is_empty();
         for raw in &w.urls {
@@ -217,28 +300,23 @@ pub fn hide_browser(ex: &Exclusions, bundle_id: &str, windows: Option<Vec<Browse
                 unreadable = true;
                 continue;
             };
-            if ex.password_managers && manager_url(&u) {
+            let u = unwrap(u);
+            if ex.password_managers && manager_url(&u, w.title.as_deref().unwrap_or("")) {
                 return Some(HideReason::PasswordManager);
             }
-            if ex.sites.iter().filter_map(|s| normalize_site(s)).any(|s| site_matches(&s, &u)) {
+            if rules.iter().any(|r| r.matches(&u)) {
                 found = Some(HideReason::Site);
             }
+            unreadable |= opaque(&u);
         }
     }
     found.or((unreadable && ex.unreadable_browsers).then_some(HideReason::Unreadable))
 }
 
-/// Tidy what a person typed into a site rule; None if it can't be one.
+/// Tidy what a person typed into a site rule; None if it could never match anything.
 #[uniffi::export]
 pub fn normalize_site(raw: &str) -> Option<String> {
-    let s = raw.trim().to_lowercase();
-    let s = s.split_once("://").map_or(s.as_str(), |(_, r)| r);
-    let s = s.split(['?', '#']).next().unwrap_or("");
-    let s = s.strip_prefix("www.").unwrap_or(s);
-    let s = s.trim_end_matches('/');
-    let host = s.split('/').next().unwrap_or("");
-    let ok = host.chars().any(char::is_alphanumeric) && !s.chars().any(char::is_whitespace);
-    ok.then(|| s.to_owned())
+    Rule::parse(raw).map(|r| r.to_string())
 }
 
 #[cfg(test)]
@@ -360,5 +438,93 @@ mod tests {
             assert!(is_browser(b), "{b}");
         }
         assert!(!is_browser("com.apple.finder"));
+    }
+
+    // ---- security review 2026-11-23 ----
+    #[test]
+    fn extensions_with_random_ids_fail_closed() {
+        for u in ["moz-extension://3c1f0a52-6f0e-4f1e-9d2b-0a1b2c3d4e5f/popup.html", "safari-web-extension://8E1C2B7A-1111-4222-8333-444455556666/popup/index.html",
+                  "safari-extension://com.x-ABCD/123/p.html"] {
+            assert_eq!(hid(&ex(), u), Some(HideReason::PasswordManager), "{u}");
+        }
+        // A known, unrelated Chromium extension is fine.
+        assert_eq!(hid(&ex(), "chrome-extension://cjpalhdlnbpafiamejdnhcphjbkeiagm/dashboard.html"), None);
+        let named = BrowserWindow { title: Some("Bitwarden".into()), urls: vec!["chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/p".into()], ..Default::default() };
+        assert_eq!(hide_browser(&ex(), CHROME, Some(vec![named])), Some(HideReason::PasswordManager));
+    }
+
+    #[test]
+    fn site_rules_are_canonical() {
+        for r in ["chase.com/*", "*://chase.com/*", ".chase.com", "chase.com.", "https://user:pw@chase.com/", "//chase.com", "CHASE.com:443"] {
+            let e = sites(&[r]);
+            assert_eq!(hid(&e, "https://secure.chase.com/accounts"), Some(HideReason::Site), "{r}");
+            assert_eq!(hid(&e, "https://example.com/"), None, "{r}");
+        }
+        assert_eq!(hid(&sites(&["bücher.de"]), "https://xn--bcher-kva.de/"), Some(HideReason::Site));
+        assert_eq!(hid(&sites(&["example.com/a/*/private"]), "https://example.com/a/b/private/x"), Some(HideReason::Site));
+        assert_eq!(hid(&sites(&["example.com/my%20docs"]), "https://example.com/my%20docs/1"), Some(HideReason::Site));
+        assert_eq!(hid(&sites(&["example.com/é"]), "https://example.com/%C3%A9"), Some(HideReason::Site));
+        assert_eq!(hid(&sites(&["192.168.1.1"]), "http://192.168.1.1/admin"), Some(HideReason::Site));
+        assert_eq!(hid(&sites(&["[::1]:8080"]), "http://[::1]:8080/"), Some(HideReason::Site));
+        for bad in ["exa mple.com", "chase.com:99999", "http://[::1", "a..b"] {
+            assert_eq!(normalize_site(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn every_accepted_rule_matches_its_own_address() {
+        for r in ["chase.com", "www.chase.com", "a.b.c.example/x/y", "localhost:8443", "bücher.de/é", "chase.com/*", "10.0.0.1:81/z"] {
+            let n = normalize_site(r).unwrap_or_else(|| panic!("{r}"));
+            let u = format!("http://{}", n.replace('*', "q"));
+            assert_eq!(hid(&sites(&[r]), &u), Some(HideReason::Site), "{r} -> {u}");
+        }
+    }
+
+    #[test]
+    fn other_vendors_private_windows() {
+        let t = |b: &str, title: &str, label: &str| {
+            hide_browser(&ex(), b, Some(vec![BrowserWindow { title: Some(title.into()), urls: vec!["https://a.com".into()], control_labels: vec![label.into()], ..Default::default() }]))
+        };
+        for (b, title, label) in [
+            ("com.brave.Browser", "News - Brave (Private)", ""), ("com.brave.Browser", "News - Brave", "Private with Tor"),
+            ("com.vivaldi.Vivaldi", "News - Vivaldi (Private)", ""), ("com.operasoftware.Opera", "News - Opera (Private)", ""),
+            ("com.microsoft.edgemac", "News - Microsoft Edge (InPrivate)", ""), (CHROME, "News", "Incognito (2)"),
+            ("company.thebrowser.Browser", "News", "Private"), ("com.duckduckgo.macos.browser", "News", "Private Browsing"),
+        ] {
+            assert_eq!(t(b, title, label), Some(HideReason::PrivateWindow), "{b} {title} {label}");
+        }
+        assert_eq!(t("com.brave.Browser", "Private equity news - Brave", "Reload"), None);
+    }
+
+    #[test]
+    fn wrapped_addresses_are_unwrapped() {
+        let e = sites(&["chase.com"]);
+        for u in ["view-source:https://chase.com/", "blob:https://chase.com/123-456", "about:reader?url=https%3A%2F%2Fchase.com%2Fx",
+                  "chrome-distiller://abc/?url=https%3A%2F%2Fchase.com%2F", "safari-reader://chase.com/x"] {
+            assert_eq!(hid(&e, u), Some(HideReason::Site), "{u}");
+        }
+        for u in ["data:text/html,hi", "about:blank", "about:srcdoc", "weird:thing"] {
+            assert_eq!(hid(&e, u), Some(HideReason::Unreadable), "{u}");
+        }
+        for u in ["chrome://newtab/", "about:home", "file:///tmp/a.html", "favorites://", "about:newtab", "edge://settings"] {
+            assert_eq!(hid(&e, u), None, "{u}");
+        }
+    }
+
+    #[test]
+    fn a_window_with_no_readable_labels_is_unreadable() {
+        let w = BrowserWindow { urls: vec!["https://a.com".into()], ..Default::default() };
+        assert_eq!(hide_browser(&ex(), CHROME, Some(vec![w.clone()])), Some(HideReason::Unreadable));
+        let e = Exclusions { private_windows: false, ..ex() };
+        assert_eq!(hide_browser(&e, CHROME, Some(vec![w])), None);
+    }
+
+    #[test]
+    fn more_vaults() {
+        for u in ["https://online.roboform.com/", "https://keepersecurity.us/vault/", "https://keepersecurity.com/en_GB/vault", "https://vault.keepersecurity.eu/",
+                  "https://lastpass.com/?ac=1", "https://nordpass.com/vault", "https://vault.zoho.com/", "https://vault.enpass.io/",
+                  "opera://settings/passwords", "arc://password-manager", "comet://password-manager/", "chrome://settings/passwords", "vivaldi:settings/passwords", "about:preferences#privacy-passwords"] {
+            assert_eq!(hid(&ex(), u), Some(HideReason::PasswordManager), "{u}");
+        }
     }
 }

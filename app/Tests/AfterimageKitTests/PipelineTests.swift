@@ -89,3 +89,45 @@ func saveAndReread(_ name: String, config: Config = rulesOnly()) async throws ->
         #expect(e.isNew(displayKey: "d", luma: Pixels.thumbprint(img("hello w"))))
     }
 }
+
+/// Needs LM Studio: AFTERIMAGE_LIVE=1 swift test --filter LiveModel
+@Suite(.serialized, .enabled(if: ProcessInfo.processInfo.environment["AFTERIMAGE_LIVE"] != nil)) struct LiveModelTests {
+    let config = Config(lmUrl: "http://127.0.0.1:1234", model: ProcessInfo.processInfo.environment["AFTERIMAGE_MODEL"] ?? "gemma-4-26b-a4b-it-qat-mlx", embedModel: "text-embedding-nomic-embed-text-v1.5", requireAi: true, describe: .never, maxAgeDays: 0, maxBytes: 0, unloadAfterSecs: 0)
+
+    @Test func unlabelledSecretsAreHiddenByTheModel() async throws {
+        let r = try await saveAndReread("notes", config: config)
+        for s in ["marmalade", "tuba", "7725"] {
+            #expect(!r.seen.contains(s), "\(s) still readable"); #expect(!r.indexed.contains(s))
+        }
+        #expect(r.seen.contains("Plumber")); #expect(r.shot.aiChecked)
+    }
+    @Test func theModelLeavesOrdinaryTextAlone() async throws {
+        let r = try await saveAndReread("clean", config: config)
+        #expect(r.shot.regions.isEmpty, "\(r.seen)"); #expect(r.shot.aiChecked)
+    }
+    @Test func describesAndFindsByMeaning() async throws {
+        let dir = FileManager.default.temporaryDirectory.appending(path: "afterimage-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        var c = config; c.describe = .always
+        let engine = try Engine(root: dir.path, config: c, host: ImageHost())
+        defer { engine.shutdown() }
+        for (i, n) in ["notes", "clean", "checkout"].enumerated() {
+            let image = try #require(Pixels.load(fixtures.appending(path: "\(n).png").path))
+            let b = try #require(Pixels.bitmap(image))
+            engine.ingest(frame: Frame(rgba: b.data, width: UInt32(b.width), height: UInt32(b.height), stride: UInt32(b.stride), lines: try Recognizer.lines(in: image),
+                moment: Moment(takenAt: 1_700_000_000_000 + Int64(i), trigger: "manual", display: "", appName: "App", bundleId: "b", windowTitle: n, url: "", userName: "", fullName: "", host: "", sessions: [], runningApps: []), displayKey: "t"))
+        }
+        for _ in 0..<1800 {
+            let s = try engine.stats()
+            if s.count == 3 && s.pending == 0 { break }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        let all = try engine.list(filter: Filter(text: "", bundleId: nil, from: nil, to: nil, onlyKept: false, onlyHidden: false), limit: 9, offset: 0)
+        #expect(all.count == 3 && all.allSatisfy { $0.indexed && !$0.description.isEmpty })
+        for s in all { print("CAPTION \(s.moment.windowTitle): \(s.description) \(s.tags)") }
+        #expect(!all.map(\.description).joined().contains("marmalade"))
+        // "shopping" appears nowhere as a word on the checkout screen's OCR.
+        let hit = try engine.search(filter: Filter(text: "buying stationery online", bundleId: nil, from: nil, to: nil, onlyKept: false, onlyHidden: false), semantic: true, limit: 5)
+        #expect(hit.first?.moment.windowTitle == "checkout", "\(hit.map(\.moment.windowTitle))")
+    }
+}
