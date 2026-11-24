@@ -1,34 +1,35 @@
 name: Release
 
-# Push a tag like v0.2.0 (or run manually with a version) to build, sign, notarize and publish a DMG.
+# Push a tag like v0.2.0 to build, sign, notarize and publish a DMG.
+# AIDEV-NOTE: three jobs on purpose. Code that came from the network (crates, build scripts, tests) only ever runs in
+# AIDEV-NOTE: `build`, which has no secrets; `sign` runs no project code but the packaging scripts; only `publish` can write.
 on:
   push:
     tags: ['v*']
-  workflow_dispatch:
-    inputs:
-      version:
-        description: Version (e.g. 0.2.0)
-        required: true
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
+  build:
     runs-on: macos-26
     timeout-minutes: 60
-    environment: release
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
 
       - name: Version
-        env:
-          INPUT_VERSION: ${{ github.event.inputs.version }}
+        id: version
         run: |
-          V="$INPUT_VERSION"
-          [[ -z "$V" ]] && V="${GITHUB_REF_NAME#v}"
+          V="${GITHUB_REF_NAME#v}"
           [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || { echo "::error title=Bad version::'$V' is not semver"; exit 1; }
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "::error title=Not on main::Tag a commit that is on main."; exit 1; }
           echo "VERSION=$V" >> "$GITHUB_ENV"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "BUILD=${{ github.run_number }}" >> "$GITHUB_ENV"
 
       - name: Toolchain
@@ -36,16 +37,60 @@ jobs:
           sudo xcode-select -s "$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)"
           echo "DEVELOPER_DIR=$(xcode-select -p)" >> "$GITHUB_ENV"
           rustup default stable
-          brew install create-dmg
-          swift --version; cargo --version
 
-      # Tests run before any certificate touches the keychain.
       - name: Tests
         timeout-minutes: 20
         run: |
           cargo test --release -p afterimage-core
+          ./scripts/extension.sh
           ./scripts/ffi.sh
-          cd app && swift test
+          (cd app && swift test)
+
+      - name: Build (unsigned)
+        run: |
+          ./scripts/build.sh
+          ditto -c -k --norsrc --noextattr --keepParent build/Afterimage.app build/Afterimage.zip
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: unsigned
+          path: |
+            build/Afterimage.zip
+            build/AppIcon.icns
+          retention-days: 1
+
+  sign:
+    needs: build
+    runs-on: macos-26
+    timeout-minutes: 60
+    environment: release
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: unsigned
+          path: ${{ runner.temp }}/unsigned
+
+      # AIDEV-NOTE: the archive comes from code that ran network dependencies. It may contain the app and nothing else.
+      # AIDEV-NOTE: the archive comes from code that ran network dependencies. It may contain the app and nothing else.
+      - name: Unpack
+        run: |
+          set -euo pipefail
+          U="$RUNNER_TEMP/unsigned"
+          mkdir "$U/x" build
+          /usr/bin/python3 -I scripts/ci/unpack_app.py "$U/Afterimage.zip" Afterimage.app "$U/x"
+          mv "$U/x/Afterimage.app" "$U/AppIcon.icns" build/
+          [[ -z "$(/usr/bin/git status --porcelain)" ]] || { echo "::error title=Checkout changed::unexpected files"; exit 1; }
+
+      - name: Toolchain
+        run: |
+          sudo xcode-select -s "$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)"
+          scripts/ci/get-create-dmg.sh
 
       - name: Import signing certificate
         env:
@@ -63,10 +108,10 @@ jobs:
             echo "::error title=Incomplete signing setup::Need a Developer ID Application identity and the notary API key (ASC_API_KEY_*). Refusing to publish an unnotarized release."
             exit 1; }
 
-      - name: Build, sign, package, notarize
-        timeout-minutes: 30
+      - name: Sign, package, notarize
+        timeout-minutes: 40
         run: |
-          ./scripts/build.sh
+          ./scripts/sign.sh build/Afterimage.app
           ./scripts/package.sh
 
       - name: Verify
@@ -75,14 +120,32 @@ jobs:
           xcrun stapler validate "build/dist/Afterimage-$VERSION.dmg"
           spctl --assess --type open --context context:primary-signature -v "build/dist/Afterimage-$VERSION.dmg"
 
-      - name: GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          TAG="v$VERSION"
-          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "Afterimage $VERSION" --generate-notes
-          gh release upload "$TAG" build/dist/* --clobber
-
       - name: Clean up keychain and notary key
         if: always()
         run: security delete-keychain "$RUNNER_TEMP/afterimage-signing.keychain-db" || true; rm -f "$RUNNER_TEMP/AuthKey.p8"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist
+          path: build/dist/*
+          retention-days: 7
+
+  publish:
+    needs: [build, sign]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist
+          path: dist
+
+      # Never replaces a published file: a version, once out, stays what it was.
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: gh release create "v$VERSION" dist/* --verify-tag --title "Afterimage $VERSION" --generate-notes

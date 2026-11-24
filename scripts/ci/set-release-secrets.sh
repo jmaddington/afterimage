@@ -18,23 +18,28 @@ fi
 [[ -t 0 ]] || { echo "✗ run this in a Terminal window (it prompts for the password)"; exit 1; }
 read -rs "PW?.p12 password: "; echo; export PW
 # Fail fast on a wrong password, the way CI imports it (security handles Keychain's AES exports; LibreSSL may not).
-KC=$(mktemp -u /tmp/p12check.XXXXXX).keychain-db
-security create-keychain -p x "$KC" >/dev/null
-trap 'security delete-keychain "$KC" 2>/dev/null' EXIT
-security unlock-keychain -p x "$KC"
+umask 077
+WORK=$(mktemp -d)
+KC="$WORK/check.keychain-db"
+KCPW=$(openssl rand -hex 24)
+cleanup() { security delete-keychain "$KC" 2>/dev/null; rm -rf "$WORK"; }
+trap cleanup EXIT
+trap 'exit 1' INT TERM HUP
+security create-keychain -p "$KCPW" "$KC" >/dev/null
+security unlock-keychain -p "$KCPW" "$KC"
 security import "$P12" -k "$KC" -P "$PW" -T /usr/bin/security >/dev/null 2>&1 || { echo "✗ wrong .p12 password (or not a .p12)"; exit 1; }
 security find-identity -v -p codesigning "$KC" | grep -q 'Developer ID Application' \
   || { echo "✗ the .p12 has no Developer ID Application identity (certificate + private key)"; exit 1; }
 # GitHub refuses empty secrets: a .p12 exported with no password is re-wrapped with a random one (never shown).
 if [[ -z "$PW" ]]; then
   PW=$(openssl rand -hex 24); export PW
-  OUT=$(mktemp -d)/rewrapped.p12
+  OUT="$WORK/rewrapped.p12"
   security export -k "$KC" -t identities -f pkcs12 -P "$PW" -o "$OUT" >/dev/null \
     || { echo "✗ couldn't re-wrap the passwordless .p12"; exit 1; }
   P12=$OUT
-  trap 'security delete-keychain "$KC" 2>/dev/null; rm -rf "${OUT:h}"' EXIT
   echo "▸ no password on the .p12: re-wrapped it with a random one for CI"
 fi
+security delete-keychain "$KC" 2>/dev/null || true
 read -r "ISSUER?App Store Connect issuer ID (Users and Access › Integrations): "
 base64 -i "$P12" | gh secret set DEVELOPER_ID_APP_P12 -R "$REPO"
 print -rn -- "$PW" | gh secret set DEVELOPER_ID_APP_PASSWORD -R "$REPO"

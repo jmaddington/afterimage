@@ -12,6 +12,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 name = "uniffi-bindgen"
 path = "src/bin/uniffi-bindgen.rs"
 
+[[bin]]
+name = "afterimage-bridge"
+path = "src/bin/afterimage-bridge.rs"
+
 [dependencies]
 uniffi = { version = "0.32.2", features = ["cli"] }
 rusqlite = { version = "0.43", features = ["bundled"] }

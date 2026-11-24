@@ -31,6 +31,7 @@ pub enum HideReason {
     PrivateWindow,
     Unreadable,
     SystemPrompt,
+    SecretField,
 }
 
 /// Desktop password managers. Matched whole, or as a dotted prefix ("com.1password" covers "com.1password.safari").
@@ -431,6 +432,16 @@ pub fn hide_browser(ex: &Exclusions, bundle_id: &str, windows: &[BrowserWindow],
         }
     }
     found.or((evasive || unreadable && ex.unreadable_browsers).then_some(HideReason::Unreadable))
+}
+
+/// What the browser extension adds to the decision. Never consulted to allow anything.
+/// AIDEV-TODO: frost placed fields instead of leaving the browser out, once page and screen coordinates are matched up.
+#[uniffi::export]
+pub fn hide_page(ex: &Exclusions, hint: &crate::pages::PageHint) -> Option<HideReason> {
+    if hint.private_window && ex.private_windows {
+        return Some(HideReason::PrivateWindow);
+    }
+    (hint.sensitive || !hint.fields.is_empty()).then_some(HideReason::SecretField)
 }
 
 /// Tidy what a person typed into a site rule; None if it could never match anything.
@@ -835,5 +846,18 @@ mod tests {
             assert_eq!(hide_browser(&Exclusions { private_windows: false, ..ex() }, "org.mozilla.firefox", &[win(u)], true), Some(HideReason::Unreadable), "{u}");
         }
         assert_eq!(hid(&ex(), "chrome://newtab/"), None);
+    }
+
+    #[test]
+    fn the_extension_can_only_add_reasons() {
+        use crate::pages::{PageField, PageHint};
+        use crate::{Rect, SecretKind};
+        let field = PageField { kind: SecretKind::Password, rect: Rect { x: 0.0, y: 0.0, w: 0.1, h: 0.1 }, tab: 1, window: 1 };
+        let none = PageHint::default();
+        assert_eq!(hide_page(&ex(), &none), None);
+        assert_eq!(hide_page(&ex(), &PageHint { private_window: true, ..none.clone() }), Some(HideReason::PrivateWindow));
+        assert_eq!(hide_page(&Exclusions { private_windows: false, ..ex() }, &PageHint { private_window: true, ..none.clone() }), None);
+        assert_eq!(hide_page(&ex(), &PageHint { sensitive: true, ..none.clone() }), Some(HideReason::SecretField));
+        assert_eq!(hide_page(&ex(), &PageHint { fields: vec![field], ..none.clone() }), Some(HideReason::SecretField));
     }
 }

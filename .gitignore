@@ -13,3 +13,4 @@ app/Generated/
 *.gate.lock*
 app/Sources/CAfterimage/
 app/Sources/AfterimageEngine/
+__pycache__/
