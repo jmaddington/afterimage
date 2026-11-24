@@ -101,7 +101,9 @@ extension Shot {
             guard let self else { return }
             let c = settings.config
             Task.detached { [engine] in engine.setConfig(config: c) }
+            applyAgentAccess()
         }
+        applyAgentAccess()
         reload()
         Task.detached { [engine] in _ = engine.listenForPages() }
         // Any app registered to open web pages is treated as a browser, known to us or not. Checked again whenever an
@@ -118,6 +120,32 @@ extension Shot {
             while let self {
                 await self.probe()
                 try? await Task.sleep(for: .seconds(8))
+            }
+        }
+    }
+
+    /// The port agents are being served on, or nil.
+    private(set) var agentPort: Int?
+    private(set) var agentProblem: String?
+    private var agentWanted: String?
+
+    /// Start or stop the agent connection to match the settings. Off unless developer mode and the switch are both on.
+    private func applyAgentAccess() {
+        let on = settings.developer && settings.agentAccess
+        if on && settings.agentToken.isEmpty { settings.newAgentToken(); return }
+        let want = on ? "\(settings.agentPort)|\(settings.agentToken)" : nil
+        guard want != agentWanted else { return }
+        agentWanted = want
+        let (port, token, zone) = (settings.agentPort, settings.agentToken, TimeZone.current.secondsFromGMT())
+        Task {
+            let r: Result<Int?, Error> = await Task.detached { [engine] in
+                engine.mcpStop()
+                guard on else { return .success(nil) }
+                return Result { Int(try engine.mcpStart(port: UInt16(clamping: port), token: token, utcOffsetSecs: Int32(zone))) }
+            }.value
+            switch r {
+            case .success(let p): (agentPort, agentProblem) = (p, nil)
+            case .failure(let e): (agentPort, agentProblem) = (nil, e.localizedDescription)
             }
         }
     }

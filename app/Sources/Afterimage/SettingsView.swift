@@ -173,6 +173,24 @@ private struct IntelligenceSettings: View {
             Section {
                 Toggle("Developer mode", isOn: $settings.developer)
                 Button("Show Log") { openWindow(id: "devlog") }
+                if settings.developer {
+                    Toggle("Let an AI agent read the library", isOn: $settings.agentAccess)
+                    if settings.agentAccess {
+                        if let port = model.agentPort {
+                            LabeledContent("Connect Claude Code") {
+                                Button("Copy Command") {
+                                    NSPasteboard.general.clearContents()
+                                    NSPasteboard.general.setString(settings.agentCommand(port: port), forType: .string)
+                                }
+                            }
+                            LabeledContent("Address", value: "http://127.0.0.1:\(port)/mcp")
+                            Button("New Token") { settings.newAgentToken() }.help("Cuts off any agent using the current one")
+                        } else {
+                            Text(model.agentProblem ?? "Starting…").foregroundStyle(.secondary)
+                        }
+                        Text("An agent can search and read everything saved here, pictures included, and can’t change or delete anything. Secrets are already hidden, but if the agent runs in the cloud, what it reads leaves this Mac.").font(.callout).foregroundStyle(.secondary)
+                    }
+                }
             } footer: {
                 Text("Keeps every request to LM Studio and its answer for a week, with secrets removed, along with each decision to take a picture or not. Turning it off deletes the log.").foregroundStyle(.secondary)
             }

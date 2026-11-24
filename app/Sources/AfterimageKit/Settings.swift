@@ -1,5 +1,6 @@
 import AfterimageEngine
 import Foundation
+import Security
 import Observation
 
 /// Everything a person can choose, persisted in UserDefaults.
@@ -27,6 +28,11 @@ import Observation
     public var port: Int { didSet { save("port", port) } }
     public var keepDays: Int { didSet { save("keepDays", keepDays) } }
     public var keepGB: Int { didSet { save("keepGB", keepGB) } }
+    /// Let an AI agent on this Mac read the library. Only honoured in developer mode.
+    public var agentAccess: Bool { didSet { save("agentAccess", agentAccess) } }
+    public var agentPort: Int { didSet { save("agentPort", agentPort) } }
+    /// Made the first time access is switched on; changing it cuts off whoever had the old one.
+    public var agentToken: String { didSet { save("agentToken", agentToken) } }
     public var developer: Bool { didSet { save("developer", developer) } }
     public var onboarded: Bool { didSet { save("onboarded", onboarded) } }
     public var recording: Bool { didSet { save("recording", recording) } }
@@ -53,6 +59,9 @@ import Observation
         port = get("port", 1234)
         keepDays = get("keepDays", 30)
         keepGB = get("keepGB", 20)
+        agentAccess = get("agentAccess", false)
+        agentPort = get("agentPort", 4319)
+        agentToken = get("agentToken", "")
         developer = get("developer", false)
         onboarded = get("onboarded", false)
         recording = get("recording", true)
@@ -67,6 +76,16 @@ import Observation
     public func finishOnboarding() {
         recording = true
         onboarded = true
+    }
+
+    public func newAgentToken() {
+        var bytes = [UInt8](repeating: 0, count: 24)
+        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        agentToken = bytes.map { String(format: "%02x", $0) }.joined()
+    }
+    /// What to paste into a terminal to connect Claude Code.
+    public func agentCommand(port: Int) -> String {
+        "claude mcp add --transport http afterimage http://127.0.0.1:\(port)/mcp --header \"Authorization: Bearer \(agentToken)\""
     }
 
     public var exclusions: Exclusions {
