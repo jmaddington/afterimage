@@ -7,6 +7,7 @@ import SwiftUI
 enum Place: Hashable {
     case all, kept, hidden
     case app(String)
+    case display(String)
 }
 
 enum DateScope: String, CaseIterable, Identifiable {
@@ -54,6 +55,8 @@ extension Shot {
     var shots: [Shot] = []
     var groups: [DayGroup] = []
     var apps: [AppCount] = []
+    /// Displays that have pictures; shown in the sidebar when there is more than one.
+    var displays: [AppCount] = []
     var stats = Stats(count: 0, bytes: 0, kept: 0, hidden: 0, pending: 0, reindexing: 0, oldest: nil)
     var status: Status?
     var loaded = false
@@ -197,6 +200,9 @@ extension Shot {
                 case .delete:
                     guard self.open != nil || !self.selection.isEmpty else { return e }
                     self.askDelete(self.open.map { [$0] })
+                case .deleteNow:
+                    guard self.open != nil || !self.selection.isEmpty else { return e }
+                    self.delete(self.open.map { [$0] } ?? Array(self.selection))
                 }
                 return nil
             }
@@ -247,6 +253,7 @@ extension Shot {
         case .kept: f.onlyKept = true
         case .hidden: f.onlyHidden = true
         case .app(let b): f.bundleId = b
+        case .display(let d): f.display = d
         }
         return f
     }
@@ -290,11 +297,12 @@ extension Shot {
                     searching ? try engine.search(filter: f, semantic: false, limit: 200) : try engine.list(filter: f, limit: n, offset: 0)
                 }.value
                 show(first)
-                let side = try await Task.detached { [engine] in (try engine.apps(), try engine.stats()) }.value
+                let side = try await Task.detached { [engine] in (try engine.apps(), try engine.stats(), try engine.displays()) }.value
                 if g == generation {
-                    (apps, stats) = side
+                    (apps, stats, displays) = side
                     // The last picture of an app takes its row with it.
                     if case .app(let b) = place, !apps.contains(where: { $0.bundleId == b }) { place = .all }
+                    if case .display(let d) = place, !displays.contains(where: { $0.name == d }) { place = .all }
                 }
                 // Words now, meaning a moment later.
                 if searching {

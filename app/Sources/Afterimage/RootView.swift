@@ -70,6 +70,7 @@ struct LibraryView: View {
         case .kept: "Kept"
         case .hidden: "With Secrets Hidden"
         case .app(let b): model.apps.first { $0.bundleId == b }?.name ?? "App"
+        case .display(let d): d
         }
     }
     private var subtitle: String {
@@ -193,6 +194,13 @@ struct Sidebar: View {
                 Label("Library", systemImage: "photo.on.rectangle").badge(Int(model.stats.count)).tag(Place.all)
                 Label("Kept", systemImage: "bookmark").badge(Int(model.stats.kept)).tag(Place.kept)
                 Label("Secrets Hidden", systemImage: "eye.slash").badge(Int(model.stats.hidden)).tag(Place.hidden)
+            }
+            if model.displays.count > 1 {
+                Section("Displays") {
+                    ForEach(model.displays, id: \.name) { d in
+                        Label(d.name, systemImage: "display").badge(Int(d.count)).tag(Place.display(d.name))
+                    }
+                }
             }
             if !model.apps.isEmpty {
                 Section("Apps") {

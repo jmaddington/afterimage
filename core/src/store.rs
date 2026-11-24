@@ -88,6 +88,9 @@ pub struct Filter {
     pub to: Option<i64>,
     pub only_kept: bool,
     pub only_hidden: bool,
+    /// Only pictures of this display, by the name it had.
+    #[uniffi(default = None)]
+    pub display: Option<String>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -305,6 +308,10 @@ impl Store {
             sql += " AND s.bundle_id=?";
             a.push(Value::Text(b.clone()));
         }
+        if let Some(d) = &f.display {
+            sql += " AND json_extract(s.moment,'$.display')=?";
+            a.push(Value::Text(d.clone()));
+        }
         if let Some(t) = f.from {
             sql += " AND s.taken_at>=?";
             a.push(Value::Integer(t));
@@ -382,6 +389,12 @@ impl Store {
     pub fn apps(&self) -> Res<Vec<AppCount>> {
         let mut st = self.db.prepare("SELECT MAX(app_name),bundle_id,COUNT(*) FROM shots WHERE bundle_id<>'' GROUP BY bundle_id ORDER BY 3 DESC")?;
         st.query_map([], |r| Ok(AppCount { name: r.get(0)?, bundle_id: r.get(1)?, count: r.get::<_, i64>(2)? as u64 }))?.collect()
+    }
+
+    /// The displays pictures were taken of, most pictures first. Counted like apps, with the name in `name`.
+    pub fn displays(&self) -> Res<Vec<AppCount>> {
+        let mut st = self.db.prepare("SELECT json_extract(moment,'$.display') AS d,COUNT(*) FROM shots WHERE d<>'' GROUP BY d ORDER BY 2 DESC, d")?;
+        st.query_map([], |r| Ok(AppCount { name: r.get(0)?, bundle_id: String::new(), count: r.get::<_, i64>(1)? as u64 }))?.collect()
     }
 
     pub fn stats(&self) -> Res<Stats> {
@@ -744,5 +757,21 @@ mod tests {
         drop(s);
         let raw: Vec<u8> = ["index.sqlite", "index.sqlite-wal"].iter().flat_map(|f| std::fs::read(d.path().join(f)).unwrap_or_default()).collect();
         assert!(!String::from_utf8_lossy(&raw).contains("zebra-title"));
+    }
+
+    #[test]
+    fn pictures_can_be_listed_by_display() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = Store::open(d.path()).unwrap();
+        for (at, display) in [(1, "Built-in Display"), (2, "Studio Display"), (3, "Studio Display"), (4, "")] {
+            let mut n = shot(d.path(), at, "x", 10);
+            n.moment.display = display.into();
+            s.insert(&n).unwrap();
+        }
+        let got = s.list(&Filter { display: Some("Studio Display".into()), ..Default::default() }, 10, 0).unwrap();
+        assert_eq!(got.iter().map(|x| x.moment.taken_at).collect::<Vec<_>>(), [3, 2]);
+        assert_eq!(s.ids_matching(&Filter { display: Some("Built-in Display".into()), ..Default::default() }).unwrap().len(), 1);
+        let all: Vec<(String, u64)> = s.displays().unwrap().into_iter().map(|a| (a.name, a.count)).collect();
+        assert_eq!(all, [("Studio Display".to_owned(), 2), ("Built-in Display".to_owned(), 1)]);
     }
 }

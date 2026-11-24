@@ -463,12 +463,16 @@ fn scan_latin(text: &str, line: usize, hits: &mut Vec<Hit>) {
         const PASSERS: &[&str] = &["tests", "checks", "builds", "suites", "specs", "jobs", "cases", "assertions", "steps", "runs"];
         let head = text[..c.get(1).unwrap().start()].rsplit('\n').next().unwrap_or("").trim_end();
         let subject = head.split_whitespace().next_back().unwrap_or("");
+        let rest = text[v.end()..].split('\n').next().unwrap_or("");
         let verb = c[1].eq_ignore_ascii_case("pass")
             && sep.as_str() == ":"
             && !quoted
             && !v.as_str().is_empty()
             && v.as_str().chars().all(|c| c.is_ascii_digit())
-            && v.as_str().len() <= 6
+            // The count must end there: "12,hunter22" and "12;x" are not counts. A bare count is short; a longer
+            // one needs a word after it ("1204 Rust"), so a PIN on its own stays hidden.
+            && (rest.is_empty() || rest.starts_with(' ') || rest.starts_with(", "))
+            && (v.as_str().len() <= 3 || v.as_str().len() <= 6 && rest.trim_start().chars().next().is_some_and(char::is_alphabetic))
             && PASSERS.contains(&subject.to_lowercase().as_str())
             && !head[..head.len() - subject.len()].trim_end().ends_with([':', '=', '>']);
         let name = if verb { "verb".to_owned() } else { c[1].to_owned() };
@@ -1430,12 +1434,12 @@ mod tests {
     #[test]
     fn a_verb_is_not_a_password_label() {
         // Seen live: every "Tests pass: 150" in a terminal was being frosted.
-        for t in ["Tests pass: 150 Rust, 57 Swift", "- Tests pass: 150 Rust", "All checks pass: 12 of 12"] {
+        for t in ["Tests pass: 150 Rust, 57 Swift", "- Tests pass: 150 Rust", "All checks pass: 12 of 12", "Tests pass: 1204 Rust", "tests pass: 150, 57 skipped", "tests pass: 9"] {
             assert_eq!(masked(t), t);
         }
         for t in ["pass: hunter22", "db pass: hunter22", "root pass = hunter22", "wifi pass: hunter22", "mysql_pass=hunter22", "PASS=hunter22", "MONGO_PASS=hunter22", "RABBITMQ_PASS=hunter22",
                   "keyPass=hunter22", "tests_pass=hunter22", "dana pass: hunter22", "user: tests pass: hunter22", "login=all pass=hunter22",
-                  "tests pass: hunter22", "tests pass = 150", "tests pass: \"4471\"", "all pass: 4471", "tests pass: 12345678"] {
+                  "tests pass: hunter22", "tests pass = 150", "tests pass: \"4471\"", "all pass: 4471", "tests pass: 12345678", "tests pass: 4471", "tests pass: 12/hunter22"] {
             assert!(!masked(t).contains("hunter22"), "{t}");
         }
     }

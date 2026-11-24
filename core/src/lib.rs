@@ -446,6 +446,9 @@ impl Engine {
     pub fn apps(&self) -> Result<Vec<AppCount>, EngineError> {
         Ok(lock(&self.s.store).apps()?)
     }
+    pub fn displays(&self) -> Result<Vec<AppCount>, EngineError> {
+        Ok(lock(&self.s.store).displays()?)
+    }
     pub fn stats(&self) -> Result<Stats, EngineError> {
         let model = lock(&self.s.config).embed_model.clone();
         let store = lock(&self.s.store);
