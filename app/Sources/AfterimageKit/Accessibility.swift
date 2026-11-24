@@ -87,6 +87,8 @@ public enum Accessibility {
         case "AXWebArea":
             let u = try e.read(kAXURLAttribute)
             let s = (u as? URL)?.absoluteString ?? (u as? String) ?? "unknown:"
+            // Firefox's own window, drawn as a page; no website can have this address. Real pages are nested inside.
+            if s == "chrome://browser/content/browser.xhtml" { break }
             if !b.urls.contains(s) { b.urls.append(s) }
             return []
         case "AXButton", "AXPopUpButton", "AXMenuButton", "AXStaticText", "AXImage":

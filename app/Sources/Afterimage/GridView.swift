@@ -4,6 +4,7 @@ import SwiftUI
 
 struct GridView: View {
     @Environment(AppModel.self) private var model
+    @FocusState private var focused: Bool
     private let columns = [GridItem(.adaptive(minimum: 230, maximum: 340), spacing: 18)]
 
     var body: some View {
@@ -27,7 +28,11 @@ struct GridView: View {
                 }
                 .padding(.horizontal, 24).padding(.vertical, 16)
             }
-            .background { Color.clear.contentShape(.rect).onTapGesture { model.selection = [] } }
+            .background { Color.clear.contentShape(.rect).onTapGesture { model.selection = []; focused = true } }
+            // Edit > Select All reaches whatever has focus.
+            .focusable().focusEffectDisabled().focused($focused)
+            .onCommand(#selector(NSResponder.selectAll(_:))) { model.selection = Set(model.shots.map(\.id)) }
+            .onAppear { focused = true }
         }
     }
 
@@ -42,6 +47,7 @@ struct GridView: View {
     }
 
     private func select(_ s: Shot) {
+        focused = true
         let f = NSEvent.modifierFlags
         if f.contains(.command) {
             model.selection.formSymmetricDifference([s.id])

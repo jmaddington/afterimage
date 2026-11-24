@@ -195,7 +195,11 @@ extension Shot {
                 }.value
                 show(first)
                 let side = try await Task.detached { [engine] in (try engine.apps(), try engine.stats()) }.value
-                if g == generation { (apps, stats) = side }
+                if g == generation {
+                    (apps, stats) = side
+                    // The last picture of an app takes its row with it.
+                    if case .app(let b) = place, !apps.contains(where: { $0.bundleId == b }) { place = .all }
+                }
                 // Words now, meaning a moment later.
                 if searching {
                     let full = try await Task.detached { [engine] in try engine.search(filter: f, semantic: true, limit: 200) }.value
