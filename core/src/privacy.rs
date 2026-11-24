@@ -428,10 +428,13 @@ pub fn hide_browser(ex: &Exclusions, bundle_id: &str, windows: &[BrowserWindow],
     }
     if only_registered(bundle_id) {
         let b = bundle_id.to_lowercase();
-        if windows.iter().any(|w| !w.urls.is_empty()) {
+        let private = ex.private_windows && windows.iter().any(|w| is_private(f, w));
+        if private || windows.iter().any(|w| !w.urls.is_empty()) {
             SHOWN_PAGES.write().unwrap_or_else(|e| e.into_inner()).insert(b.clone());
         }
-        if !SHOWN_PAGES.read().unwrap_or_else(|e| e.into_inner()).contains(&b) {
+        // Not a browser only on evidence: a full look at its windows that found no page in any of them.
+        let pageless = complete && !windows.is_empty() && windows.iter().all(|w| w.urls.is_empty());
+        if pageless && !SHOWN_PAGES.read().unwrap_or_else(|e| e.into_inner()).contains(&b) {
             return None;
         }
     }
@@ -881,7 +884,13 @@ mod tests {
         // A terminal also says it opens links. With no page in it, it's an ordinary app, readable or not.
         let plain = BrowserWindow { urls: vec![], ..win("x") };
         assert_eq!(hide_browser(&e, "com.example.terminal", &[plain.clone()], true), None);
-        assert_eq!(hide_browser(&e, "com.example.terminal", &[], false), None);
+        // Only a full look that finds no page says so; a failed look says nothing.
+        assert_eq!(hide_browser(&e, "com.example.terminal", &[plain.clone()], false), Some(HideReason::Unreadable));
+        assert_eq!(hide_browser(&e, "com.example.terminal", &[], false), Some(HideReason::Unreadable));
+        // A private-window marker makes it a browser on the spot.
+        register_browsers(vec!["net.Mullvad.MullvadBrowser".into(), "one.ablaze.floorp".into(), "com.example.terminal".into(), "com.example.quiet".into()]);
+        let marked = BrowserWindow { title: Some("x — Private Browsing".into()), urls: vec![], ..win("x") };
+        assert_eq!(hide_browser(&ex(), "com.example.quiet", &[marked], true), Some(HideReason::PrivateWindow));
         // One page seen, and from then on it is held to a browser's rules.
         assert_eq!(hide_browser(&e, "net.mullvad.mullvadbrowser", &[win("https://chase.com/")], true), Some(HideReason::Site));
         assert_eq!(hide_browser(&e, "net.mullvad.mullvadbrowser", &[], false), Some(HideReason::Unreadable));
