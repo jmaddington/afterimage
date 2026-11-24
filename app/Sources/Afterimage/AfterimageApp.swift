@@ -18,10 +18,8 @@ import SwiftUI
             SettingsView().environment(model).environment(model.settings).environment(model.recorder)
         }
 
-        MenuBarExtra {
+        MenuBarExtra("Afterimage: \(model.statusLine)", systemImage: model.menuSymbol) {
             MenuBarContent().environment(model).environment(model.settings).environment(model.recorder)
-        } label: {
-            Image(systemName: model.menuSymbol).accessibilityLabel("Afterimage: \(model.statusLine)")
         }
     }
 }

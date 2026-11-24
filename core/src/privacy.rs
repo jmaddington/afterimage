@@ -123,7 +123,7 @@ pub fn hide_app(ex: &Exclusions, bundle_id: &str) -> Option<HideReason> {
     if SYSTEM_PROMPTS.contains(&b.as_str()) {
         return Some(HideReason::SystemPrompt);
     }
-    if ex.apps.iter().any(|a| a.to_lowercase() == b) {
+    if ex.apps.iter().any(|a| a.to_lowercase() == b) || ex.tor && is_tor(&b) {
         return Some(HideReason::App);
     }
     (ex.password_managers && MANAGER_APPS.iter().any(|m| b == *m || b.starts_with(&format!("{m}.")))).then_some(HideReason::PasswordManager)
@@ -803,6 +803,9 @@ mod tests {
         assert_eq!(tor(true, false), Some(HideReason::App));
         assert_eq!(tor(false, true), None);
         assert_eq!(tor(false, false), None);
+        // Excluded whole: not read, not woken, not listed among running apps, like any other excluded app.
+        assert_eq!(hide_app(&ex(), "org.torproject.TorBrowser"), Some(HideReason::App));
+        assert_eq!(hide_app(&Exclusions { tor: false, ..ex() }, "org.torproject.torbrowser"), None);
         // Allowed, but every other rule still applies.
         let e = Exclusions { tor: false, ..sites(&["chase.com"]) };
         assert_eq!(hide_browser(&e, "org.torproject.torbrowser", &[win("https://chase.com")], true), Some(HideReason::Site));
