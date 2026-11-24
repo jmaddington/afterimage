@@ -2,7 +2,11 @@
 members = ["core"]
 resolver = "2"
 
+# AIDEV-NOTE: strip must stay off: macOS 27 dyld rejects rustc-stripped proc-macro dylibs (mis-aligned LINKEDIT).
 [profile.release]
 lto = "thin"
 codegen-units = 4
-strip = "debuginfo"
+strip = "none"
+
+[profile.release.build-override]
+strip = "none"

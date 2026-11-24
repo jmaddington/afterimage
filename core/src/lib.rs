@@ -1,15 +1,17 @@
 //! Afterimage engine. Swift captures and reads the screen; everything after that happens here.
 //!
 //! AIDEV-NOTE: privacy-critical invariant: raw pixels live only in RAM. `process` is the sole path to disk, and
-//! AIDEV-NOTE: `Host::encode` is only ever handed a frame whose secrets have been frosted over.
+//! AIDEV-NOTE: `HostServices::encode` is only ever handed a frame whose secrets have been frosted over.
 
 mod detect;
 mod lm;
+mod privacy;
 mod redact;
 mod store;
 
 pub use detect::{Rect, SecretKind, TextLine, Token};
 pub use lm::ModelInfo;
+pub use privacy::*;
 pub use store::*;
 
 use detect::Hit;
@@ -59,7 +61,7 @@ pub struct Encoded {
 
 /// Apple-framework services supplied by the app.
 #[uniffi::export(with_foreign)]
-pub trait Host: Send + Sync {
+pub trait HostServices: Send + Sync {
     fn encode(&self, rgba: Vec<u8>, width: u32, height: u32, stride: u32, path: String, thumb_path: String) -> Result<Encoded, HostError>;
     fn model_image(&self, path: String) -> Result<Vec<u8>, HostError>;
     fn library_changed(&self);
@@ -123,7 +125,7 @@ struct Queue {
 }
 
 struct Shared {
-    host: Arc<dyn Host>,
+    host: Arc<dyn HostServices>,
     root: PathBuf,
     store: Mutex<Store>,
     config: Mutex<Config>,
@@ -167,7 +169,7 @@ pub struct Engine {
 #[uniffi::export]
 impl Engine {
     #[uniffi::constructor]
-    pub fn new(root: String, config: Config, host: Arc<dyn Host>) -> Result<Arc<Self>, EngineError> {
+    pub fn new(root: String, config: Config, host: Arc<dyn HostServices>) -> Result<Arc<Self>, EngineError> {
         let root = PathBuf::from(root);
         let store = Store::open(&root)?;
         if let Err(e) = store.sweep_orphans() {
@@ -683,7 +685,7 @@ mod tests {
     use super::*;
 
     struct FakeHost(Mutex<Vec<Vec<u8>>>);
-    impl Host for FakeHost {
+    impl HostServices for FakeHost {
         fn encode(&self, rgba: Vec<u8>, width: u32, height: u32, _: u32, path: String, thumb: String) -> Result<Encoded, HostError> {
             std::fs::write(path, &rgba).unwrap();
             std::fs::write(thumb, b"t").unwrap();

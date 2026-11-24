@@ -11,3 +11,5 @@ app/Generated/
 .beads-credential-key
 .beads/proxieddb/
 *.gate.lock*
+app/Sources/CAfterimage/
+app/Sources/AfterimageEngine/
