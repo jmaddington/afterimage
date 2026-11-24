@@ -472,6 +472,11 @@ fn scan_latin(text: &str, line: usize, hits: &mut Vec<Hit>) {
             // The count must end there: "12,hunter22" and "12;x" are not counts. A bare count is short; a longer
             // one needs a word after it ("1204 Rust"), so a PIN on its own stays hidden.
             && (rest.is_empty() || rest.starts_with(' ') || rest.starts_with(", "))
+            // And so must everything after it: plain numbers and plain words only ("of 12", "Rust, 57 Swift").
+            && rest.split(|c: char| c.is_whitespace() || c == ',').filter(|t| !t.is_empty()).all(|t| {
+                let t = t.trim_end_matches('.');
+                !t.is_empty() && (t.chars().all(|c| c.is_ascii_digit()) || t.chars().all(char::is_alphabetic))
+            })
             && (v.as_str().len() <= 3 || v.as_str().len() <= 6 && rest.trim_start().chars().next().is_some_and(char::is_alphabetic))
             && PASSERS.contains(&subject.to_lowercase().as_str())
             && !head[..head.len() - subject.len()].trim_end().ends_with([':', '=', '>']);
@@ -1436,6 +1441,10 @@ mod tests {
         // Seen live: every "Tests pass: 150" in a terminal was being frosted.
         for t in ["Tests pass: 150 Rust, 57 Swift", "- Tests pass: 150 Rust", "All checks pass: 12 of 12", "Tests pass: 1204 Rust", "tests pass: 150, 57 skipped", "tests pass: 9"] {
             assert_eq!(masked(t), t);
+        }
+        // Anything that isn't a plain number or word after the count, and it is no longer read as a count.
+        for t in ["tests pass: 4471 hunter22", "tests pass: 4471, hunter22", "tests pass: 4471 x=1"] {
+            assert!(!masked(t).contains("4471"), "{}", masked(t));
         }
         for t in ["pass: hunter22", "db pass: hunter22", "root pass = hunter22", "wifi pass: hunter22", "mysql_pass=hunter22", "PASS=hunter22", "MONGO_PASS=hunter22", "RABBITMQ_PASS=hunter22",
                   "keyPass=hunter22", "tests_pass=hunter22", "dana pass: hunter22", "user: tests pass: hunter22", "login=all pass=hunter22",
