@@ -50,7 +50,10 @@ public struct OnScreenWindow: Sendable {
     public static func front(of pid: pid_t, in list: [OnScreenWindow]) -> OnScreenWindow? {
         let mine = list.filter { $0.pid == pid && $0.layer == 0 && $0.alpha > 0 }
         let real = mine.filter { $0.bounds.width > 160 && $0.bounds.height > 160 }
-        return real.first { !$0.title.isEmpty } ?? real.first ?? mine.first
+        guard let top = real.first else { return mine.first }
+        guard top.title.isEmpty else { return top }
+        // Only a popup yields to what's behind it, and only to the window it belongs to.
+        return real.first { !$0.title.isEmpty && $0.bounds.contains(top.bounds) } ?? top
     }
     public static func all() -> [OnScreenWindow] {
         let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []

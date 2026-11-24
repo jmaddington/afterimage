@@ -19,6 +19,7 @@ public struct TriggerPolicy: Sendable {
     public var interval: TimeInterval = 60
     public var enabled: Set<Trigger> = Set(Trigger.allCases)
 
+    public private(set) var generation = 0
     private var pending: Trigger?
     private var first: TimeInterval = 0
     private var last: TimeInterval = 0
@@ -52,12 +53,13 @@ public struct TriggerPolicy: Sendable {
 
     public mutating func captured(at now: TimeInterval) { lastCapture = now; pending = nil; retrying = false }
     /// The capture came to nothing (a menu was open, a page was mid-change). Try again twice, then let it go.
-    public mutating func missed(_ t: Trigger, at now: TimeInterval) {
-        guard t != .interval, t != .manual, pending == nil, retries < 2 else { return }
+    /// `since` is the generation when it began: whatever was cleared meanwhile stays cleared.
+    public mutating func missed(_ t: Trigger, at now: TimeInterval, since g: Int) {
+        guard g == generation, t != .interval, t != .manual, pending == nil, retries < 2 else { return }
         retries += 1
         (pending, first, last, retrying) = (t, now, now, true)
     }
-    public mutating func clear() { pending = nil; retrying = false }
+    public mutating func clear() { pending = nil; retrying = false; generation += 1 }
 
     /// Drop spinners, counters and percentages so only real title changes count.
     public static func stableTitle(_ s: String) -> String {

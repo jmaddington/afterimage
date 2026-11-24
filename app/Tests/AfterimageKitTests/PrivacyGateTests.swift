@@ -136,20 +136,25 @@ final class FakeElement: ScreenElement {
     }
     @Test func nothingChangedIsFine() { #expect(Capturer.spoiled(look(), look(), omitted: [9]) == nil) }
     @Test func anythingThatChangedSpoilsIt() {
-        #expect(Capturer.spoiled(look(), look { $0.blocked = "A password is being typed" }, omitted: [9]) == "A password is being typed")
-        #expect(Capturer.spoiled(look { $0.blocked = "Paused" }, look(), omitted: [9]) == "Paused")
+        #expect(Capturer.spoiled(look(), look { $0.blocked = "A password is being typed" }, omitted: [9]) == .blocked("A password is being typed"))
+        #expect(Capturer.spoiled(look { $0.blocked = "Paused" }, look(), omitted: [9]) == .blocked("Paused"))
         #expect(Capturer.spoiled(look(), look { $0.exclusions.sites = ["chase.com"] }, omitted: [9]) != nil)
         #expect(Capturer.spoiled(look(), look { $0.exclusions.apps = ["x"] }, omitted: [9]) != nil)
         #expect(Capturer.spoiled(look(), look { $0.front = 6 }, omitted: [9]) != nil)
         #expect(Capturer.spoiled(look(), look { $0.hidden = [9, 5] }, omitted: [9]) != nil)
         // Private and drawn only at the moment of the picture, gone by the last look.
         #expect(Capturer.spoiled(look(), look { $0.hidden = [9, 7] }, during: [look { $0.drawn = [5, 7, 9] }], omitted: [9]) != nil)
-        #expect(Capturer.spoiled(look(), look(), during: [look { $0.blocked = "Paused" }], omitted: [9]) == "Paused")
+        #expect(Capturer.spoiled(look(), look(), during: [look { $0.blocked = "Paused" }], omitted: [9]) == .blocked("Paused"))
         #expect(Capturer.spoiled(look(), look(), during: [look { $0.exclusions.sites = ["x.com"] }], omitted: [9]) != nil)
         // Private before, gone after, and never left out of the picture.
         #expect(Capturer.spoiled(look { $0.hidden = [9, 7]; $0.drawn = [5, 7] }, look(), omitted: [9]) != nil)
         // Private and on screen, but macOS didn't list it, so it couldn't be left out.
         #expect(Capturer.spoiled(look(), look(), omitted: []) != nil)
+        // Only what may pass on its own is worth another try.
+        #expect(Capturer.spoiled(look(), look { $0.exclusions.sites = ["x.com"] }, omitted: [9]) == .blocked("Your settings changed mid-capture"))
+        #expect(Capturer.spoiled(look(), look { $0.front = 6 }, omitted: [9]) == .skipped("The app changed mid-capture"))
+        #expect(Capturer.refused(.site, "Safari") == .blocked("A site you excluded is open in Safari"))
+        #expect(Capturer.refused(.unreadable, "Safari") == .skipped("Safari’s address couldn’t be read"))
         // Private but not on screen.
         #expect(Capturer.spoiled(look { $0.hidden = [9, 7] }, look { $0.hidden = [9, 7] }, omitted: [9]) == nil)
     }

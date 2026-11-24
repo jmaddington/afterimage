@@ -72,21 +72,29 @@ import Testing
     }
     @Test func aMissedCaptureIsTriedAgainButNotForever() {
         var p = TriggerPolicy(); p.interval = 0
-        p.event(.tab, at: 100); p.captured(at: 101); p.missed(.tab, at: 101.5)
+        p.event(.tab, at: 100); p.captured(at: 101); p.missed(.tab, at: 101.5, since: p.generation)
         #expect(p.due(at: 102) == nil)
         #expect(p.due(at: 105.1) == .tab)         // a retry waits the ordinary gap, not the title one
-        p.captured(at: 105.1); p.missed(.tab, at: 106)
+        p.captured(at: 105.1); p.missed(.tab, at: 106, since: p.generation)
         #expect(p.due(at: 109.2) == .tab)
-        p.captured(at: 109.2); p.missed(.tab, at: 110)
+        p.captured(at: 109.2); p.missed(.tab, at: 110, since: p.generation)
         #expect(p.due(at: 200) == nil)
-        p.event(.app, at: 201); p.captured(at: 202); p.missed(.app, at: 202.5)
+        p.event(.app, at: 201); p.captured(at: 202); p.missed(.app, at: 202.5, since: p.generation)
         #expect(p.due(at: 206.1) == .app)         // a new event earns new tries
         p.clear(); #expect(p.due(at: 300) == nil)
-        p.missed(.interval, at: 301); #expect(p.due(at: 400) == nil)
+        p.missed(.interval, at: 301, since: p.generation); #expect(p.due(at: 400) == nil)
+    }
+    @Test func aMissFromBeforeAPauseIsNotRetried() {
+        var p = TriggerPolicy(); p.interval = 0
+        p.event(.app, at: 100); p.captured(at: 101)
+        let g = p.generation
+        p.clear()                                 // paused, locked, or off while the capture was in flight
+        p.missed(.app, at: 102, since: g)
+        #expect(p.due(at: 200) == nil)
     }
     @Test func aNewerEventOutranksARetry() {
         var p = TriggerPolicy(); p.captured(at: 100)
-        p.event(.app, at: 100.5); p.missed(.tab, at: 101)
+        p.event(.app, at: 100.5); p.missed(.tab, at: 101, since: p.generation)
         #expect(p.due(at: 104.1) == .app)
     }
 }
@@ -97,12 +105,15 @@ import Testing
     }
     @Test func popupsAreNotTheFrontWindow() {
         let page = w(9, "apples page")
-        #expect(OnScreenWindow.front(of: 5, in: [w(1, "", 1038, 218), page])?.id == 9)     // address bar suggestions
+        #expect(OnScreenWindow.front(of: 5, in: [w(1, "", 838, 218), page])?.id == 9)     // address bar suggestions
         #expect(OnScreenWindow.front(of: 5, in: [w(1, "x", 270, 80), page])?.id == 9)      // tab hover card
         #expect(OnScreenWindow.front(of: 5, in: [w(1, "x", layer: 101), w(2, "x", alpha: 0), w(3, "x", pid: 6), page])?.id == 9)
         #expect(OnScreenWindow.front(of: 5, in: [w(8, "second"), page])?.id == 8)
         #expect(OnScreenWindow.front(of: 5, in: [w(1, "", 1038, 218)])?.id == 1)           // nothing better
         #expect(OnScreenWindow.front(of: 5, in: [w(1, "", 100, 50)])?.id == 1)
+        // Untitled but not a popup of the titled window: the titled one isn't what's in front.
+        let away = OnScreenWindow(id: 7, pid: 5, title: "", layer: 0, bounds: CGRect(x: 2000, y: 0, width: 800, height: 600), alpha: 1)
+        #expect(OnScreenWindow.front(of: 5, in: [away, page])?.id == 7)
         #expect(OnScreenWindow.front(of: 5, in: []) == nil)
     }
 }

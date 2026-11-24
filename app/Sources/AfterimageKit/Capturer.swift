@@ -5,7 +5,10 @@ import ScreenCaptureKit
 public enum CaptureOutcome: Sendable, Equatable {
     case queued(Int)
     case unchanged
+    /// Something in the way that may pass on its own.
     case skipped(String)
+    /// A choice or a state that forbids it. Never retried.
+    case blocked(String)
     case failed(String)
 }
 
@@ -35,15 +38,15 @@ public actor Capturer {
     }
 
     /// Why a picture taken between these looks can't be kept, or nil.
-    static func spoiled(_ before: Look, _ after: Look, during: [Look] = [], omitted: Set<pid_t>) -> String? {
+    static func spoiled(_ before: Look, _ after: Look, during: [Look] = [], omitted: Set<pid_t>) -> CaptureOutcome? {
         let all = [before] + during + [after]
-        if let b = all.lazy.compactMap(\.blocked).first { return b }
-        if all.contains(where: { $0.exclusions != before.exclusions }) { return "Your settings changed mid-capture" }
-        if all.contains(where: { $0.front != before.front }) { return "The app changed mid-capture" }
+        if let b = all.lazy.compactMap(\.blocked).first { return .blocked(b) }
+        if all.contains(where: { $0.exclusions != before.exclusions }) { return .blocked("Your settings changed mid-capture") }
+        if all.contains(where: { $0.front != before.front }) { return .skipped("The app changed mid-capture") }
         // Off-limits at any instant and drawn at any instant: they needn't be the same one.
         let hidden = all.reduce(into: Set<pid_t>()) { $0.formUnion($1.hidden) }
         let drawn = all.reduce(into: Set<pid_t>()) { $0.formUnion($1.drawn) }
-        return hidden.intersection(drawn).subtracting(omitted).isEmpty ? nil : "Something private appeared"
+        return hidden.intersection(drawn).subtracting(omitted).isEmpty ? nil : .skipped("Something private appeared")
     }
 
     private func look(_ ex: Exclusions, _ hidden: Hidden, _ gate: Gate) async -> Look {
@@ -63,17 +66,17 @@ public actor Capturer {
 
     public func capture(_ trigger: Trigger, allDisplays: Bool, gate: @escaping Gate) async -> CaptureOutcome {
         // Actors are re-entrant across awaits; without this two cycles could mix one's pixels with the other's facts.
-        guard !busy else { return .skipped("Busy") }
+        guard !busy else { return .blocked("Busy") }
         busy = true
         defer { busy = false }
 
         let front = await MainActor.run { NSWorkspace.shared.frontmostApplication.map { ($0.processIdentifier, $0.localizedName ?? "", $0.bundleIdentifier ?? "") } }
         guard let front else { return .skipped("No app is in front") }
-        if front.0 == getpid() { return .skipped("Afterimage is in front") }
+        if front.0 == getpid() { return .blocked("Afterimage is in front") }
 
         let exclusions = await gate().exclusions
         var hiddenBefore = await hidden(exclusions)
-        if hiddenBefore.pids.contains(front.0) { return .skipped(Self.phrase(hiddenBefore.reasons[front.0], front.1)) }
+        if hiddenBefore.pids.contains(front.0) { return Self.refused(hiddenBefore.reasons[front.0], front.1) }
         let frontWindow = OnScreenWindow.front(of: front.0, in: OnScreenWindow.all())
 
         let content: SCShareableContent
@@ -82,7 +85,7 @@ public actor Capturer {
         } catch { return .failed(error.localizedDescription) }
         // Listing windows can take long enough for the facts to change.
         hiddenBefore = await hidden(exclusions)
-        if hiddenBefore.pids.contains(front.0) { return .skipped(Self.phrase(hiddenBefore.reasons[front.0], front.1)) }
+        if hiddenBefore.pids.contains(front.0) { return Self.refused(hiddenBefore.reasons[front.0], front.1) }
         let omit = content.applications.filter { hiddenBefore.pids.contains($0.processID) }
         let omitted = Set(omit.map(\.processID))
         let displays = pick(content.displays, front: frontWindow?.bounds, all: allDisplays)
@@ -90,7 +93,7 @@ public actor Capturer {
 
         // The last thing before looking.
         let before = await look(exclusions, hiddenBefore, gate)
-        if let why = Self.spoiled(before, before, omitted: omitted) { return .skipped(why) }
+        if let why = Self.spoiled(before, before, omitted: omitted) { return why }
         guard before.front == front.0, before.exclusions == exclusions else { return .skipped("The app changed mid-capture") }
 
         var shots: [(display: SCDisplay, image: CGImage, at: Date)] = []
@@ -112,7 +115,7 @@ public actor Capturer {
         let quick = await look(exclusions, hiddenBefore, gate)
         let hiddenAfter = await hidden(exclusions)
         let after = await look(exclusions, hiddenAfter, gate)
-        if let why = Self.spoiled(before, after, during: [quick], omitted: omitted) { return .skipped(why) }
+        if let why = Self.spoiled(before, after, during: [quick], omitted: omitted) { return why }
 
         let apps = await MainActor.run {
             NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular }
@@ -176,6 +179,9 @@ public actor Capturer {
     }
     @MainActor private static func name(_ id: CGDirectDisplayID) -> String {
         NSScreen.screens.first { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID) == id }?.localizedName ?? "Display"
+    }
+    static func refused(_ r: HideReason?, _ app: String) -> CaptureOutcome {
+        r == .unreadable ? .skipped(phrase(r, app)) : .blocked(phrase(r, app))
     }
     static func phrase(_ r: HideReason?, _ app: String) -> String {
         switch r {

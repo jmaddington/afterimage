@@ -123,7 +123,11 @@ import Observation
 
     private func tick() {
         let s = current()
-        if s != state { state = s }
+        if s != state {
+            // What happened before a pause isn't a reason to look after it.
+            if state == .watching { policy.clear() }
+            state = s
+        }
         guard s == .watching, !capturing else { return }
         policy.enabled = settings.triggers
         policy.interval = TimeInterval(settings.interval)
@@ -133,7 +137,7 @@ import Observation
         if t == .interval && Session.idleSeconds > max(60, Double(settings.interval)) { return }
         policy.captured(at: now)
         capturing = true
-        let all = settings.allDisplays
+        let all = settings.allDisplays, generation = policy.generation
         engine.setConditions(onPower: Session.onPower, calm: Session.calm)
         Task {
             let r = await capturer.capture(t, allDisplays: all) { self.gate() }
@@ -149,7 +153,9 @@ import Observation
                 lastNote = "Nothing has changed"
             case .skipped(let why):
                 lastNote = why
-                policy.missed(t, at: now)
+                if current() == .watching { policy.missed(t, at: now, since: generation) }
+            case .blocked(let why):
+                lastNote = why
             case .failed(let why):
                 failures += 1
                 lastNote = why
