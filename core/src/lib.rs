@@ -135,6 +135,14 @@ pub struct Status {
 /// AIDEV-NOTE: privacy-critical. Frames are refused by arrival number, never by the clock: anything that arrived
 /// AIDEV-NOTE: before the request and falls in its span is refused, however its timestamp compares with "now"; so is
 /// AIDEV-NOTE: anything taken before the request that arrives after it.
+/// The stretch of activity going on.
+struct Doing {
+    span: ActivitySpan,
+    key: u64,
+    /// When it was last written down.
+    saved: i64,
+}
+
 struct Forgot {
     from: i64,
     to: i64,
@@ -182,7 +190,10 @@ struct Shared {
     question: AtomicU64,
     mcp: Mutex<Option<mcp::Server>>,
     /// The stretch of activity being added to, and when it was last written down.
-    now_doing: Mutex<Option<(ActivitySpan, i64)>>,
+    // AIDEV-NOTE: lock order is now_doing, then store. `cleared` and `forgotten` are never held while taking another.
+    now_doing: Mutex<Option<Doing>>,
+    /// Window key -> its title as a saved picture left it. In memory only.
+    cleared: Mutex<HashMap<u64, String>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -226,7 +237,7 @@ impl Engine {
             hasher: RandomState::new(), forgotten: Default::default(), loaded_by_us: Default::default(),
             last_lm_use: Mutex::new(Instant::now()), lm_state: Mutex::new(LmState::Unknown), links: Default::default(),
             discarded: AtomicU64::new(0), reason: Default::default(), busy: AtomicBool::new(false),
-            describing: AtomicBool::new(false), on_power: AtomicBool::new(true), calm: AtomicBool::new(true), pages: Default::default(), outlets: Default::default(), question: AtomicU64::new(now_ms() as u64), mcp: Default::default(), now_doing: Default::default(),
+            describing: AtomicBool::new(false), on_power: AtomicBool::new(true), calm: AtomicBool::new(true), pages: Default::default(), outlets: Default::default(), question: AtomicU64::new(now_ms() as u64), mcp: Default::default(), now_doing: Default::default(), cleared: Default::default(),
         });
         for (name, f) in [("afterimage-save", save_loop as fn(Arc<Shared>)), ("afterimage-index", index_loop)] {
             let s = s.clone();
@@ -362,27 +373,44 @@ impl Engine {
 
     /// What is in front right now. Called every second or so while recording; cheap unless something changed.
     pub fn note_activity(&self, ex: Exclusions, sample: ActivitySample) -> Result<(), EngineError> {
-        let mut span = activity::describe(&ex, &sample);
+        let (mut span, key) = {
+            let cleared = lock(&self.s.cleared);
+            activity::describe(&ex, &sample, &|k| cleared.get(&k).cloned())
+        };
         let mut doing = lock(&self.s.now_doing);
+        // Asked to be forgotten while this was on its way here. Checked under the lock `forget` also takes.
+        if lock(&self.s.forgotten).iter().any(|x| (x.from..x.to).contains(&sample.at) && sample.at <= x.asked) {
+            return Ok(());
+        }
+        let near = |d: &Doing| sample.at - d.span.end < 60_000;
         match doing.as_mut() {
-            // The same window still: stretch it. Written down every quarter minute, so little is lost if the app dies.
-            Some((cur, saved)) if activity::same(cur, &span) && sample.at >= cur.end && sample.at - cur.end < 60_000 => {
-                cur.end = sample.at;
-                if sample.at - *saved >= 15_000 {
-                    lock(&self.s.store).activity_extend(cur.id, cur.end)?;
-                    *saved = sample.at;
+            // Out of order: it says nothing new.
+            Some(d) if sample.at < d.span.end => {}
+            // The same window still, and its title hasn't been withdrawn: stretch it. Written down every quarter
+            // minute, so little is lost if the app dies.
+            Some(d) if d.key == key && d.span.private_time == span.private_time && near(d)
+                && (d.span.title == span.title || span.title.is_empty() == d.span.title.is_empty() || d.span.title.is_empty() && activity::may_retitle(&span.bundle_id)) => {
+                d.span.end = sample.at;
+                let retitle = d.span.title.is_empty() && !span.title.is_empty();
+                if retitle || sample.at - d.saved >= 15_000 {
+                    let store = lock(&self.s.store);
+                    if retitle {
+                        store.activity_retitle(d.span.id, &span.title)?;
+                        d.span.title = span.title;
+                    }
+                    store.activity_extend(d.span.id, d.span.end)?;
+                    d.saved = sample.at;
                 }
             }
             _ => {
                 let store = lock(&self.s.store);
-                if let Some((cur, _)) = doing.take() {
+                if let Some(d) = doing.take() {
                     // It lasted until this one began, unless there was a long silence between.
-                    let end = if sample.at >= cur.end && sample.at - cur.end < 60_000 { sample.at } else { cur.end };
-                    store.activity_extend(cur.id, end)?;
+                    store.activity_extend(d.span.id, if near(&d) { sample.at } else { d.span.end })?;
                 }
                 (span.start, span.end) = (sample.at, sample.at);
                 span.id = store.activity_open(&span)?;
-                *doing = Some((span, sample.at));
+                *doing = Some(Doing { span, key, saved: sample.at });
             }
         }
         Ok(())
@@ -390,8 +418,8 @@ impl Engine {
 
     /// Nobody is there, or recording stopped: the current stretch ends where it last was.
     pub fn end_activity(&self) {
-        if let Some((cur, _)) = lock(&self.s.now_doing).take() {
-            let _ = lock(&self.s.store).activity_extend(cur.id, cur.end);
+        if let Some(d) = lock(&self.s.now_doing).take() {
+            let _ = lock(&self.s.store).activity_extend(d.span.id, d.span.end);
         }
     }
 
@@ -457,13 +485,17 @@ impl Engine {
         drop(f);
         q.frames.retain(|(_, f)| !(from..to).contains(&f.moment.taken_at));
         drop(q);
+        lock(&self.s.cleared).clear();
+        // Held together, in this order, so a sample can't write between the delete and the reset.
+        let mut doing = lock(&self.s.now_doing);
         let store = lock(&self.s.store);
         store.dev_forget(from, to)?;
         store.activity_forget(from, to)?;
         // What is going on right now is inside "everything so far".
-        if lock(&self.s.now_doing).as_ref().is_some_and(|d| d.0.end >= from && d.0.start < to) {
-            *lock(&self.s.now_doing) = None;
+        if doing.as_ref().is_some_and(|d| d.span.end >= from && d.span.start < to) {
+            *doing = None;
         }
+        drop(doing);
         let ids = store.ids_matching(&Filter { from: Some(from), to: Some(to), ..Default::default() })?;
         drop(store);
         self.delete(ids)
@@ -552,7 +584,7 @@ fn take(t: &lm::Tape) -> Vec<lm::Call> {
 impl Shared {
     /// Stretches overlapping the range, the one still going included up to now.
     fn activity(&self, from: i64, to: i64) -> Result<Vec<ActivitySpan>, EngineError> {
-        let doing = lock(&self.now_doing).as_ref().map(|d| d.0.clone());
+        let doing = lock(&self.now_doing).as_ref().map(|d| d.span.clone());
         let mut spans = lock(&self.store).activity_list(from, to, 5000)?;
         if let Some(cur) = doing {
             if let Some(s) = spans.iter_mut().find(|s| s.id == cur.id) {
@@ -852,11 +884,21 @@ impl Shared {
             remove();
             return Ok(None);
         }
+        let title = (activity::key(&m.bundle_id, &f.moment.window_title), m.window_title.clone());
         let new = NewShot { moment: m, path: path.clone(), thumb_path: thumb_path.clone(), width: e.width, height: e.height, bytes: e.bytes, regions, lines, ai_checked };
-        match store.insert(&new) {
-            Ok(id) => Ok(Some((id, hits, ai_checked, all))),
+        let inserted = store.insert(&new);
+        drop(store);
+        match inserted {
+            Ok(id) => {
+                // This window's title has now been through everything the picture went through.
+                let mut cleared = lock(&self.cleared);
+                if cleared.len() >= 512 {
+                    cleared.clear();
+                }
+                cleared.insert(title.0, title.1);
+                Ok(Some((id, hits, ai_checked, all)))
+            }
             Err(e) => {
-                drop(store);
                 remove();
                 Err(format!("The library couldn't be updated: {e}"))
             }
@@ -1666,6 +1708,9 @@ mod tests {
         // How the time was spent, with private time shown as such and nothing more.
         let nine = 1_795_528_800_000i64;
         let ex = Exclusions { password_managers: true, ..Default::default() };
+        for (b, t) in [("test.Mail", "Inbox"), ("test.Safari", "Chase"), ("n", "House")] {
+            lock(&e.s.cleared).insert(activity::key(b, t), t.into());
+        }
         for half in 0..20i64 {
             let (bundle, title) = match half { 0..=7 => ("test.Mail", "Inbox"), 8..=9 => ("com.bitwarden.desktop", "Vault"), _ => ("test.Safari", "Chase") };
             let front = OpenWindow { app: bundle.rsplit('.').next().unwrap().into(), bundle_id: bundle.into(), title: title.into() };
@@ -1745,6 +1790,9 @@ mod tests {
         let e = Engine::new(d.path().to_string_lossy().into(), config(false), Arc::new(FakeHost(Default::default()))).unwrap();
         let ex = Exclusions { password_managers: true, ..Default::default() };
         let now = now_ms() - 600_000;
+        for t in ["one", "two", "after"] {
+            lock(&e.s.cleared).insert(activity::key("x", t), t.into());
+        }
         let at = |secs: i64, bundle: &str, title: &str| ActivitySample { at: now + secs * 1000, front: OpenWindow { app: bundle.into(), bundle_id: bundle.into(), title: title.into() }, ..Default::default() };
         for (secs, bundle, title) in [(0, "x", "one"), (1, "x", "one"), (40, "x", "one"), (41, "x", "two"), (50, "com.bitwarden.desktop", "Vault"), (55, "x", "two"), (56, "x", "two"),
                                       // A long silence (asleep, or the app wasn't running): not counted as time in the window.
@@ -1758,9 +1806,79 @@ mod tests {
         assert_eq!(e.activity(0, i64::MAX).unwrap().len(), 6);
         e.forget(i64::MIN, i64::MAX).unwrap();
         assert!(e.activity(0, i64::MAX).unwrap().is_empty());
-        // And it starts again cleanly afterwards.
-        e.note_activity(ex, ActivitySample { at: now_ms(), front: OpenWindow { app: "x".into(), bundle_id: "x".into(), title: "after".into() }, ..Default::default() }).unwrap();
+        // A sample from before the request that arrives after it is refused.
+        e.note_activity(ex.clone(), at(403, "x", "two")).unwrap();
+        assert!(e.activity(0, i64::MAX).unwrap().is_empty());
+        // And it starts again cleanly afterwards, with titles to be earned again.
+        e.note_activity(ex.clone(), ActivitySample { at: now_ms() + 5, front: OpenWindow { app: "x".into(), bundle_id: "x".into(), title: "after".into() }, ..Default::default() }).unwrap();
+        assert_eq!(e.activity(0, i64::MAX).unwrap()[0].title, "");
+        e.forget(i64::MIN, i64::MAX).unwrap();
+        lock(&e.s.cleared).insert(activity::key("x", "after"), "after".into());
+        e.note_activity(ex, ActivitySample { at: now_ms() + 5, front: OpenWindow { app: "x".into(), bundle_id: "x".into(), title: "after".into() }, ..Default::default() }).unwrap();
         assert_eq!(e.activity(0, i64::MAX).unwrap().len(), 1);
+        e.shutdown();
+    }
+
+    #[test]
+    fn a_window_title_is_logged_only_as_a_saved_picture_left_it() {
+        let ex = Exclusions::default();
+        let front = |at: i64| ActivitySample { at, front: OpenWindow { app: "B".into(), bundle_id: "b".into(), title: "login hunter22".into() }, ..Default::default() };
+        let titles = |e: &Engine| e.activity(0, i64::MAX).unwrap().into_iter().map(|s| s.title).collect::<Vec<_>>();
+        let shot = || {
+            let mut f = frame(1000);
+            f.moment.bundle_id = "b".into();
+            f
+        };
+        // The model must check and can't: no picture, so no title either.
+        let d = tempfile::tempdir().unwrap();
+        let e = Engine::new(d.path().to_string_lossy().into(), config(true), Arc::new(FakeHost(Default::default()))).unwrap();
+        e.ingest(shot());
+        wait(|| e.status().discarded == 1);
+        e.note_activity(ex.clone(), front(5000)).unwrap();
+        assert_eq!(titles(&e), [""]);
+        e.shutdown();
+        // Saved: the stretch already going gets the title the picture got, secrets out.
+        let d = tempfile::tempdir().unwrap();
+        let e = Engine::new(d.path().to_string_lossy().into(), config(false), Arc::new(FakeHost(Default::default()))).unwrap();
+        e.note_activity(ex.clone(), front(5000)).unwrap();
+        e.ingest(shot());
+        wait(|| e.stats().unwrap().count == 1);
+        e.note_activity(ex.clone(), front(6000)).unwrap();
+        let saved = e.list(Filter::default(), 1, 0).unwrap().remove(0).moment.window_title;
+        assert!(!saved.contains("hunter22") && saved.starts_with("login"));
+        assert_eq!(titles(&e), [saved.clone()]);
+        // A late sample changes nothing.
+        e.note_activity(ex.clone(), ActivitySample { at: 5500, front: OpenWindow { app: "C".into(), bundle_id: "c".into(), title: "x".into() }, ..Default::default() }).unwrap();
+        assert_eq!(titles(&e), [saved]);
+        let raw = std::fs::read(d.path().join("index.sqlite")).unwrap();
+        assert!(!String::from_utf8_lossy(&raw).contains("hunter22"));
+        e.shutdown();
+    }
+
+    #[test]
+    fn forgetting_and_logging_at_once_do_not_lock_each_other_out() {
+        let d = tempfile::tempdir().unwrap();
+        let e = Arc::new(Engine::new(d.path().to_string_lossy().into(), config(false), Arc::new(FakeHost(Default::default()))).unwrap());
+        let (a, b) = (e.clone(), e.clone());
+        let now = now_ms();
+        let logging = std::thread::spawn(move || {
+            for i in 0..400 {
+                let t = if i % 2 == 0 { "p" } else { "q" };
+                a.note_activity(Exclusions::default(), ActivitySample { at: now + i, front: OpenWindow { app: "x".into(), bundle_id: "x".into(), title: t.into() }, ..Default::default() }).unwrap();
+            }
+        });
+        let forgetting = std::thread::spawn(move || {
+            for _ in 0..400 {
+                b.forget(0, 10).unwrap();
+            }
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            logging.join().unwrap();
+            forgetting.join().unwrap();
+            let _ = tx.send(());
+        });
+        assert!(rx.recv_timeout(Duration::from_secs(20)).is_ok(), "deadlocked");
         e.shutdown();
     }
 }

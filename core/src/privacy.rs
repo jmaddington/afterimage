@@ -150,6 +150,11 @@ fn is_tor(bundle_id: &str) -> bool {
     bundle_id.to_lowercase().starts_with("org.torproject.")
 }
 
+/// A browser we know, or an app that has actually shown a web page. A terminal that merely registers for links isn't.
+pub fn shows_pages(bundle_id: &str) -> bool {
+    family_of(bundle_id, false).is_some() || SHOWN_PAGES.read().unwrap_or_else(|e| e.into_inner()).contains(&bundle_id.to_lowercase())
+}
+
 #[uniffi::export]
 pub fn hide_app(ex: &Exclusions, bundle_id: &str) -> Option<HideReason> {
     let b = bundle_id.to_lowercase();

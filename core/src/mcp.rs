@@ -348,7 +348,7 @@ fn activity(s: &Shared, a: &Value, off: i32) -> Result<Value, String> {
     Ok(json!({"note": UNTRUSTED, "from": iso(from, off), "to": iso(to, off),
               "minutes_by_app": by_app.iter().map(|(a, ms)| json!({"app": a, "minutes": minutes(*ms)})).collect::<Vec<_>>(),
               "stretches": out,
-              "about": "Time with nothing listed means the person was away, the screen was locked, or recording was off. A browser's window title is blank unless that page was allowed to be photographed."}))
+              "about": "Time with nothing listed means the person was away, the screen was locked, or recording was off. A window's title is blank until a picture of that window has been checked for secrets and saved."}))
 }
 
 fn timeline(s: &Shared, a: &Value, off: i32) -> Result<Value, String> {

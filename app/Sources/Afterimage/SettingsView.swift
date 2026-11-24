@@ -47,7 +47,7 @@ private struct CaptureSettings: View {
             Section {
                 Toggle("Keep a log of the window in front", isOn: $settings.trackActivity)
             } footer: {
-                Text("Which app and window you were in, for how long, and what else was open. No pictures. Apps you exclude show only as private time, and a browser’s page title is kept only for pages that were allowed to be photographed.").foregroundStyle(.secondary)
+                Text("Which app and window you were in, for how long, and what else was open. No pictures. Apps you exclude show only as private time. A window’s title is kept only once a picture of that window has been checked for secrets and saved.").foregroundStyle(.secondary)
             }
             Section {
                 Toggle("Open at login", isOn: $login)

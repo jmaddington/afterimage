@@ -451,6 +451,9 @@ impl Store {
     pub fn activity_extend(&self, id: i64, end: i64) -> Res<()> {
         self.db.execute("UPDATE activity SET end=? WHERE id=? AND end<?", params![end, id, end]).map(|_| ())
     }
+    pub fn activity_retitle(&self, id: i64, title: &str) -> Res<()> {
+        self.db.execute("UPDATE activity SET title=? WHERE id=?", params![title, id]).map(|_| ())
+    }
     /// Stretches that overlap the range, oldest first.
     pub fn activity_list(&self, from: i64, to: i64, limit: u32) -> Res<Vec<ActivitySpan>> {
         let mut st = self.db.prepare("SELECT id,start,end,app,bundle_id,title,url,private_time,others FROM activity WHERE start<? AND end>=? ORDER BY start LIMIT ?")?;

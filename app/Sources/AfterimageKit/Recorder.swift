@@ -20,7 +20,11 @@ import Observation
     private var observers: [(NotificationCenter, NSObjectProtocol)] = []
     private var tracker = FrontTracker()
     /// The window the last successful capture was of: its title has passed every privacy check.
-    private var approved: (pid: pid_t, title: String)?
+    /// AIDEV-NOTE: privacy-critical. Bound to the window and the settings it passed under; withdrawn by any capture that didn't succeed.
+    private var approved: Approval?
+    private struct Approval: Equatable { let window: CGWindowID, title: String, rules: Exclusions }
+    /// Samples reach the engine in the order they were taken.
+    private let activityQueue = DispatchQueue(label: "afterimage.activity", qos: .utility)
     private var lastActivity = Date.distantPast
     private var logging = false
     private var pausedUntil: Date?
@@ -161,21 +165,24 @@ import Observation
             }
             switch r {
             case .queued:
-                approved = shown
+                approved = shown == frontNow() ? shown : nil
                 failures = 0
                 lastCapture = Date()
                 lastNote = ""
                 flash += 1
             case .unchanged:
-                approved = shown
+                approved = shown == frontNow() ? shown : nil
                 failures = 0
                 lastNote = "Nothing has changed"
             case .skipped(let why):
+                approved = nil
                 lastNote = why
                 if current() == .watching { policy.missed(t, at: now, since: generation) }
             case .blocked(let why):
+                approved = nil
                 lastNote = why
             case .failed(let why):
+                approved = nil
                 failures += 1
                 lastNote = why
                 backoffUntil = Date().addingTimeInterval([5, 30, 60, 120, 300][min(failures - 1, 4)])
@@ -192,9 +199,10 @@ import Observation
         if let t = tracker.see(pid: app.processIdentifier, window: w) { policy.event(t, at: now) }
     }
 
-    private func frontNow() -> (pid: pid_t, title: String)? {
+    /// The window in front and the settings in force, as an approval would record them.
+    private func frontNow() -> Approval? {
         guard let app = NSWorkspace.shared.frontmostApplication, let w = OnScreenWindow.front(of: app.processIdentifier, in: OnScreenWindow.all()) else { return nil }
-        return (app.processIdentifier, w.title)
+        return Approval(window: w.id, title: TriggerPolicy.stableTitle(w.title), rules: settings.exclusions)
     }
 
     /// Once a second while watching: which window is in front and what else is open. The engine applies the privacy rules.
@@ -212,12 +220,11 @@ import Observation
         let sample = ActivitySample(
             at: Int64(Date().timeIntervalSince1970 * 1000),
             front: OpenWindow(app: app.localizedName ?? "", bundleId: app.bundleIdentifier ?? "", title: front?.title ?? ""),
-            url: "",
-            titleOk: approved.map { $0.pid == app.processIdentifier && $0.title == (front?.title ?? "") } ?? false,
+            titleOk: front.map { approved == Approval(window: $0.id, title: TriggerPolicy.stableTitle($0.title), rules: settings.exclusions) } ?? false,
             others: all.filter { $0.id != front?.id && $0.pid != getpid() }.map(open))
         logging = true
         let ex = settings.exclusions
-        Task.detached { [engine] in
+        activityQueue.async { [engine] in
             do { try engine.noteActivity(ex: ex, sample: sample) } catch { NSLog("activity not recorded: %@ [AIMG-ACTIVITY]", error.localizedDescription) }
         }
     }
@@ -225,6 +232,6 @@ import Observation
     private func stopActivity() {
         guard logging else { return }
         logging = false
-        Task.detached { [engine] in engine.endActivity() }
+        activityQueue.async { [engine] in engine.endActivity() }
     }
 }
