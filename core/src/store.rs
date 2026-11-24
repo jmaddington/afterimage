@@ -130,6 +130,8 @@ pub struct Near<'a> {
     pub band: f32,
 }
 
+use crate::activity::ActivitySpan;
+
 pub struct Store {
     db: Connection,
     pub root: PathBuf,
@@ -215,6 +217,10 @@ impl Store {
                kind TEXT NOT NULL, model TEXT NOT NULL, ms INTEGER NOT NULL, ok INTEGER NOT NULL, note TEXT NOT NULL,
                request TEXT NOT NULL, response TEXT NOT NULL);
              CREATE INDEX IF NOT EXISTS dev_shot ON dev(shot_id);
+             CREATE TABLE IF NOT EXISTS activity(
+               id INTEGER PRIMARY KEY AUTOINCREMENT, start INTEGER NOT NULL, end INTEGER NOT NULL, app TEXT NOT NULL, bundle_id TEXT NOT NULL,
+               title TEXT NOT NULL, url TEXT NOT NULL, private_time INTEGER NOT NULL, others TEXT NOT NULL);
+             CREATE INDEX IF NOT EXISTS activity_time ON activity(start);
              INSERT INTO fts(fts, rank) VALUES('secure-delete', 1);
              PRAGMA user_version=1;",
         )?;
@@ -435,6 +441,40 @@ impl Store {
             let _ = self.db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
         }
         Ok((n, failed))
+    }
+
+    pub fn activity_open(&self, a: &ActivitySpan) -> Res<i64> {
+        self.db.execute("INSERT INTO activity(start,end,app,bundle_id,title,url,private_time,others) VALUES(?,?,?,?,?,?,?,?)",
+            params![a.start, a.end, a.app, a.bundle_id, a.title, a.url, a.private_time, serde_json::to_string(&a.others).unwrap_or_default()])?;
+        Ok(self.db.last_insert_rowid())
+    }
+    pub fn activity_extend(&self, id: i64, end: i64) -> Res<()> {
+        self.db.execute("UPDATE activity SET end=? WHERE id=? AND end<?", params![end, id, end]).map(|_| ())
+    }
+    /// Stretches that overlap the range, oldest first.
+    pub fn activity_list(&self, from: i64, to: i64, limit: u32) -> Res<Vec<ActivitySpan>> {
+        let mut st = self.db.prepare("SELECT id,start,end,app,bundle_id,title,url,private_time,others FROM activity WHERE start<? AND end>=? ORDER BY start LIMIT ?")?;
+        st.query_map(params![to, from, limit], |r| {
+            Ok(ActivitySpan { id: r.get(0)?, start: r.get(1)?, end: r.get(2)?, app: r.get(3)?, bundle_id: r.get(4)?, title: r.get(5)?, url: r.get(6)?, private_time: r.get(7)?,
+                              others: serde_json::from_str(&r.get::<_, String>(8)?).unwrap_or_default() })
+        })?
+        .collect()
+    }
+    /// Forget a span of time: stretches inside it go; ones that straddle its edge are cut back to it.
+    pub fn activity_forget(&self, from: i64, to: i64) -> Res<()> {
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute("DELETE FROM activity WHERE start>=? AND end<?", [from, to])?;
+        tx.execute("UPDATE activity SET end=? WHERE start<? AND end>=? AND end<?", [from, from, from, to])?;
+        tx.execute("UPDATE activity SET start=? WHERE start>=? AND start<? AND end>=?", [to, from, to, to])?;
+        // One that covers the whole range from outside is the same window before and after; its middle can't be cut out
+        // of a single row, so the whole of it goes.
+        tx.execute("DELETE FROM activity WHERE start<? AND end>=?", [from, to])?;
+        tx.commit()?;
+        let _ = self.db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+        Ok(())
+    }
+    pub fn activity_expire(&self, before: i64) -> Res<()> {
+        self.db.execute("DELETE FROM activity WHERE end<?", [before]).map(|_| ())
     }
 
     pub fn dev_add(&self, e: &DevEntry) -> Res<()> {
@@ -677,5 +717,32 @@ mod tests {
         assert_eq!(s.expired(10, 0, 150).unwrap(), Vec::<i64>::new());
         assert_eq!(s.expired(10, 0, 65).unwrap(), vec![c]);
         let _ = e;
+    }
+
+    #[test]
+    fn activity_is_kept_listed_and_forgotten() {
+        let d = tempfile::tempdir().unwrap();
+        let s = Store::open(d.path()).unwrap();
+        let span = |start, end, app: &str| ActivitySpan { start, end, app: app.into(), title: "zebra-title".into(), others: vec![crate::activity::OpenWindow { app: "Notes".into(), ..Default::default() }], ..Default::default() };
+        let a = s.activity_open(&span(100, 200, "A")).unwrap();
+        s.activity_open(&span(200, 300, "B")).unwrap();
+        s.activity_open(&span(300, 900, "C")).unwrap();
+        s.activity_extend(a, 150).unwrap();
+        assert_eq!(s.activity_list(0, 1000, 10).unwrap()[0].end, 200, "never shortened");
+        let got = s.activity_list(150, 250, 10).unwrap();
+        assert_eq!(got.iter().map(|x| x.app.as_str()).collect::<Vec<_>>(), ["A", "B"]);
+        assert_eq!(got[0].others[0].app, "Notes");
+        // Forget 180..350: A is cut back, B goes, C starts later.
+        s.activity_forget(180, 350).unwrap();
+        let left: Vec<(String, i64, i64)> = s.activity_list(0, 1000, 10).unwrap().into_iter().map(|x| (x.app, x.start, x.end)).collect();
+        assert_eq!(left, [("A".to_owned(), 100, 180), ("C".to_owned(), 350, 900)]);
+        // Forget the middle of C: all of C goes.
+        s.activity_forget(400, 500).unwrap();
+        assert_eq!(s.activity_list(0, 1000, 10).unwrap().len(), 1);
+        s.activity_expire(500).unwrap();
+        assert!(s.activity_list(0, 1000, 10).unwrap().is_empty());
+        drop(s);
+        let raw: Vec<u8> = ["index.sqlite", "index.sqlite-wal"].iter().flat_map(|f| std::fs::read(d.path().join(f)).unwrap_or_default()).collect();
+        assert!(!String::from_utf8_lossy(&raw).contains("zebra-title"));
     }
 }

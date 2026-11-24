@@ -45,6 +45,11 @@ private struct CaptureSettings: View {
                 }
             } footer: { Text("Identical pictures are never saved twice.").foregroundStyle(.secondary) }
             Section {
+                Toggle("Keep a log of the window in front", isOn: $settings.trackActivity)
+            } footer: {
+                Text("Which app and window you were in, for how long, and what else was open. No pictures. Apps you exclude show only as private time, and a browser’s page title is kept only for pages that were allowed to be photographed.").foregroundStyle(.secondary)
+            }
+            Section {
                 Toggle("Open at login", isOn: $login)
                     .onChange(of: login) { _, on in
                         do { if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() } } catch { loginError = error.localizedDescription }
