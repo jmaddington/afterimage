@@ -161,6 +161,9 @@ public actor Capturer {
                 if let r = hideBrowser(ex: ex, bundleId: bundle, windows: reading.windows, complete: reading.complete) {
                     h.pids.insert(pid)
                     h.reasons[pid] = r
+                } else if let r = hidePage(ex: ex, hint: engine.pageHint(pid: pid)) {
+                    h.pids.insert(pid)
+                    h.reasons[pid] = r
                 } else if let u = reading.focusedURL {
                     h.focusedURL[pid] = u
                 }
@@ -170,11 +173,16 @@ public actor Capturer {
     }
 
     private func pick(_ all: [SCDisplay], front: CGRect?, all wantAll: Bool) -> [SCDisplay] {
-        if wantAll || all.count == 1 { return all }
-        if let f = front, let d = all.max(by: { area($0.frame, f) < area($1.frame, f) }), area(d.frame, f) > 0 { return [d] }
-        return all.filter { $0.displayID == CGMainDisplayID() }
+        let ids = Self.displays(all.map { ($0.displayID, $0.frame) }, front: front, all: wantAll, main: CGMainDisplayID())
+        return all.filter { ids.contains($0.displayID) }
     }
-    private func area(_ a: CGRect, _ b: CGRect) -> CGFloat {
+    /// Every display, or the one holding most of the front window, or the main one when nothing is in front.
+    static func displays(_ d: [(id: CGDirectDisplayID, frame: CGRect)], front: CGRect?, all: Bool, main: CGDirectDisplayID) -> [CGDirectDisplayID] {
+        if all || d.count <= 1 { return d.map(\.id) }
+        if let f = front, let best = d.max(by: { area($0.frame, f) < area($1.frame, f) }), area(best.frame, f) > 0 { return [best.id] }
+        return d.map(\.id).filter { $0 == main }
+    }
+    private static func area(_ a: CGRect, _ b: CGRect) -> CGFloat {
         let r = a.intersection(b)
         return r.isNull ? 0 : r.width * r.height
     }
@@ -190,6 +198,7 @@ public actor Capturer {
         case .site: "A site you excluded is open in \(app)"
         case .privateWindow: "\(app) has a private window open"
         case .unreadable: "\(app)’s address couldn’t be read"
+        case .secretField: "\(app) is showing a password or account field"
         case .systemPrompt: "macOS is asking for something"
         case .app, nil: "\(app) is excluded"
         }

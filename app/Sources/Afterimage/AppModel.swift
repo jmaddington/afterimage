@@ -103,6 +103,7 @@ extension Shot {
             Task.detached { [engine] in engine.setConfig(config: c) }
         }
         reload()
+        Task.detached { [engine] in _ = engine.listenForPages() }
         if settings.onboarded { recorder.start() }
         #if DEBUG
         stage(ProcessInfo.processInfo.environment["AFTERIMAGE_STAGE"] ?? "")

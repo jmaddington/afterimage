@@ -159,3 +159,23 @@ final class FakeElement: ScreenElement {
         #expect(Capturer.spoiled(look { $0.hidden = [9, 7] }, look { $0.hidden = [9, 7] }, omitted: [9]) == nil)
     }
 }
+
+@Suite struct DisplayChoiceTests {
+    // A laptop, a taller screen to its left and a small one above: origins go negative.
+    let d: [(id: CGDirectDisplayID, frame: CGRect)] = [(1, CGRect(x: 0, y: 0, width: 1728, height: 1117)), (2, CGRect(x: -1440, y: -700, width: 1440, height: 2560)), (3, CGRect(x: 200, y: -900, width: 1280, height: 900))]
+    func pick(_ f: CGRect?, all: Bool = false) -> [CGDirectDisplayID] { Capturer.displays(d, front: f, all: all, main: 1) }
+    @Test func theFrontWindowsDisplay() {
+        #expect(pick(CGRect(x: 100, y: 100, width: 800, height: 600)) == [1])
+        #expect(pick(CGRect(x: -1200, y: 0, width: 800, height: 600)) == [2])
+        #expect(pick(CGRect(x: 300, y: -800, width: 800, height: 600)) == [3])
+        #expect(pick(CGRect(x: -600, y: 100, width: 800, height: 600)) == [2])      // straddling: most of it wins
+    }
+    @Test func nothingInFrontOrOffEveryScreen() {
+        #expect(pick(nil) == [1])
+        #expect(pick(CGRect(x: 9000, y: 9000, width: 10, height: 10)) == [1])
+    }
+    @Test func allMeansAllAndOneIsOne() {
+        #expect(pick(nil, all: true) == [1, 2, 3])
+        #expect(Capturer.displays([d[1]], front: nil, all: false, main: 1) == [2])
+    }
+}

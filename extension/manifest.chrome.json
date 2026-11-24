@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "Afterimage",
+  "version": "0.1.0",
+  "description": "Tells the Afterimage app where passwords and account numbers are, so it never photographs them. Nothing leaves your Mac.",
+  "permissions": [
+    "nativeMessaging",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "incognito": "spanning",
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "all_frames": true,
+      "match_about_blank": true,
+      "run_at": "document_start"
+    }
+  ],
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA55twodoyoIIzJJG6KDgNaJB9DkrK0j6ClAxuk4497WiSbqTp/g2gbvxFLDnwJPNIOgR09qIfcpMSWxC5in/nHNCGJf9C2Tdeb7ghfnPsXyYtr34OGNee/KK+exwbgrseNgNilLtGw2hRsRRWrO2S05mJW/hlOKFQDPrgPzYkG7Qlq0imJ/QtnsquQoNxXrkB/maAWCIAasXgOoJxz6l8ClIh92vx4cXTTljFO6XFGhVUOLtxgrt/yzmP7ae7qfw80DVRg+sAEj7Xnpdh7blYBoilqdBI5i6CsbbNwN5fmfJfb/vf7V5NdXYjkQXZqyEWS8zADK9tRHajMzN89tOC6wIDAQAB",
+  "background": {
+    "service_worker": "background.js"
+  },
+  "minimum_chrome_version": "116"
+}

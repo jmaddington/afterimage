@@ -1,0 +1,9 @@
+{
+  "name": "com.jmaddington.afterimage",
+  "description": "Afterimage",
+  "path": "/Applications/Afterimage.app/Contents/MacOS/afterimage-bridge",
+  "type": "stdio",
+  "allowed_extensions": [
+    "afterimage@jmaddington.com"
+  ]
+}

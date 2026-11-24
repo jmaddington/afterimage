@@ -3,8 +3,10 @@
 //! AIDEV-NOTE: privacy-critical invariant: raw pixels live only in RAM. `process` is the sole path to disk, and
 //! AIDEV-NOTE: `HostServices::encode` is only ever handed a frame whose secrets have been frosted over.
 
+pub mod bridge;
 mod detect;
 mod lm;
+pub mod pages;
 mod privacy;
 mod redact;
 mod store;
@@ -147,6 +149,7 @@ struct Shared {
     describing: AtomicBool,
     on_power: AtomicBool,
     calm: AtomicBool,
+    pages: Mutex<pages::Pages>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -181,7 +184,7 @@ impl Engine {
             hasher: RandomState::new(), forgotten: Default::default(), loaded_by_us: Default::default(),
             last_lm_use: Mutex::new(Instant::now()), lm_state: Mutex::new(LmState::Unknown), links: Default::default(),
             discarded: AtomicU64::new(0), reason: Default::default(), busy: AtomicBool::new(false),
-            describing: AtomicBool::new(false), on_power: AtomicBool::new(true), calm: AtomicBool::new(true),
+            describing: AtomicBool::new(false), on_power: AtomicBool::new(true), calm: AtomicBool::new(true), pages: Default::default(),
         });
         for (name, f) in [("afterimage-save", save_loop as fn(Arc<Shared>)), ("afterimage-index", index_loop)] {
             let s = s.clone();
@@ -193,6 +196,26 @@ impl Engine {
     pub fn set_config(&self, config: Config) {
         *lock(&self.s.config) = config;
         self.s.wake.notify_all();
+    }
+
+    /// Hear from the browser extension, if it's there. Its absence changes nothing.
+    pub fn listen_for_pages(&self) -> bool {
+        let s = self.s.clone();
+        let heard = move |e| match e {
+            bridge::Event::Message(pid, id, m) => lock(&s.pages).receive(pid, id, &m, Instant::now()),
+            bridge::Event::Gone(pid, id) => lock(&s.pages).gone(pid, id),
+        };
+        match bridge::listen(&self.s.root.join("bridge.sock"), heard) {
+            Ok(()) => true,
+            Err(e) => {
+                log::error!("can't listen for the browser extension: {e} [AIMG-BRIDGE]");
+                false
+            }
+        }
+    }
+
+    pub fn page_hint(&self, pid: i32) -> pages::PageHint {
+        lock(&self.s.pages).hint(pid, Instant::now())
     }
 
     /// `calm`: thermal state is fine and Low Power Mode is off.
@@ -820,6 +843,24 @@ mod tests {
         e.ingest(f);
         wait(|| e.stats().unwrap().count == 1 || e.status().discarded == 1);
         assert_eq!(e.status().discarded, 0);
+        e.shutdown();
+    }
+
+    #[test]
+    fn the_engine_hears_the_extension() {
+        let d = tempfile::tempdir().unwrap();
+        let e = Engine::new(d.path().to_string_lossy().into(), config(true), Arc::new(FakeHost(Default::default()))).unwrap();
+        assert!(e.listen_for_pages());
+        let m = r#"{"v":1,"type":"page","tab":1,"window":1,"frame":0,"fields":[],"typing":true,"unplaced":false}"#;
+        let mut input = (m.len() as u32).to_ne_bytes().to_vec();
+        input.extend_from_slice(m.as_bytes());
+        let (mut s, sock) = (std::os::unix::net::UnixStream::pair().unwrap(), d.path().join("bridge.sock"));
+        let t = std::thread::spawn(move || bridge::forward(&mut s.1, &sock, 77));
+        std::io::Write::write_all(&mut s.0, &input).unwrap();
+        wait(|| e.page_hint(77).sensitive);
+        assert!(!e.page_hint(78).sensitive);
+        drop(s.0);
+        t.join().unwrap().unwrap();
         e.shutdown();
     }
 }
