@@ -9,6 +9,7 @@ dependencies = [
  "base64 0.22.1",
  "fastrand",
  "log",
+ "percent-encoding",
  "regex",
  "rusqlite",
  "serde",

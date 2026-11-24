@@ -410,7 +410,7 @@ impl Shared {
         let todo: Vec<usize> = {
             let clean = lock(&self.clean);
             (0..lines.len())
-                .filter(|&i| lines[i].text.chars().filter(|c| c.is_alphanumeric()).count() >= 3 && !clean.contains(&keys[i]))
+                .filter(|&i| !lines[i].code && lines[i].text.chars().filter(|c| c.is_alphanumeric()).count() >= 3 && !clean.contains(&keys[i]))
                 .collect()
         };
         if todo.is_empty() {
@@ -420,6 +420,8 @@ impl Shared {
         let mut send: Vec<usize> = todo.iter().flat_map(|&i| i.saturating_sub(2)..=(i + 1).min(lines.len() - 1)).collect();
         send.sort_unstable();
         send.dedup();
+        // Codes are judged by rule alone; their payloads are written by whoever made the page.
+        send.retain(|&i| !lines[i].code);
         let text: Vec<(usize, String)> = send
             .iter()
             .map(|&i| {
@@ -501,7 +503,11 @@ impl Shared {
         redact::frost(&mut f.rgba, f.width as usize, f.height as usize, f.stride as usize, &rects);
 
         let values: Vec<String> = secret_values(&f.lines, &hits);
-        let scrub = |t: &str| values.iter().fold(detect::mask_text(t), |t, v| t.replace(v.as_str(), "[hidden]"));
+        let scrub = |t: &str| values.iter().fold(detect::mask_text(t), |t, v| {
+            let l = [TextLine { text: t, rect: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }, tokens: vec![], code: false }];
+            let r: Vec<_> = detect::find_secret(&l, v).into_iter().map(|(_, r)| r).collect();
+            detect::mask(&l[0].text, &r)
+        });
         let mut m = f.moment.clone();
         m.window_title = scrub(&m.window_title);
         m.url = scrub(&detect::scrub_url(&m.url));
@@ -550,7 +556,8 @@ impl Shared {
 
 fn secret_values(lines: &[TextLine], hits: &[Hit]) -> Vec<String> {
     let mut v: Vec<String> = hits.iter().map(|h| lines[h.line].text[h.range.clone()].trim().to_owned()).filter(|v| v.chars().count() >= 6).collect();
-    v.sort_by_key(|x| std::cmp::Reverse(x.len()));
+    v.extend(lines.iter().filter(|l| l.code).flat_map(|l| detect::code_secrets(&l.text)));
+    v.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
     v.dedup();
     v
 }
@@ -558,12 +565,9 @@ fn secret_values(lines: &[TextLine], hits: &[Hit]) -> Vec<String> {
 /// A secret found once is hidden everywhere it appears on screen.
 fn propagate(lines: &[TextLine], hits: &mut Vec<Hit>) {
     for v in secret_values(lines, hits) {
-        for (i, l) in lines.iter().enumerate() {
-            for (s, m) in l.text.match_indices(v.as_str()) {
-                let h = Hit { line: i, range: s..s + m.len(), kind: SecretKind::Other };
-                if !hits.iter().any(|x| x.line == i && x.range.start <= h.range.start && x.range.end >= h.range.end) {
-                    hits.push(h);
-                }
+        for (line, range) in detect::find_secret(lines, &v) {
+            if !hits.iter().any(|x| x.line == line && x.range.start <= range.start && x.range.end >= range.end) {
+                hits.push(Hit { line, range, kind: SecretKind::Other });
             }
         }
     }
@@ -703,7 +707,7 @@ mod tests {
         Config { lm_url: "http://127.0.0.1:9".into(), model: "m".into(), embed_model: String::new(), require_ai, describe: DescribeWhen::Never, max_age_days: 0, max_bytes: 0, unload_after_secs: 0 }
     }
     fn frame(at: i64) -> Frame {
-        let l = |t: &str, y: f64| TextLine { text: t.into(), rect: Rect { x: 0.1, y, w: 0.5, h: 0.1 }, tokens: vec![] };
+        let l = |t: &str, y: f64| TextLine { text: t.into(), rect: Rect { x: 0.1, y, w: 0.5, h: 0.1 }, tokens: vec![], code: false };
         Frame {
             rgba: vec![200; 100 * 100 * 4], width: 100, height: 100, stride: 400, display_key: "d".into(),
             lines: vec![l("hello world", 0.1), l("password: hunter22", 0.5), l("again hunter22 here", 0.8)],
@@ -773,6 +777,42 @@ mod tests {
         assert!(e.is_new("b".into(), vec![10; 64]));
         e.s.discard("x");
         assert!(e.is_new("a".into(), vec![10; 64]));
+        e.shutdown();
+    }
+
+    #[test]
+    fn a_codes_secret_is_hidden_wherever_it_is_typed_out() {
+        let d = tempfile::tempdir().unwrap();
+        let h = Arc::new(FakeHost(Default::default()));
+        let e = Engine::new(d.path().to_string_lossy().into(), config(false), h.clone()).unwrap();
+        let l = |t: &str, y: f64, code: bool| TextLine { text: t.into(), rect: Rect { x: 0.1, y, w: 0.5, h: 0.1 }, tokens: vec![], code };
+        let mut f = frame(1000);
+        f.lines = vec![l("Or type jbsw y3dp ehpk 3pxp", 0.1, false), l("network BlueHeron", 0.25, false), l("marmalade", 0.4, false),
+                       l("otpauth://totp/A:d?secret=JBSWY3DPEHPK3PXP", 0.6, true), l("WIFI:T:WPA;S:BlueHeron;P:marmalade;;", 0.7, true), l("", 0.85, true)];
+        f.moment.window_title = "Setup JBSW-Y3DP-EHPK-3PXP".into();
+        e.ingest(f);
+        wait(|| e.stats().unwrap().count == 1);
+        let s = e.list(Filter::default(), 10, 0).unwrap().remove(0);
+        let all = format!("{:?}{:?}", s, e.lines(s.id).unwrap()).to_lowercase();
+        for x in ["jbsw", "3pxp", "marmalade", "otpauth"] {
+            assert!(!all.contains(x), "{x}: {all}");
+        }
+        assert!(all.contains("network blueheron"), "{all}");
+        // The undecodable code is gone from the picture too.
+        assert_ne!(&lock(&h.0)[0][90 * 400 + 30 * 4..][..8], &[200; 8]);
+        e.shutdown();
+    }
+
+    #[test]
+    fn codes_are_never_sent_to_the_model() {
+        // A harmless code and nothing else: no question to ask, so an offline model is not an error.
+        let d = tempfile::tempdir().unwrap();
+        let e = Engine::new(d.path().to_string_lossy().into(), config(true), Arc::new(FakeHost(Default::default()))).unwrap();
+        let mut f = frame(1000);
+        f.lines = vec![TextLine { text: "https://example.com/menu".into(), rect: Rect { x: 0.1, y: 0.1, w: 0.2, h: 0.2 }, tokens: vec![], code: true }];
+        e.ingest(f);
+        wait(|| e.stats().unwrap().count == 1 || e.status().discarded == 1);
+        assert_eq!(e.status().discarded, 0);
         e.shutdown();
     }
 }

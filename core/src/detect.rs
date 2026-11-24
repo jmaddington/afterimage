@@ -72,6 +72,9 @@ pub struct TextLine {
     pub text: String,
     pub rect: Rect,
     pub tokens: Vec<Token>,
+    /// The payload of a QR or bar code; empty when it couldn't be decoded.
+    #[uniffi(default = false)]
+    pub code: bool,
 }
 
 /// A secret at a byte range of a line.
@@ -129,7 +132,9 @@ re!(KNOWN, r"(?x)
   | \beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-.]*
 ");
 // Payloads of setup QR codes, which the recogniser hands over as lines of text.
-re!(QR_SECRET, r"(?i)otpauth(?:-migration)?://.*|\bWIFI:[^\n]*\bP:.*");
+re!(QR_SECRET, r"(?is)otpauth(?:-migration)?://.*|\bWIFI:.*\bP:.*");
+// Query keys whose values are worth hunting for elsewhere on the screen.
+re!(SECRET_KEY, r"(?i)secret|token|pass|pwd|key|code|auth|sig|otp|pin|session|credential|^data$");
 re!(PEM_BEGIN, r"-{2,}\s*BEGIN [A-Z0-9 ]*(?:PRIVATE KEY|SECRET)");
 re!(PEM_END, r"-{2,}\s*END [A-Z0-9 ]*(?:PRIVATE KEY|SECRET)");
 re!(LONG_TOKEN, r"[A-Za-z0-9_+/=\-]{24,}");
@@ -192,7 +197,7 @@ fn neighbours(lines: &[TextLine], i: usize) -> Vec<usize> {
     let mut right: Option<(f64, usize)> = None;
     let mut below: Option<(f64, usize)> = None;
     for (j, o) in lines.iter().enumerate() {
-        if j == i {
+        if j == i || o.code {
             continue;
         }
         let r = &o.rect;
@@ -298,6 +303,12 @@ pub fn scan(lines: &[TextLine]) -> Vec<Hit> {
     let mut in_pem = false;
     for (i, l) in lines.iter().enumerate() {
         let t = &l.text;
+        if l.code {
+            if !code_is_harmless(t) {
+                hits.push(Hit { line: i, range: 0..t.len(), kind: SecretKind::Key });
+            }
+            continue;
+        }
         if PEM_BEGIN.is_match(t) {
             in_pem = true;
         }
@@ -350,7 +361,7 @@ pub fn extend_wrapped(lines: &[TextLine], hits: &mut Vec<Hit>) {
     let starts: Vec<usize> = hits
         .iter()
         .filter(|h| matches!(h.kind, SecretKind::Key | SecretKind::Other))
-        .filter(|h| lines[h.line].text[h.range.end..].trim().is_empty() && h.range.len() >= 16)
+        .filter(|h| !lines[h.line].code && lines[h.line].text[h.range.end..].trim().is_empty() && h.range.len() >= 16)
         .map(|h| h.line)
         .collect();
     for mut at in starts {
@@ -416,6 +427,104 @@ pub fn scrub_url(raw: &str) -> String {
     mask_text(u.as_str())
 }
 
+/// Longest code payload that can still be an ordinary web address.
+const CODE_MAX: usize = 300;
+
+/// Deny by default: a code stays visible only when it is a bare web address carrying nothing private.
+/// AIDEV-NOTE: privacy-critical. Codes hold 2FA seeds, Wi-Fi keys, login tokens; OCR can't see any of them.
+fn code_is_harmless(payload: &str) -> bool {
+    if payload.len() > CODE_MAX || payload.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return false;
+    }
+    let Ok(u) = url::Url::parse(payload) else { return false };
+    let mut found = Vec::new();
+    scan_text(payload, 0, &mut found);
+    matches!(u.scheme(), "http" | "https")
+        && u.username().is_empty()
+        && u.password().is_none()
+        && u.query().is_none()
+        && u.fragment().is_none()
+        && found.is_empty()
+}
+
+/// The secrets inside a code's payload, as they might also be shown as text ("or type this key instead").
+pub fn code_secrets(payload: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if payload.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("wifi:")) {
+        let mut fields = vec![String::new()];
+        let mut rest = payload[5..].chars();
+        while let Some(c) = rest.next() {
+            match c {
+                '\\' => fields.last_mut().unwrap().extend(rest.next()),
+                ';' => fields.push(String::new()),
+                c => fields.last_mut().unwrap().push(c),
+            }
+        }
+        for f in fields {
+            if let Some(("P" | "p", v)) = f.split_once(':') {
+                out.push(v.to_owned());
+                out.push(v.trim_matches('"').to_owned());
+            }
+        }
+    } else if let Ok(u) = url::Url::parse(payload) {
+        out.extend(u.query_pairs().filter(|(k, _)| SECRET_KEY.is_match(k)).map(|(_, v)| v.into_owned()));
+        out.extend(u.password().map(|p| percent_encoding::percent_decode_str(p).decode_utf8_lossy().into_owned()));
+    }
+    out.retain(|v| v.trim().chars().count() >= 4);
+    out.dedup();
+    out
+}
+
+/// Case, spacing and the letters OCR confuses don't make it a different secret.
+fn fold(c: char) -> char {
+    match c {
+        'o' => '0',
+        'l' | 'i' | '|' => '1',
+        's' => '5',
+        'b' => '8',
+        'z' => '2',
+        c => c,
+    }
+}
+fn folded(text: &str) -> impl Iterator<Item = (char, Range<usize>)> + '_ {
+    text.char_indices()
+        .filter(|(_, c)| !c.is_whitespace() && !matches!(c, '-' | '\u{2010}'..='\u{2015}' | '\u{2212}'))
+        .flat_map(|(i, c)| c.to_lowercase().map(move |l| (fold(l), i..i + c.len_utf8())))
+}
+
+/// Every place a known secret appears, however it is spaced, grouped or broken across rows.
+pub fn find_secret(lines: &[TextLine], value: &str) -> Vec<(usize, Range<usize>)> {
+    let needle: Vec<char> = folded(value).map(|x| x.0).collect();
+    let mut out: Vec<(usize, Range<usize>)> = Vec::new();
+    if needle.len() < 6 {
+        // Too short to match loosely: verbatim, as a word of its own.
+        let v = value.trim();
+        let word = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
+        for (i, l) in lines.iter().enumerate().filter(|_| v.chars().any(char::is_alphanumeric)) {
+            for (s, m) in l.text.match_indices(v) {
+                if !word(l.text[..s].chars().next_back()) && !word(l.text[s + m.len()..].chars().next()) {
+                    out.push((i, s..s + m.len()));
+                }
+            }
+        }
+        return out;
+    }
+    let all: Vec<(char, usize, Range<usize>)> = lines.iter().enumerate().flat_map(|(i, l)| folded(&l.text).map(move |(c, r)| (c, i, r))).collect();
+    let mut at = 0;
+    while at + needle.len() <= all.len() {
+        let span = &all[at..at + needle.len()];
+        if span.iter().map(|x| x.0).ne(needle.iter().copied()) {
+            at += 1;
+            continue;
+        }
+        for row in span.chunk_by(|a, b| a.1 == b.1) {
+            out.push((row[0].1, row[0].2.start..row[row.len() - 1].2.end));
+        }
+        at += needle.len();
+    }
+    out
+}
+
 /// Pixel-space cover for a hit: every token the hit touches, or the whole line when tokens are missing.
 pub fn hit_rect(line: &TextLine, range: &Range<usize>) -> Rect {
     let start = line.text[..range.start].chars().count() as u32;
@@ -441,7 +550,10 @@ mod tests {
     use super::*;
 
     fn line(t: &str, x: f64, y: f64) -> TextLine {
-        TextLine { text: t.into(), rect: Rect { x, y, w: t.len() as f64 * 0.008, h: 0.02 }, tokens: vec![] }
+        TextLine { text: t.into(), rect: Rect { x, y, w: t.len() as f64 * 0.008, h: 0.02 }, tokens: vec![], code: false }
+    }
+    fn code(t: &str) -> TextLine {
+        TextLine { code: true, ..line(t, 0.5, 0.5) }
     }
     fn masked(t: &str) -> String {
         mask_text(t)
@@ -554,5 +666,76 @@ mod tests {
     #[test]
     fn mask_handles_overlap_and_unicode() {
         assert_eq!(mask("é abc def", &[3..6, 4..10]), "é [hidden]");
+    }
+
+    // ---- security review 2026-11-23: codes ----
+    #[test]
+    fn codes_are_hidden_unless_plainly_harmless() {
+        for t in ["", "otpauth://totp/A?secret=JBSWY3DPEHPK3PXP", "WIFI:T:WPA;S:x;P:marmalade;;", "WIFI:S:a\nb;P:marmalade;;", "https://x.com/login?token=abc",
+                  "https://x.com/#abc", "https://u:p@x.com/", "https://u@x.com/", "HTTPS://X.COM/?A", "2@abc,def,ghi", "sgnl://linkdevice?uuid=1", "bitcoin:1A2b", "LPA:1$smdp.io$ABC",
+                  "MATMSG:TO:a@b.c;", "tel:5550142", "5901234123457", "https://x.com/ra/Zk3Lq9TtWv2Xy7Pb4Nc8Rd5M", "https://x.com/a\nb", "just text"] {
+            let h = scan(&[code(t)]);
+            assert!(h.iter().any(|h| h.line == 0 && h.range == (0..t.len())), "{t:?} {h:?}");
+        }
+        assert!(!scan(&[code(&format!("https://x.com/{}", "a/".repeat(400)))]).is_empty());
+        for t in ["https://example.com/menu", "http://example.com", "HTTPS://EXAMPLE.COM/MENU"] {
+            assert_eq!(scan(&[code(t)]), vec![], "{t}");
+        }
+        // The same characters as ordinary text aren't a code.
+        assert_eq!(scan(&[line("just text", 0.1, 0.1)]), vec![]);
+    }
+
+    #[test]
+    fn an_undecodable_code_covers_its_whole_box() {
+        let c = code("");
+        let h = scan(std::slice::from_ref(&c)).remove(0);
+        assert_eq!(hit_rect(&c, &h.range), c.rect);
+    }
+
+    #[test]
+    fn a_code_neither_displaces_nor_spreads() {
+        // Nearer than the real value, but not a form field.
+        let l = vec![line("Password", 0.1, 0.10), TextLine { rect: Rect { x: 0.1, y: 0.125, w: 0.1, h: 0.01 }, ..code("https://example.com/menu") }, line("blue-heron-7", 0.1, 0.15)];
+        assert!(scan(&l).iter().any(|h| h.line == 2));
+        let l = vec![TextLine { rect: Rect { x: 0.1, y: 0.1, w: 0.3, h: 0.3 }, ..code("otpauth://totp/A?secret=JBSWY3DPEHPK3PXP") }, line("Continue1", 0.1, 0.45)];
+        assert!(!scan(&l).iter().any(|h| h.line == 1));
+        let l = vec![code("-----BEGIN RSA PRIVATE KEY-----"), line("hello", 0.1, 0.1)];
+        assert!(!scan(&l).iter().any(|h| h.line == 1));
+    }
+
+    #[test]
+    fn codes_give_up_their_inner_secrets() {
+        for (t, want) in [
+            ("otpauth://totp/Acme:dana?secret=JBSWY3DPEHPK3PXP&issuer=Acme", "JBSWY3DPEHPK3PXP"),
+            ("OTPAUTH://totp/a?issuer=Acme&SECRET=JBSW%20Y3DP", "JBSW Y3DP"),
+            ("otpauth-migration://offline?data=CjEKCkhl", "CjEKCkhl"),
+            (r"WIFI:T:WPA;S:Blue;P:mar\;ma\\la\:de;;", r"mar;ma\la:de"),
+            ("wifi:P:first-field;S:Blue;;", "first-field"),
+            ("WIFI:S:a\nb;P:marmalade;;", "marmalade"),
+            (r#"WIFI:S:P:x;P:"quoted1";;"#, "quoted1"),
+            ("https://x.com/l?session_token=abc123&lang=en", "abc123"),
+            ("https://dana:hunter2@x.com/", "hunter2"),
+        ] {
+            let v = code_secrets(t);
+            assert!(v.iter().any(|x| x == want), "{t}: {v:?}");
+        }
+        assert!(!code_secrets("otpauth://totp/Acme:dana?secret=JBSWY3DPEHPK3PXP&issuer=Acme").iter().any(|v| v == "Acme"));
+    }
+
+    #[test]
+    fn a_known_secret_is_found_however_it_is_spaced() {
+        let find = |l: &[TextLine], v: &str| find_secret(l, v).into_iter().map(|(i, r)| (i, l[i].text[r].to_owned())).collect::<Vec<_>>();
+        assert_eq!(find(&[line("Key: jbsw y3dp ehpk 3pxp ok", 0.1, 0.1)], "JBSWY3DPEHPK3PXP"), vec![(0, "jbsw y3dp ehpk 3pxp".to_owned())]);
+        assert_eq!(find(&[line("JBSWY3DP-EHPK3PXP", 0.1, 0.1)], "JBSW Y3DP EHPK 3PXP"), vec![(0, "JBSWY3DP-EHPK3PXP".to_owned())]);
+        // Split across rows, and with the letters OCR confuses.
+        assert_eq!(find(&[line("key JBSWY3DP", 0.1, 0.1), line("EHPK3PXP", 0.1, 0.2), line("x", 0.1, 0.3)], "JBSWY3DPEHPK3PXP"),
+                   vec![(0, "JBSWY3DP".to_owned()), (1, "EHPK3PXP".to_owned())]);
+        assert_eq!(find(&[line("J8SWY3DPEHPK3PXP", 0.1, 0.1)], "JBSWY3DPEHPK3PXP").len(), 1);
+        assert_eq!(find(&[line("é hunter22 é hunter22", 0.1, 0.1)], "hunter22").len(), 2);
+        assert_eq!(find(&[line("hunter 2 miles", 0.1, 0.1)], "hunter22").len(), 0);
+        assert_eq!(find(&[line("anything", 0.1, 0.1)], " - "), vec![]);
+        // Too short to trust loosely.
+        assert_eq!(find(&[line("see 77 25 rows", 0.1, 0.1)], "7725").len(), 0);
+        assert_eq!(find(&[line("code 7725", 0.1, 0.1)], "7725").len(), 1);
     }
 }
