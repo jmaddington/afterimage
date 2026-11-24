@@ -34,13 +34,16 @@ public actor Capturer {
         var drawn: Set<pid_t>
     }
 
-    /// Why a picture taken between these two looks can't be kept, or nil.
-    static func spoiled(_ before: Look, _ after: Look, omitted: Set<pid_t>) -> String? {
-        if let b = before.blocked ?? after.blocked { return b }
-        if before.exclusions != after.exclusions { return "Your settings changed mid-capture" }
-        if before.front != after.front { return "The app changed mid-capture" }
-        let exposed = before.hidden.union(after.hidden).intersection(before.drawn.union(after.drawn)).subtracting(omitted)
-        return exposed.isEmpty ? nil : "Something private appeared"
+    /// Why a picture taken between these looks can't be kept, or nil.
+    static func spoiled(_ before: Look, _ after: Look, during: [Look] = [], omitted: Set<pid_t>) -> String? {
+        let all = [before] + during + [after]
+        if let b = all.lazy.compactMap(\.blocked).first { return b }
+        if all.contains(where: { $0.exclusions != before.exclusions }) { return "Your settings changed mid-capture" }
+        if all.contains(where: { $0.front != before.front }) { return "The app changed mid-capture" }
+        // Off-limits at any instant and drawn at any instant: they needn't be the same one.
+        let hidden = all.reduce(into: Set<pid_t>()) { $0.formUnion($1.hidden) }
+        let drawn = all.reduce(into: Set<pid_t>()) { $0.formUnion($1.drawn) }
+        return hidden.intersection(drawn).subtracting(omitted).isEmpty ? nil : "Something private appeared"
     }
 
     private func look(_ ex: Exclusions, _ hidden: Hidden, _ gate: Gate) async -> Look {
@@ -69,7 +72,7 @@ public actor Capturer {
         if front.0 == getpid() { return .skipped("Afterimage is in front") }
 
         let exclusions = await gate().exclusions
-        let hiddenBefore = await hidden(exclusions)
+        var hiddenBefore = await hidden(exclusions)
         if hiddenBefore.pids.contains(front.0) { return .skipped(Self.phrase(hiddenBefore.reasons[front.0], front.1)) }
         let frontWindow = OnScreenWindow.all().first { $0.pid == front.0 && $0.layer == 0 }
 
@@ -77,12 +80,15 @@ public actor Capturer {
         do {
             content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
         } catch { return .failed(error.localizedDescription) }
+        // Listing windows can take long enough for the facts to change.
+        hiddenBefore = await hidden(exclusions)
+        if hiddenBefore.pids.contains(front.0) { return .skipped(Self.phrase(hiddenBefore.reasons[front.0], front.1)) }
         let omit = content.applications.filter { hiddenBefore.pids.contains($0.processID) }
         let omitted = Set(omit.map(\.processID))
         let displays = pick(content.displays, front: frontWindow?.bounds, all: allDisplays)
         guard !displays.isEmpty else { return .failed("No display is available") }
 
-        // The last thing before looking: listing windows above can take long enough for a password prompt to open.
+        // The last thing before looking.
         let before = await look(exclusions, hiddenBefore, gate)
         if let why = Self.spoiled(before, before, omitted: omitted) { return .skipped(why) }
         guard before.front == front.0, before.exclusions == exclusions else { return .skipped("The app changed mid-capture") }
@@ -104,10 +110,9 @@ public actor Capturer {
 
         // Anything that became off-limits while we were looking spoils the whole frame.
         let quick = await look(exclusions, hiddenBefore, gate)
-        if let why = Self.spoiled(before, quick, omitted: omitted) { return .skipped(why) }
         let hiddenAfter = await hidden(exclusions)
         let after = await look(exclusions, hiddenAfter, gate)
-        if let why = Self.spoiled(before, after, omitted: omitted) { return .skipped(why) }
+        if let why = Self.spoiled(before, after, during: [quick], omitted: omitted) { return .skipped(why) }
 
         let apps = await MainActor.run {
             NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular }
@@ -149,10 +154,10 @@ public actor Capturer {
                 h.reasons[pid] = r
             } else if isBrowser(bundleId: bundle), drawing.contains(pid) {
                 let reading = Accessibility.read(pid: pid, visible: visible)
-                if let r = hideBrowser(ex: ex, bundleId: bundle, windows: reading?.windows) {
+                if let r = hideBrowser(ex: ex, bundleId: bundle, windows: reading.windows, complete: reading.complete) {
                     h.pids.insert(pid)
                     h.reasons[pid] = r
-                } else if let u = reading?.focusedURL {
+                } else if let u = reading.focusedURL {
                     h.focusedURL[pid] = u
                 }
             }

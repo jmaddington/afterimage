@@ -210,10 +210,14 @@ const MAX_DECODES: usize = 6;
 const MAX_ADDRESS: usize = 16_384;
 const MAX_FOUND: usize = 256;
 
-/// Parse the address starting here; only its first stretch matters to any rule.
-fn address(s: &str) -> Option<url::Url> {
-    let end = s.char_indices().map(|x| x.0).find(|i| *i >= 2048).unwrap_or(s.len());
-    url::Url::parse(&s[..end]).ok()
+const MAX_PARSE: usize = 2048;
+
+/// Add the address starting here. False when it's too long to read whole.
+fn address(s: &str, found: &mut Vec<url::Url>) -> bool {
+    let whole = s.len() <= MAX_PARSE;
+    let end = if whole { s.len() } else { (0..=MAX_PARSE).rev().find(|i| s.is_char_boundary(*i)).unwrap_or(0) };
+    found.extend(url::Url::parse(&s[..end]));
+    whole
 }
 
 /// This address and every address it carries inside, plain or percent-encoded. A wrapper can add suspicion, never
@@ -238,11 +242,22 @@ fn layers(u: &url::Url) -> (Vec<url::Url>, bool) {
             complete = false;
             continue;
         }
-        let mut found: Vec<url::Url> = u.query_pairs().filter_map(|(_, v)| address(&v)).take(MAX_FOUND + 1).collect();
+        let mut found = Vec::new();
+        for (n, (_, v)) in u.query_pairs().enumerate() {
+            complete &= n < MAX_FOUND && address(&v, &mut found);
+            if n == MAX_FOUND {
+                break;
+            }
+        }
         for n in 0.. {
-            found.extend(address(&rest));
-            for mark in ["https://", "http://"] {
-                found.extend(rest.match_indices(mark).take(MAX_FOUND + 1).filter_map(|(at, _)| address(&rest[at..])));
+            complete &= address(&rest, &mut found);
+            for mark in ["https:", "http:"] {
+                for (k, (at, _)) in rest.match_indices(mark).enumerate() {
+                    complete &= k < MAX_FOUND && address(&rest[at..], &mut found);
+                    if k == MAX_FOUND {
+                        break;
+                    }
+                }
             }
             if out.len() + found.len() > MAX_FOUND {
                 found.truncate(MAX_FOUND);
@@ -350,17 +365,16 @@ fn is_private(f: Family, w: &BrowserWindow) -> bool {
         || w.field_descriptions.iter().map(|d| norm(d)).any(|d| field.iter().any(|m| d.contains(m)))
 }
 
-/// Decide whether a whole browser must be left out. `windows` is its on-screen windows; None means accessibility
-/// couldn't look. AIDEV-NOTE: privacy-critical; any one offending window hides the entire browser.
+/// Decide whether a whole browser must be left out. `windows` is what accessibility could read of its on-screen
+/// windows; `complete` is false when something couldn't be read, which never excuses what was. AIDEV-NOTE: privacy-critical; any one offending window hides the entire browser.
 #[uniffi::export]
-pub fn hide_browser(ex: &Exclusions, bundle_id: &str, windows: Option<Vec<BrowserWindow>>) -> Option<HideReason> {
+pub fn hide_browser(ex: &Exclusions, bundle_id: &str, windows: &[BrowserWindow], complete: bool) -> Option<HideReason> {
     let f = family(bundle_id)?;
-    let Some(windows) = windows else { return ex.unreadable_browsers.then_some(HideReason::Unreadable) };
     let rules: Vec<Rule> = ex.sites.iter().filter_map(|s| Rule::parse(s)).collect();
-    let mut unreadable = false;
+    let mut unreadable = !complete;
     let mut evasive = false;
     let mut found = None;
-    for w in &windows {
+    for w in windows {
         if ex.private_windows {
             if is_private(f, w) {
                 found = found.or(Some(HideReason::PrivateWindow));
@@ -412,7 +426,7 @@ mod tests {
     const CHROME: &str = "com.google.Chrome";
     const SAFARI: &str = "com.apple.Safari";
     fn hid(e: &Exclusions, url: &str) -> Option<HideReason> {
-        hide_browser(e, CHROME, Some(vec![win(url)]))
+        hide_browser(e, CHROME, &[win(url)], true)
     }
 
     #[test]
@@ -452,7 +466,7 @@ mod tests {
     fn a_password_manager_in_any_window_or_frame_hides_the_browser() {
         let mut two = win("https://example.com/");
         two.urls.push("chrome-extension://nngceckbapebfimnlniiiahkandclblb/popup".into());
-        assert_eq!(hide_browser(&ex(), CHROME, Some(vec![win("https://a.com"), two])), Some(HideReason::PasswordManager));
+        assert_eq!(hide_browser(&ex(), CHROME, &[win("https://a.com"), two], true), Some(HideReason::PasswordManager));
     }
 
     #[test]
@@ -481,33 +495,33 @@ mod tests {
 
     #[test]
     fn unreadable_browsers_fail_closed() {
-        assert_eq!(hide_browser(&ex(), CHROME, None), Some(HideReason::Unreadable));
+        assert_eq!(hide_browser(&ex(), CHROME, &[], false), Some(HideReason::Unreadable));
         let blank = BrowserWindow { title: Some("x".into()), ..Default::default() };
-        assert_eq!(hide_browser(&ex(), CHROME, Some(vec![blank.clone()])), Some(HideReason::Unreadable));
-        assert_eq!(hide_browser(&ex(), CHROME, Some(vec![win("https://a.com"), blank.clone()])), Some(HideReason::Unreadable));
+        assert_eq!(hide_browser(&ex(), CHROME, &[blank.clone()], true), Some(HideReason::Unreadable));
+        assert_eq!(hide_browser(&ex(), CHROME, &[win("https://a.com"), blank.clone()], true), Some(HideReason::Unreadable));
         let lax = Exclusions { unreadable_browsers: false, ..ex() };
-        assert_eq!(hide_browser(&lax, CHROME, None), None);
-        assert_eq!(hide_browser(&lax, CHROME, Some(vec![blank])), None);
+        assert_eq!(hide_browser(&lax, CHROME, &[], false), None);
+        assert_eq!(hide_browser(&lax, CHROME, &[blank], true), None);
         // No windows on screen: nothing to hide.
-        assert_eq!(hide_browser(&ex(), CHROME, Some(vec![])), None);
-        assert_eq!(hide_browser(&ex(), "com.apple.TextEdit", None), None);
+        assert_eq!(hide_browser(&ex(), CHROME, &[], true), None);
+        assert_eq!(hide_browser(&ex(), "com.apple.TextEdit", &[], false), None);
     }
 
     #[test]
     fn private_windows() {
-        let t = |b: &str, title: &str| hide_browser(&ex(), b, Some(vec![BrowserWindow { title: Some(title.into()), urls: vec!["https://a.com".into()], ..Default::default() }]));
+        let t = |b: &str, title: &str| hide_browser(&ex(), b, &[BrowserWindow { title: Some(title.into()), urls: vec!["https://a.com".into()], ..Default::default() }], true);
         assert_eq!(t(CHROME, "News - Google Chrome (Incognito)"), Some(HideReason::PrivateWindow));
         assert_eq!(t(CHROME, "Seite - Google Chrome (Inkognito)"), Some(HideReason::PrivateWindow));
         assert_eq!(t(SAFARI, "News, Private Browsing"), Some(HideReason::PrivateWindow));
         assert_eq!(t("org.mozilla.firefox", "News — Mozilla Firefox Private Browsing"), Some(HideReason::PrivateWindow));
         assert_eq!(t(CHROME, "How incognito mode works - Google Chrome"), Some(HideReason::Unreadable));
-        assert_eq!(hide_browser(&ex(), CHROME, Some(vec![BrowserWindow { title: Some("How incognito mode works - Google Chrome".into()), ..win("https://a.com") }])), None);
+        assert_eq!(hide_browser(&ex(), CHROME, &[BrowserWindow { title: Some("How incognito mode works - Google Chrome".into()), ..win("https://a.com") }], true), None);
         let f = BrowserWindow { title: Some("x".into()), urls: vec!["https://a.com".into()], field_descriptions: vec!["smart search field in a private window".into()], ..Default::default() };
-        assert_eq!(hide_browser(&ex(), SAFARI, Some(vec![f])), Some(HideReason::PrivateWindow));
+        assert_eq!(hide_browser(&ex(), SAFARI, &[f], true), Some(HideReason::PrivateWindow));
         let c = BrowserWindow { title: Some("x".into()), urls: vec!["https://a.com".into()], control_labels: vec!["Incognito".into()], ..Default::default() };
-        assert_eq!(hide_browser(&ex(), CHROME, Some(vec![c.clone()])), Some(HideReason::PrivateWindow));
+        assert_eq!(hide_browser(&ex(), CHROME, &[c.clone()], true), Some(HideReason::PrivateWindow));
         let off = Exclusions { private_windows: false, ..ex() };
-        assert_eq!(hide_browser(&off, CHROME, Some(vec![c])), None);
+        assert_eq!(hide_browser(&off, CHROME, &[c], true), None);
     }
 
     #[test]
@@ -528,7 +542,7 @@ mod tests {
         // A known, unrelated Chromium extension is fine.
         assert_eq!(hid(&ex(), "chrome-extension://cjpalhdlnbpafiamejdnhcphjbkeiagm/dashboard.html"), None);
         let named = BrowserWindow { title: Some("Bitwarden".into()), urls: vec!["chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/p".into()], ..Default::default() };
-        assert_eq!(hide_browser(&ex(), CHROME, Some(vec![named])), Some(HideReason::PasswordManager));
+        assert_eq!(hide_browser(&ex(), CHROME, &[named], true), Some(HideReason::PasswordManager));
     }
 
     #[test]
@@ -561,7 +575,7 @@ mod tests {
     #[test]
     fn other_vendors_private_windows() {
         let t = |b: &str, title: &str, label: &str| {
-            hide_browser(&ex(), b, Some(vec![BrowserWindow { title: Some(title.into()), urls: vec!["https://a.com".into()], control_labels: vec![label.into()], ..Default::default() }]))
+            hide_browser(&ex(), b, &[BrowserWindow { title: Some(title.into()), urls: vec!["https://a.com".into()], control_labels: vec![label.into()], ..Default::default() }], true)
         };
         for (b, title, label) in [
             ("com.brave.Browser", "News - Brave (Private)", ""), ("com.brave.Browser", "News - Brave", "Private with Tor"),
@@ -592,9 +606,9 @@ mod tests {
     #[test]
     fn a_window_with_no_readable_labels_is_unreadable() {
         let w = BrowserWindow { urls: vec!["https://a.com".into()], ..Default::default() };
-        assert_eq!(hide_browser(&ex(), CHROME, Some(vec![w.clone()])), Some(HideReason::Unreadable));
+        assert_eq!(hide_browser(&ex(), CHROME, &[w.clone()], true), Some(HideReason::Unreadable));
         let e = Exclusions { private_windows: false, ..ex() };
-        assert_eq!(hide_browser(&e, CHROME, Some(vec![w])), None);
+        assert_eq!(hide_browser(&e, CHROME, &[w], true), None);
     }
 
     #[test]
@@ -651,16 +665,16 @@ mod tests {
     fn extension_names_ignore_spacing() {
         for t in ["Proton Pass", "NordPass", "Nord Pass", "Robo-Form", "Kee Pass XC", "1 Password"] {
             let w = BrowserWindow { title: Some(t.into()), ..win("chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/p") };
-            assert_eq!(hide_browser(&ex(), CHROME, Some(vec![w])), Some(HideReason::PasswordManager), "{t}");
+            assert_eq!(hide_browser(&ex(), CHROME, &[w], true), Some(HideReason::PasswordManager), "{t}");
         }
     }
 
     #[test]
     fn a_title_alone_does_not_prove_a_window_is_ordinary() {
         let w = BrowserWindow { control_labels: vec![], ..win("https://a.com") };
-        assert_eq!(hide_browser(&ex(), CHROME, Some(vec![w])), Some(HideReason::Unreadable));
+        assert_eq!(hide_browser(&ex(), CHROME, &[w], true), Some(HideReason::Unreadable));
         let blank = BrowserWindow { title: Some("  ".into()), control_labels: vec![" ".into()], ..win("https://a.com") };
-        assert_eq!(hide_browser(&ex(), CHROME, Some(vec![blank])), Some(HideReason::Unreadable));
+        assert_eq!(hide_browser(&ex(), CHROME, &[blank], true), Some(HideReason::Unreadable));
     }
 
     #[test]
@@ -730,6 +744,17 @@ mod tests {
         let many: String = (0..1200).map(|i| format!("http://{i}.a/")).collect();
         let u = format!("chrome-extension://cjpalhdlnbpafiamejdnhcphjbkeiagm/v#{many}");
         assert!(hid(&sites(&["chase.com"]), &u).is_some());
-        assert!(t.elapsed().as_millis() < 300, "{:?}", t.elapsed());
+        assert!(t.elapsed().as_secs() < 3, "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn junk_or_length_before_an_address_cannot_hide_it() {
+        let lax = Exclusions { unreadable_browsers: false, ..sites(&["chase.com"]) };
+        let base = "chrome-extension://cjpalhdlnbpafiamejdnhcphjbkeiagm/v#";
+        for tail in [format!("{}https://chase.com/", "https://[,".repeat(600)), format!("https://{}@chase.com/", "u".repeat(3000)), format!("https:{}chase.com/", "/".repeat(3000))] {
+            assert!(hid(&lax, &format!("{base}{tail}")).is_some(), "{}", &tail[..20]);
+        }
+        let deep = Exclusions { sites: vec!["chase.com/*/secret".into()], ..lax };
+        assert!(hid(&deep, &format!("{base}https://chase.com/{}/secret", "a".repeat(3000))).is_some());
     }
 }

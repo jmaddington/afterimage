@@ -14,73 +14,91 @@ public protocol ScreenElement: Equatable {
 
 /// Reads page addresses and private-window markers from a browser's accessibility tree.
 /// AIDEV-NOTE: AX calls block on the target app; every read has a short timeout and an overall deadline.
-/// AIDEV-NOTE: privacy-critical: anything incomplete returns nil, which the engine treats as "leave the browser out".
+/// AIDEV-NOTE: privacy-critical: anything incomplete says so, which the engine treats as "leave the browser out".
 public enum Accessibility {
     public static var isTrusted: Bool { AXIsProcessTrusted() }
 
     public struct Reading: Sendable {
-        public var windows: [BrowserWindow]
+        public var windows: [BrowserWindow] = []
         public var focusedURL: String?
+        /// False when anything couldn't be read. What was read still counts against the browser.
+        public var complete = true
     }
 
-    public static func read(pid: pid_t, visible: [OnScreenWindow], budget: TimeInterval = 1.0) -> Reading? {
-        guard isTrusted, pid != getpid() else { return nil }
+    public static func read(pid: pid_t, visible: [OnScreenWindow], budget: TimeInterval = 1.0) -> Reading {
+        guard isTrusted, pid != getpid() else { return Reading(complete: false) }
         let app = LiveElement(AXUIElementCreateApplication(pid))
         let drawn = visible.filter { $0.pid == pid && $0.alpha > 0 && $0.bounds.width > 160 && $0.bounds.height > 160 }.map(\.bounds)
-        return try? read(app: app, drawn: drawn, deadline: Date().addingTimeInterval(budget))
+        return read(app: app, drawn: drawn, deadline: Date().addingTimeInterval(budget))
     }
 
-    static func read<E: ScreenElement>(app: E, drawn: [CGRect], deadline: Date) throws -> Reading {
-        var elements = try list(app, kAXWindowsAttribute)
+    static func read<E: ScreenElement>(app: E, drawn: [CGRect], deadline: Date) -> Reading {
+        var r = Reading()
+        func attempt<T>(_ f: () throws -> T) -> T? {
+            if let v = try? f() { return v }
+            r.complete = false
+            return nil
+        }
+        var elements = attempt { try list(app, kAXWindowsAttribute) } ?? []
         // Extension popups and sheets can hang off the app rather than its window list.
-        for c in try list(app, kAXChildrenAttribute) where ["AXWindow", "AXSheet", "AXPopover", "AXGroup"].contains(try role(c)) {
-            if !elements.contains(c) { elements.append(c) }
+        for c in attempt({ try list(app, kAXChildrenAttribute) }) ?? [] {
+            guard let role = attempt({ try role(c) }), ["AXWindow", "AXSheet", "AXPopover", "AXGroup"].contains(role), !elements.contains(c) else { continue }
+            elements.append(c)
         }
         var seen: [(element: E, window: BrowserWindow, frame: CGRect?)] = []
         for w in elements {
-            guard Date() < deadline else { throw Unreadable() }
-            if try w.read(kAXMinimizedAttribute) as? Bool == true { continue }
-            seen.append((w, try window(w, deadline: deadline), try frame(w)))
+            // Unknown counts as not minimised.
+            if attempt({ try w.read(kAXMinimizedAttribute) as? Bool ?? false }) == true { continue }
+            var b = BrowserWindow(title: nil, urls: [], controlLabels: [], fieldDescriptions: [])
+            _ = attempt { try fill(&b, w, deadline: deadline) }
+            seen.append((w, b, attempt { try frame(w) } ?? nil))
         }
         // A window the server is drawing that accessibility didn't show us could hold anything.
         var frames = seen.compactMap(\.frame)
         for d in drawn {
-            guard let i = frames.firstIndex(where: { same($0, d) }) else { throw Unreadable() }
-            frames.remove(at: i)
+            if let i = frames.firstIndex(where: { same($0, d) }) { frames.remove(at: i) } else { r.complete = false }
         }
+        r.windows = seen.map(\.window)
         // Metadata only, so a failure here costs nothing; but never report a page that wasn't inspected.
-        let focused = try? app.read(kAXFocusedWindowAttribute) as? E
-        return Reading(windows: seen.map(\.window), focusedURL: seen.first { $0.element == focused }?.window.urls.first)
+        if let focused = try? app.read(kAXFocusedWindowAttribute) as? E { r.focusedURL = seen.first { $0.element == focused }?.window.urls.first }
+        return r
     }
 
-    private static func window<E: ScreenElement>(_ w: E, deadline: Date) throws -> BrowserWindow {
-        var b = BrowserWindow(title: try w.read(kAXTitleAttribute) as? String, urls: [], controlLabels: [], fieldDescriptions: [])
+    private static func fill<E: ScreenElement>(_ b: inout BrowserWindow, _ w: E, deadline: Date) throws {
+        b.title = try w.read(kAXTitleAttribute) as? String
         if let d = try w.read(kAXDocumentAttribute) as? String, d.contains(":") { b.urls.append(d) }
         // Breadth-first over the window's furniture. Web content itself is never entered.
+        // One bad element doesn't stop the walk: what lies beyond it may be the reason to hide.
         var queue = [w]
         var i = 0
+        var failed = false
         while i < queue.count {
             guard Date() < deadline, i < 900 else { throw Unreadable() }
             let e = queue[i]
             i += 1
-            switch try role(e) {
-            case "AXWebArea":
-                let u = try e.read(kAXURLAttribute)
-                let s = (u as? URL)?.absoluteString ?? (u as? String) ?? "unknown:"
-                if !b.urls.contains(s) { b.urls.append(s) }
-                continue
-            case "AXButton", "AXPopUpButton", "AXMenuButton", "AXStaticText", "AXImage":
-                for k in [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute] {
-                    if let s = try e.read(k) as? String, !s.isEmpty, s.count < 40 { b.controlLabels.append(s) }
-                }
-            case "AXTextField", "AXComboBox", "AXSearchField":
-                if let s = try e.read(kAXDescriptionAttribute) as? String, !s.isEmpty { b.fieldDescriptions.append(s) }
-                continue
-            default: break
-            }
-            queue.append(contentsOf: try list(e, kAXChildrenAttribute))
+            do { queue.append(contentsOf: try visit(e, &b)) } catch { failed = true }
         }
-        return b
+        if failed { throw Unreadable() }
+    }
+
+    /// Note what this element says and return what's inside it.
+    private static func visit<E: ScreenElement>(_ e: E, _ b: inout BrowserWindow) throws -> [E] {
+        switch try role(e) {
+        case "AXWebArea":
+            let u = try e.read(kAXURLAttribute)
+            let s = (u as? URL)?.absoluteString ?? (u as? String) ?? "unknown:"
+            if !b.urls.contains(s) { b.urls.append(s) }
+            return []
+        case "AXButton", "AXPopUpButton", "AXMenuButton", "AXStaticText", "AXImage":
+            for k in [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute] {
+                if let s = try e.read(k) as? String, !s.isEmpty, s.count < 40 { b.controlLabels.append(s) }
+            }
+        case "AXTextField", "AXComboBox", "AXSearchField":
+            if let s = try e.read(kAXDescriptionAttribute) as? String, !s.isEmpty { b.fieldDescriptions.append(s) }
+            return []
+        default: break
+        }
+        return try list(e, kAXChildrenAttribute)
     }
 
     private static func role<E: ScreenElement>(_ e: E) throws -> String {

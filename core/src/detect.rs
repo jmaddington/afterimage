@@ -93,8 +93,8 @@ macro_rules! re {
 
 re!(SSN, r"\b\d{3}[\s\-\u{2010}-\u{2015}\u{2212}.]{1,3}\d{2}[\s\-\u{2010}-\u{2015}\u{2212}.]{1,3}\d{4}\b");
 re!(NINE, r"\b\d{9}\b");
-re!(DIGIT_RUN, r"\d(?:[\s\-\u{2010}-\u{2015}\u{2212}.]{0,2}\d){11,18}");
-re!(CARD_PREFIX, r"^(?:3[47]\d{13}|(?:4\d|5[1-5]|2[2-7]|6[05])\d{14})$");
+re!(DIGIT_RUN, r"\d(?:[\s\-\u{2010}-\u{2015}\u{2212}.]{0,2}\d){11,}");
+re!(CARD_PREFIX, r"^(?:3[47]\d{13}|(?:4\d|5[1-5]|2[2-7]|35|6[025])\d{14}|64[4-9]\d{13})$");
 re!(CARD_GROUPS, r"\b\d{4}[\s\-.]{1,2}\d{4}[\s\-.]{1,2}\d{4}[\s\-.]{1,2}\d{1,7}\b|\b3[47]\d{2}[\s\-.]{1,2}\d{6}[\s\-.]{1,2}\d{5}\b");
 re!(IBAN, r"\b[A-Z]{2}\d{2}(?:\s?[A-Z0-9]{4}){2,7}(?:\s?[A-Z0-9]{1,4})?\b");
 re!(SSN_LABEL, r"(?i)\b(?:ssn|social\s+security|tax(?:payer)?\s*id|itin|tin)\b");
@@ -229,12 +229,14 @@ pub fn scan_text(text: &str, line: usize, hits: &mut Vec<Hit>) {
     if text.is_ascii() {
         return scan_latin(text, line, hits);
     }
-    // Both readings: looking through lookalikes may only ever add.
+    // Every reading: looking through lookalikes may only ever add.
     scan_latin(text, line, hits);
-    let (t, at) = latinised(text);
-    let mut found = Vec::new();
-    scan_latin(&t, line, &mut found);
-    hits.extend(found.into_iter().map(|h| Hit { range: at[h.range.start]..at[h.range.end], ..h }));
+    for ze in [false, true] {
+        let (t, at) = latinised(text, ze);
+        let mut found = Vec::new();
+        scan_latin(&t, line, &mut found);
+        hits.extend(found.into_iter().map(|h| Hit { range: at[h.range.start]..at[h.range.end], ..h }));
+    }
 }
 
 fn scan_latin(text: &str, line: usize, hits: &mut Vec<Hit>) {
@@ -251,11 +253,18 @@ fn scan_latin(text: &str, line: usize, hits: &mut Vec<Hit>) {
         push(hits, line, m.range(), Financial);
     }
     for m in DIGIT_RUN.find_iter(text) {
-        let d: String = m.as_str().chars().filter(char::is_ascii_digit).collect();
-        // A stray digit beside a card must not hide it; inside a longer run only real card shapes count.
-        let inside = [15, 16].into_iter().flat_map(|n| d.as_bytes().windows(n).filter_map(|w| std::str::from_utf8(w).ok())).any(|w| CARD_PREFIX.is_match(w) && luhn(w));
-        if (13..=19).contains(&d.len()) && luhn(&d) || inside {
+        let (at, d): (Vec<usize>, String) = m.as_str().char_indices().filter(|x| x.1.is_ascii_digit()).unzip();
+        if (13..=19).contains(&d.len()) && luhn(&d) {
             push(hits, line, m.range(), Financial);
+        }
+        // A stray digit beside a card must not hide it; inside a longer run only real card shapes count.
+        for n in [15, 16] {
+            for i in 0..(d.len() + 1).saturating_sub(n) {
+                let w = &d[i..i + n];
+                if CARD_PREFIX.is_match(w) && luhn(w) {
+                    push(hits, line, m.start() + at[i]..m.start() + at[i + n - 1] + 1, Financial);
+                }
+            }
         }
     }
     for m in IBAN.find_iter(text) {
@@ -316,7 +325,7 @@ fn scan_latin(text: &str, line: usize, hits: &mut Vec<Hit>) {
 pub fn scan(lines: &[TextLine]) -> Vec<Hit> {
     let mut hits = Vec::new();
     let mut in_pem = false;
-    let latin: Vec<String> = lines.iter().map(|l| latinised(&l.text).0).collect();
+    let latin: Vec<String> = lines.iter().map(|l| latinised(&l.text, false).0).collect();
     for (i, l) in lines.iter().enumerate() {
         let t = &latin[i];
         if l.code {
@@ -494,11 +503,12 @@ fn latin(c: char) -> char {
 }
 
 /// Text with lookalikes made Latin, and the original byte offset of every byte boundary in it.
-fn latinised(text: &str) -> (String, Vec<usize>) {
+/// `ze` reads the Cyrillic letter as the digit it also looks like.
+fn latinised(text: &str, ze: bool) -> (String, Vec<usize>) {
     let mut out = String::with_capacity(text.len());
     let mut at = Vec::with_capacity(text.len() + 1);
     for (i, c) in text.char_indices() {
-        let l = latin(c);
+        let l = if ze && matches!(c, '\u{0417}' | '\u{0437}') { '3' } else { latin(c) };
         out.push(l);
         at.extend(std::iter::repeat_n(i, l.len_utf8()));
     }
@@ -530,10 +540,10 @@ pub fn find_secret(lines: &[TextLine], value: &str) -> Vec<(usize, Range<usize>)
     let mut out: Vec<(usize, Range<usize>)> = Vec::new();
     if needle.len() < 6 {
         // Too short to match loosely: as a word of its own, spacing and all.
-        let v = latinised(value.trim()).0.to_ascii_lowercase();
+        let v = latinised(value.trim(), true).0.to_ascii_lowercase();
         let word = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
         for (i, l) in lines.iter().enumerate().filter(|_| v.chars().any(char::is_alphanumeric)) {
-            let (t, at) = latinised(&l.text);
+            let (t, at) = latinised(&l.text, true);
             let t = t.to_ascii_lowercase();
             for (s, m) in t.match_indices(v.as_str()) {
                 let e = s + m.len();
@@ -840,6 +850,22 @@ mod tests {
         }
         for t in ["https://example.com", "https://www.example.co.uk/Menu/", "HTTP://EXAMPLE.COM/ABOUT"] {
             assert_eq!(scan(&[code(t)]), vec![], "{t}");
+        }
+    }
+
+    #[test]
+    fn cyrillic_ze_is_also_read_as_three() {
+        assert!(!masked("SSN 21З-09-9999").contains("9999"));
+        assert!(!masked("4111 1111 1111 1З11").contains("4111"));
+        assert_eq!(find_secret(&[line("pin Зху9 ok", 0.1, 0.1)], "3xy9").len(), 1);
+    }
+
+    #[test]
+    fn cards_are_found_in_runs_of_any_length() {
+        let t = masked("2026 11 24 07 18 4111111111111111 55 1234567890");
+        assert!(!t.contains("4111111111111111") && t.contains("2026") && t.contains("1234567890"), "{t}");
+        for n in ["3530111333300000", "6200000000000005", "6445644564456445"] {
+            assert!(masked(&format!("{n}9")).contains("[hidden]"), "{n}");
         }
     }
 }
