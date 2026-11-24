@@ -703,6 +703,7 @@ impl Shared {
         };
         detect::extend_wrapped(&all, &mut hits);
         propagate(&all, &mut hits);
+        detect::snap(&all, &mut hits);
 
         let mut regions: Vec<Region> = f.covers.iter().map(|c| region(c.kind, c.rect, "extension")).collect();
         for h in hits.iter().filter(|h| h.line < shown) {
@@ -858,7 +859,12 @@ fn save_loop(s: Arc<Shared>) {
         // AIDEV-NOTE: rgba is taken by encode; only retry failures that happen before it (model errors).
         for attempt in 0..3 {
             let require = lock(&s.config).require_ai;
-            result = s.process(&mut f, arrived, require);
+            // A frame that can't be handled is dropped; it must not take the saving of every later one with it.
+            result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| s.process(&mut f, arrived, require))).unwrap_or_else(|_| {
+                f.rgba.clear();
+                log::error!("a frame couldn't be processed and was dropped [AIMG-PANIC]");
+                Err("Afterimage couldn't read this picture, so it wasn't saved".into())
+            });
             if result.is_ok() || f.rgba.is_empty() || lock(&s.queue).stop {
                 break;
             }

@@ -123,8 +123,10 @@ re!(RECOVERY, r"(?i)\b(?:recovery|backup)\s+(?:codes?|keys?|phrases?)\b[ \t]*([:
 re!(FIELD_START, r"(?i)^\s*(?:card|account|routing|name|member|e-?mail|user(?:name)?|phone|address|notes?|date|expir\w*|cvv|cvc|zip|city|state|country|first|last|company)(?:\s+(?:number|no\.?|name|code|date|address))?(?:\s*:\s*|\s+|$)");
 re!(WIFI, r#"(?i)\bwi-?fi\b(?:\s+(?:password|passphrase|key|code))?\s*(?:\bis\b|:)\s*["']?([^\s"']+)"#);
 re!(COMMAND, r"(?i)\b(mysql(?:dump|admin)?|curl|wget|http)\b");
-re!(MYSQL_FLAG, r#"\s-p(?:'([^']+)'|"([^"]+)"|([^\s'"]+))"#);
-re!(CURL_FLAG, r#"\s(?:-u|--user|-U|--proxy-user)(?:=|\s+)(?:'[^':]*:([^']+)'|"[^":]*:([^"]+)"|[^\s:'"]+:([^\s'"]+))"#);
+re!(MYSQL_FLAG, r#"\s-p(?:'([^']+)(?:'|$)|"([^"]+)(?:"|$)|(\S+))"#);
+re!(MYSQL_LOOSE, r"\s-p(\S+)");
+re!(CURL_LOOSE, r#"\s(?:-u|--user|-U|--proxy-user)(?:=|\s+)["']?[^\s:"']+:(\S+)"#);
+re!(CURL_FLAG, r#"\s(?:-u|--user|-U|--proxy-user)(?:=|\s+)(?:'[^':]*:([^']+)(?:'|$)|"[^":]*:([^"]+)(?:"|$)|[^\s:'"]+:([^\s'"]+))"#);
 re!(PHONE_334, r"^\d{3}[\s.\-]\d{3}[\s.\-]\d{4}$");
 re!(FIN_QUAL, r"(?i)\b(?:number|num|no\.?|nbr|code|iban|routing|aba|swift|bic|sort\s*code)\b|#");
 // Long numbers that are plainly something else.
@@ -463,8 +465,13 @@ fn scan_latin(text: &str, line: usize, hits: &mut Vec<Hit>) {
                         end += rest.trim_end().len();
                     }
                 }
-                push(hits, line, v.start()..end, kind, "assignment");
-                from = end;
+                // The word by itself too, so it is recognised wherever else it appears; and the rest of the line is
+                // still read for secrets of its own.
+                push(hits, line, v.range(), kind, "assignment");
+                if end > v.end() {
+                    push(hits, line, v.start()..end, kind, "assignment");
+                }
+                from = v.end();
             }
             None => from = sep.end(),
         }
@@ -481,9 +488,10 @@ fn scan_latin(text: &str, line: usize, hits: &mut Vec<Hit>) {
     for cmd in COMMAND.captures_iter(text) {
         let from = cmd.get(0).unwrap().end();
         let tail_end = text[from..].find('\n').map_or(text.len(), |i| from + i);
-        let flags = if cmd[1].to_lowercase().starts_with("mysql") { &*MYSQL_FLAG } else { &*CURL_FLAG };
-        for f in flags.captures_iter(&text[from..tail_end]) {
-            if let Some(v) = (1..=3).find_map(|i| f.get(i)) {
+        // Careful and loose readings both: a stray quote must only ever add to what is hidden.
+        let flags: [&Regex; 2] = if cmd[1].to_lowercase().starts_with("mysql") { [&MYSQL_FLAG, &MYSQL_LOOSE] } else { [&CURL_FLAG, &CURL_LOOSE] };
+        for f in flags.iter().flat_map(|re| re.captures_iter(&text[from..tail_end])) {
+            if let Some(v) = (1..f.len()).find_map(|i| f.get(i)) {
                 push(hits, line, from + v.start()..from + v.end(), Password, "flag");
             }
         }
@@ -561,6 +569,8 @@ pub fn scan(lines: &[TextLine]) -> Vec<Hit> {
                 let v = &latin[j];
                 if (plausible_value(v) || plausible_value(&lines[j].text)) && !PASS_LABEL.is_match(v) {
                     // A row that names its own field keeps its label; what follows goes, unless a rule already has it.
+                    // `v` is the Latin reading; offsets into it are not offsets into what was read.
+                    let at = latinised(&lines[j].text, false).1;
                     let start = match FIELD_START.find(v) {
                         Some(f) => {
                             let mut own = Vec::new();
@@ -568,7 +578,7 @@ pub fn scan(lines: &[TextLine]) -> Vec<Hit> {
                             if !own.is_empty() || f.end() >= v.len() {
                                 continue;
                             }
-                            f.end()
+                            at[f.end()]
                         }
                         None => 0,
                     };
@@ -601,7 +611,27 @@ pub fn scan(lines: &[TextLine]) -> Vec<Hit> {
         }
     }
     extend_wrapped(lines, &mut hits);
+    snap(lines, &mut hits);
     hits
+}
+
+/// Make every hit a whole number of characters on a line that exists. Widens, never narrows.
+/// AIDEV-NOTE: a range that splits a character would panic wherever the text is sliced, and a panic stops all saving.
+pub fn snap(lines: &[TextLine], hits: &mut Vec<Hit>) {
+    hits.retain_mut(|h| {
+        let Some(t) = lines.get(h.line).map(|l| l.text.as_str()) else { return false };
+        let mut a = h.range.start.min(t.len());
+        let mut b = h.range.end.min(t.len());
+        while !t.is_char_boundary(a) {
+            a -= 1;
+        }
+        while !t.is_char_boundary(b) {
+            b += 1;
+        }
+        h.range = a..b;
+        // A code that couldn't be read has no text; its hit stands for its whole box.
+        a < b || t.is_empty()
+    });
 }
 
 /// A key that runs to the end of its line usually wraps. Hide following rows that look like more of it.
@@ -636,7 +666,18 @@ pub fn extend_wrapped(lines: &[TextLine], hits: &mut Vec<Hit>) {
 
 /// Replace every hit with a marker; used for indexed text, titles and URLs.
 pub fn mask(text: &str, ranges: &[Range<usize>]) -> String {
-    let mut r: Vec<Range<usize>> = ranges.to_vec();
+    // Widened to whole characters and kept inside the text, whatever was asked.
+    let fit = |x: &Range<usize>| {
+        let (mut a, mut b) = (x.start.min(text.len()), x.end.min(text.len()));
+        while !text.is_char_boundary(a) {
+            a -= 1;
+        }
+        while !text.is_char_boundary(b) {
+            b += 1;
+        }
+        a..b
+    };
+    let mut r: Vec<Range<usize>> = ranges.iter().map(fit).collect();
     r.sort_by_key(|x| x.start);
     let mut out = String::with_capacity(text.len());
     let mut at = 0;
@@ -798,6 +839,9 @@ pub fn find_secret(lines: &[TextLine], value: &str) -> Vec<(usize, Range<usize>)
 
 /// Pixel-space cover for a hit: every token the hit touches, or the whole line when tokens are missing.
 pub fn hit_rect(line: &TextLine, range: &Range<usize>) -> Rect {
+    if range.start > range.end || !line.text.is_char_boundary(range.start) || !line.text.is_char_boundary(range.end) {
+        return line.rect;
+    }
     let start = line.text[..range.start].chars().count() as u32;
     let end = start + line.text[range.clone()].chars().count() as u32;
     let mut acc: Option<Rect> = None;
@@ -1300,5 +1344,35 @@ mod tests {
         // A quoted password runs to its closing quote; an unquoted one to the end of the line.
         assert_eq!(masked("password = \"correct horse battery\" # note"), "password = \"[hidden]\" # note");
         assert_eq!(masked("password: correct, horse; battery staple!"), "password: [hidden]");
+    }
+
+    #[test]
+    fn lookalike_letters_never_split_a_character() {
+        // "Nаmе dаna" with Cyrillic а and е: the label ends at a different byte in what was read than in its Latin twin.
+        let l = vec![line("Password", 0.1, 0.10), line("Nаmе dаna9", 0.1, 0.14), line("Саrd numbеr 12 34 tеxt", 0.1, 0.18)];
+        let h = scan(&l);
+        for x in &h {
+            assert!(l[x.line].text.is_char_boundary(x.range.start) && l[x.line].text.is_char_boundary(x.range.end), "{x:?}");
+        }
+        let r: Vec<_> = h.iter().filter(|x| x.line == 1).map(|x| x.range.clone()).collect();
+        assert_eq!(mask(&l[1].text, &r), "Nаmе [hidden]");
+        // Whatever arrives, masking and placing never panic.
+        let odd = line("é😀é", 0.1, 0.1);
+        assert_eq!(mask(&odd.text, &[1..3, 2..6, 0..99]), "[hidden]");
+        let _ = hit_rect(&odd, &(1..5));
+        let mut hits = vec![Hit { line: 0, range: 1..5, kind: SecretKind::Other, why: "model" }, Hit { line: 9, range: 0..1, kind: SecretKind::Other, why: "model" }];
+        snap(std::slice::from_ref(&odd), &mut hits);
+        assert_eq!(hits, vec![Hit { line: 0, range: 0..6, kind: SecretKind::Other, why: "model" }]);
+    }
+
+    #[test]
+    fn a_passphrase_and_its_first_word_are_both_remembered() {
+        let mut h = Vec::new();
+        scan_text("password: correct horse battery token=Zx81qwerty99", 0, &mut h);
+        let got: Vec<&str> = h.iter().map(|x| &"password: correct horse battery token=Zx81qwerty99"[x.range.clone()]).collect();
+        assert!(got.contains(&"correct") && got.contains(&"correct horse battery token=Zx81qwerty99") && got.contains(&"Zx81qwerty99"), "{got:?}");
+        for (t, secret) in [("mysql -p'half open9", "open9"), ("mysql -pab'cd9 x", "cd9"), ("curl -u dana:pa'ss9 x", "ss9"), ("curl -u \"dana:open quote9", "quote9")] {
+            assert!(!masked(t).contains(secret), "{t}: {}", masked(t));
+        }
     }
 }

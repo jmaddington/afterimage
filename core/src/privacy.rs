@@ -86,13 +86,19 @@ static OTHER_BROWSERS: std::sync::LazyLock<std::sync::RwLock<std::collections::H
 /// Apps this Mac says can open web pages. Any not already known is read like a browser, and left out when it can't be.
 #[uniffi::export]
 pub fn register_browsers(bundle_ids: Vec<String>) {
-    *OTHER_BROWSERS.write().unwrap_or_else(|e| e.into_inner()) = bundle_ids.into_iter().map(|b| b.to_lowercase()).collect();
+    // Only ever added to while the app runs: an app that vanishes from the list for a moment is still a browser.
+    OTHER_BROWSERS.write().unwrap_or_else(|e| e.into_inner()).extend(bundle_ids.into_iter().map(|b| b.to_lowercase()));
 }
 
 /// Registered apps that have actually shown a web page. Terminals and the like register for links and never do.
 static SHOWN_PAGES: std::sync::LazyLock<std::sync::RwLock<std::collections::HashSet<String>>> = std::sync::LazyLock::new(Default::default);
 
-static PAGELESS_LOOKS: std::sync::LazyLock<std::sync::RwLock<std::collections::HashMap<String, u8>>> = std::sync::LazyLock::new(Default::default);
+static PAGELESS_LOOKS: std::sync::LazyLock<std::sync::RwLock<std::collections::HashMap<String, (u8, Option<std::time::Instant>)>>> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(not(test))]
+const PAGELESS_GAP: std::time::Duration = std::time::Duration::from_millis(1200);
+#[cfg(test)]
+const PAGELESS_GAP: std::time::Duration = std::time::Duration::from_millis(30);
 
 fn only_registered(bundle: &str) -> bool {
     family_of(bundle, false).is_none() && family_of(bundle, true).is_some()
@@ -118,6 +124,8 @@ fn family_of(bundle: &str, registered: bool) -> Option<Family> {
         Some(Family::Firefox)
     } else if p(&["company.thebrowser.browser", "company.thebrowser.dia", "com.sigmaos.sigmaos.macos", "ai.perplexity.comet",
                   "com.perplexity.comet", "com.openai.atlas", "com.duckduckgo.macos.browser"]) {
+        Some(Family::Other)
+    } else if registered && SHOWN_PAGES.read().unwrap_or_else(|e| e.into_inner()).contains(&b) {
         Some(Family::Other)
     } else if registered && OTHER_BROWSERS.read().unwrap_or_else(|e| e.into_inner()).contains(&b) {
         Some(Family::Other)
@@ -439,8 +447,14 @@ pub fn hide_browser(ex: &Exclusions, bundle_id: &str, windows: &[BrowserWindow],
         let read = |w: &BrowserWindow| w.urls.is_empty() && w.control_labels.iter().chain(&w.field_descriptions).any(|l| !l.trim().is_empty());
         let pageless = complete && !windows.is_empty() && windows.iter().all(read);
         let mut looks = PAGELESS_LOOKS.write().unwrap_or_else(|e| e.into_inner());
-        let n = looks.entry(b.clone()).or_insert(0);
-        *n = if pageless { n.saturating_add(1) } else { 0 };
+        let (n, last) = looks.entry(b.clone()).or_insert((0, None));
+        // One look counts per second or so: three in the same breath are one look.
+        let spaced = last.is_none_or(|t| t.elapsed() >= PAGELESS_GAP);
+        if !pageless {
+            (*n, *last) = (0, None);
+        } else if spaced {
+            (*n, *last) = (n.saturating_add(1), Some(std::time::Instant::now()));
+        }
         if *n >= 3 && !SHOWN_PAGES.read().unwrap_or_else(|e| e.into_inner()).contains(&b) {
             return None;
         }
@@ -891,20 +905,30 @@ mod tests {
         // A terminal also says it opens links. With no page in it, it's an ordinary app, readable or not.
         let plain = BrowserWindow { urls: vec![], ..win("x") };
         // Not on the first look: its tree may not have filled in yet.
+        let nap = || std::thread::sleep(std::time::Duration::from_millis(40));
         assert_eq!(hide_browser(&e, "com.example.terminal", &[plain.clone()], true), Some(HideReason::Unreadable));
+        // Looks in the same breath count once.
+        for _ in 0..5 {
+            assert_eq!(hide_browser(&e, "com.example.terminal", &[plain.clone()], true), Some(HideReason::Unreadable));
+        }
+        nap();
         assert_eq!(hide_browser(&e, "com.example.terminal", &[plain.clone()], true), Some(HideReason::Unreadable));
+        nap();
         assert_eq!(hide_browser(&e, "com.example.terminal", &[plain.clone()], true), None);
         let bare = BrowserWindow { urls: vec![], control_labels: vec![], ..win("x") };
         assert_eq!(hide_browser(&e, "com.example.terminal", &[bare], true), Some(HideReason::Unreadable));
         for _ in 0..3 {
             hide_browser(&e, "com.example.terminal", &[plain.clone()], true);
+            nap();
         }
         assert_eq!(hide_browser(&e, "com.example.terminal", &[plain.clone()], true), None);
         // Only a full look that finds no page says so; a failed look says nothing.
         assert_eq!(hide_browser(&e, "com.example.terminal", &[plain.clone()], false), Some(HideReason::Unreadable));
         assert_eq!(hide_browser(&e, "com.example.terminal", &[], false), Some(HideReason::Unreadable));
         // A private-window marker makes it a browser on the spot.
-        register_browsers(vec!["net.Mullvad.MullvadBrowser".into(), "one.ablaze.floorp".into(), "com.example.terminal".into(), "com.example.quiet".into()]);
+        // Registering again adds; nothing registered before is forgotten.
+        register_browsers(vec!["com.example.quiet".into()]);
+        assert!(is_browser("one.ablaze.floorp"));
         let marked = BrowserWindow { title: Some("x — Private Browsing".into()), urls: vec![], ..win("x") };
         assert_eq!(hide_browser(&ex(), "com.example.quiet", &[marked], true), Some(HideReason::PrivateWindow));
         // One page seen, and from then on it is held to a browser's rules.
