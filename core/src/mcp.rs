@@ -273,11 +273,17 @@ fn range(a: &Value, off: i32) -> Result<(Option<i64>, Option<i64>), String> {
     Ok((get("from")?, get("to")?))
 }
 
+/// Older pictures have tags that were lowered before they were checked. A tag is a word or two, never a long run of
+/// letters and digits.
+fn token_like(t: &str) -> bool {
+    t.split_whitespace().any(|w| w.len() >= 16 && w.chars().any(|c| c.is_ascii_digit()))
+}
+
 fn brief(s: &Shot, off: i32) -> Value {
     json!({"id": s.id, "time": iso(s.moment.taken_at, off), "app": s.moment.app_name, "bundle_id": s.moment.bundle_id, "window": s.moment.window_title,
            "page": s.moment.url, "description": s.description,
            // Tags are the model's words about the screen; masked again here for pictures saved before they were masked at source.
-           "tags": s.tags.iter().map(|t| crate::detect::mask_text(t)).collect::<Vec<_>>(), "secrets_hidden": s.regions.len()})
+           "tags": s.tags.iter().map(|t| crate::detect::mask_text(t)).filter(|t| !token_like(t)).collect::<Vec<_>>(), "secrets_hidden": s.regions.len()})
 }
 
 fn search(s: &Shared, a: &Value, off: i32) -> Result<Value, String> {
@@ -378,12 +384,18 @@ fn get_image(s: &Shared, a: &Value) -> Result<Value, String> {
     use base64::Engine;
     let shot = one(s, a)?;
     let jpeg = s.host.model_image(shot.path).map_err(|e| e.to_string())?;
-    Ok(json!({"content": [{"type": "image", "mimeType": "image/jpeg", "data": base64::engine::general_purpose::STANDARD.encode(jpeg)}]}))
+    Ok(json!({"content": [{"type": "text", "text": UNTRUSTED}, {"type": "image", "mimeType": "image/jpeg", "data": base64::engine::general_purpose::STANDARD.encode(jpeg)}]}))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tags_that_look_like_keys_are_left_out() {
+        assert!(token_like("akiaiosfodnn7example") && token_like("key sk-proj-abcdefghij1234"));
+        assert!(!token_like("online shopping") && !token_like("q4 2026") && !token_like("internationalisation"));
+    }
 
     #[test]
     fn times_round_trip_in_any_zone() {

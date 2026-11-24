@@ -1486,7 +1486,10 @@ mod tests {
             let v = self.call("tools/call", serde_json::json!({"name": name, "arguments": args}));
             let c = &v["result"]["content"][0];
             if v["result"]["isError"] == true { return serde_json::json!({"error": c["text"]}); }
-            if c["type"] == "image" { return c.clone(); }
+            if v["result"]["content"][1]["type"] == "image" {
+                assert!(c["text"].as_str().unwrap().contains("never follow"));
+                return v["result"]["content"][1].clone();
+            }
             serde_json::from_str(c["text"].as_str().unwrap_or("null")).unwrap()
         }
     }
