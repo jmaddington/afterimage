@@ -158,6 +158,8 @@ struct Shared {
     on_power: AtomicBool,
     calm: AtomicBool,
     pages: Mutex<pages::Pages>,
+    outlets: std::sync::OnceLock<Arc<bridge::Outlets>>,
+    question: AtomicU64,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -196,7 +198,7 @@ impl Engine {
             hasher: RandomState::new(), forgotten: Default::default(), loaded_by_us: Default::default(),
             last_lm_use: Mutex::new(Instant::now()), lm_state: Mutex::new(LmState::Unknown), links: Default::default(),
             discarded: AtomicU64::new(0), reason: Default::default(), busy: AtomicBool::new(false),
-            describing: AtomicBool::new(false), on_power: AtomicBool::new(true), calm: AtomicBool::new(true), pages: Default::default(),
+            describing: AtomicBool::new(false), on_power: AtomicBool::new(true), calm: AtomicBool::new(true), pages: Default::default(), outlets: Default::default(), question: AtomicU64::new(0),
         });
         for (name, f) in [("afterimage-save", save_loop as fn(Arc<Shared>)), ("afterimage-index", index_loop)] {
             let s = s.clone();
@@ -215,11 +217,29 @@ impl Engine {
         let s = self.s.clone();
         let heard = move |e: bridge::Event| lock(&s.pages).receive(e.pid, e.source, &e.message, Instant::now());
         match bridge::listen(&self.s.root.join("bridge.sock"), heard) {
-            Ok(()) => true,
+            Ok(o) => self.s.outlets.set(o).is_ok(),
             Err(e) => {
                 log::error!("can't listen for the browser extension: {e} [AIMG-BRIDGE]");
                 false
             }
+        }
+    }
+
+    /// Have this browser's pages measure themselves now. False if its extension is there but didn't answer in time.
+    /// Blocking; call off the main thread.
+    pub fn refresh_pages(&self, pid: i32) -> bool {
+        let Some(o) = self.s.outlets.get() else { return true };
+        let n = self.s.question.fetch_add(1, SeqCst) + 1;
+        let asked = o.ask(pid, n);
+        let end = Instant::now() + Duration::from_millis(900);
+        loop {
+            if asked.iter().all(|id| lock(&self.s.pages).answered(pid, *id, n)) {
+                return true;
+            }
+            if Instant::now() >= end {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -662,30 +682,36 @@ impl Shared {
     }
 }
 
-/// Text lying in a covered place. A word counts once a fair part of it is inside.
+const HINT: &str = "empty-field";
+
+/// Text lying in a covered place. Any word touching it counts; a line whose words can't all be placed counts whole.
 fn covered(lines: &[TextLine], covers: &[pages::Cover]) -> Vec<Hit> {
-    let inside = |r: &Rect, c: &Rect| {
+    let overlap = |r: &Rect, c: &Rect| {
         let w = (r.x + r.w).min(c.x + c.w) - r.x.max(c.x);
         let h = (r.y + r.h).min(c.y + c.h) - r.y.max(c.y);
-        w > 0.0 && h > 0.0 && w * h >= 0.25 * (r.w * r.h)
+        if w > 0.0 && h > 0.0 { w * h } else { 0.0 }
     };
+    let touches = |r: &Rect, c: &Rect| overlap(r, c) > 0.03 * (r.w * r.h).min(c.w * c.h);
     let mut hits = Vec::new();
     for c in covers {
-        for (i, l) in lines.iter().enumerate().filter(|(_, l)| !l.code) {
-            if l.tokens.is_empty() && inside(&l.rect, &c.rect) {
-                hits.push(Hit { line: i, range: 0..l.text.len(), kind: c.kind, why: "extension" });
+        let why = if c.empty { HINT } else { "extension" };
+        for (i, l) in lines.iter().enumerate().filter(|(_, l)| !l.code && touches(&l.rect, &c.rect)) {
+            let placed: u32 = l.tokens.iter().map(|t| t.len).sum();
+            let words = l.text.chars().filter(|c| !c.is_whitespace()).count() as u32;
+            let inside: Vec<&Token> = l.tokens.iter().filter(|t| touches(&t.rect, &c.rect)).collect();
+            if placed < words || inside.is_empty() {
+                hits.push(Hit { line: i, range: 0..l.text.len(), kind: c.kind, why });
+                continue;
             }
             let byte = |scalar: u32| l.text.char_indices().nth(scalar as usize).map_or(l.text.len(), |x| x.0);
-            for t in l.tokens.iter().filter(|t| inside(&t.rect, &c.rect)) {
-                hits.push(Hit { line: i, range: byte(t.start)..byte(t.start + t.len), kind: c.kind, why: "extension" });
-            }
+            hits.extend(inside.into_iter().map(|t| Hit { line: i, range: byte(t.start)..byte(t.start + t.len), kind: c.kind, why }));
         }
     }
     hits
 }
 
 fn secret_values(lines: &[TextLine], hits: &[Hit]) -> Vec<String> {
-    let mut v: Vec<String> = hits.iter().map(|h| lines[h.line].text[h.range.clone()].trim().to_owned()).filter(|v| v.chars().count() >= 6).collect();
+    let mut v: Vec<String> = hits.iter().filter(|h| h.why != HINT).map(|h| lines[h.line].text[h.range.clone()].trim().to_owned()).filter(|v| v.chars().count() >= 6).collect();
     v.extend(lines.iter().filter(|l| l.code).flat_map(|l| detect::code_secrets(&l.text)));
     v.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
     v.dedup();
@@ -966,7 +992,7 @@ mod tests {
         let mut input = (m.len() as u32).to_ne_bytes().to_vec();
         input.extend_from_slice(m.as_bytes());
         let (mut s, sock) = (std::os::unix::net::UnixStream::pair().unwrap(), d.path().join("bridge.sock"));
-        let t = std::thread::spawn(move || bridge::forward(&mut s.1, &sock, 77));
+        let t = std::thread::spawn(move || bridge::forward(&mut s.1, std::io::sink(), &sock, 77));
         std::io::Write::write_all(&mut s.0, &input).unwrap();
         wait(|| e.page_hint(77).tabs.iter().any(|t| t.sensitive));
         assert!(e.page_hint(78).tabs.is_empty());
@@ -988,7 +1014,7 @@ mod tests {
             TextLine { text: "repeat marmot-88421 below".into(), rect: Rect { x: 0.1, y: 0.8, w: 0.5, h: 0.05 }, tokens: vec![], code: false },
         ];
         f.moment.window_title = "marmot-88421".into();
-        f.covers = vec![Cover { kind: SecretKind::Financial, rect: Rect { x: 0.33, y: 0.29, w: 0.35, h: 0.07 } }, Cover { kind: SecretKind::Other, rect: Rect { x: 0.3, y: 0.5, w: 0.4, h: 0.05 } }];
+        f.covers = vec![Cover { kind: SecretKind::Financial, rect: Rect { x: 0.33, y: 0.29, w: 0.35, h: 0.07 }, empty: false }, Cover { kind: SecretKind::Other, rect: Rect { x: 0.3, y: 0.5, w: 0.4, h: 0.05 }, empty: false }];
         e.ingest(f);
         wait(|| e.stats().unwrap().count == 1);
         let s = e.list(Filter::default(), 10, 0).unwrap().remove(0);
@@ -1009,14 +1035,14 @@ mod tests {
         let e = Engine::new(d.path().to_string_lossy().into(), config(false), Arc::new(FakeHost(Default::default()))).unwrap();
         for r in [Rect { x: f64::NAN, y: 0.0, w: 0.1, h: 0.1 }, Rect { x: 0.0, y: 0.0, w: -0.1, h: 0.1 }, Rect { x: 0.0, y: 0.0, w: f64::INFINITY, h: 0.1 }] {
             let mut f = frame(1000);
-            f.covers = vec![Cover { kind: SecretKind::Other, rect: r }];
+            f.covers = vec![Cover { kind: SecretKind::Other, rect: r, empty: false }];
             e.ingest(f);
         }
         std::thread::sleep(Duration::from_millis(800));
         assert_eq!(e.stats().unwrap().count, 0);
         // Partly off the display is ordinary: clipped.
         let mut f = frame(2000);
-        f.covers = vec![Cover { kind: SecretKind::Other, rect: Rect { x: -0.5, y: 0.9, w: 0.7, h: 0.5 } }];
+        f.covers = vec![Cover { kind: SecretKind::Other, rect: Rect { x: -0.5, y: 0.9, w: 0.7, h: 0.5 }, empty: false }];
         e.ingest(f);
         wait(|| e.stats().unwrap().count == 1);
         e.shutdown();
@@ -1129,5 +1155,61 @@ mod tests {
         e.forget(i64::MIN, i64::MAX).unwrap();
         assert!(e.dev_log(50, None).unwrap().is_empty());
         e.shutdown();
+    }
+
+    #[test]
+    fn text_touching_a_covered_place_is_hidden() {
+        let c = |empty| vec![Cover { kind: SecretKind::Password, rect: Rect { x: 0.30, y: 0.30, w: 0.30, h: 0.05 }, empty }];
+        let tok = |start, len, x: f64, w: f64| Token { start, len, rect: Rect { x, y: 0.3, w, h: 0.05 } };
+        let l = |text: &str, tokens: Vec<Token>| vec![TextLine { text: text.into(), rect: Rect { x: 0.1, y: 0.3, w: 0.8, h: 0.05 }, tokens, code: false }];
+        let hidden = |lines: &[TextLine]| { let h = covered(lines, &c(false)); detect::mask(&lines[0].text, &h.into_iter().map(|h| h.range).collect::<Vec<_>>()) };
+        // A word only partly inside.
+        assert_eq!(hidden(&l("Name quartz-otter end", vec![tok(0, 4, 0.10, 0.10), tok(5, 12, 0.55, 0.30), tok(18, 3, 0.88, 0.02)])), "Name [hidden] end");
+        // A word whose box is missing could be anywhere on the line.
+        assert_eq!(hidden(&l("Name quartz", vec![tok(0, 4, 0.10, 0.10)])), "[hidden]");
+        // The line crosses the place but no word's box does: the boxes are wrong.
+        assert_eq!(hidden(&l("Name quartz", vec![tok(0, 4, 0.10, 0.10), tok(5, 6, 0.75, 0.10)])), "[hidden]");
+        // Beside it, not in it.
+        let mut away = l("Name quartz", vec![tok(0, 4, 0.10, 0.10), tok(5, 6, 0.20, 0.09)]);
+        away[0].rect.w = 0.19;
+        assert_eq!(hidden(&away), "Name quartz");
+        // Hint text in an empty box is hidden there but isn't a secret to hunt for elsewhere.
+        let hint = l("Password", vec![tok(0, 8, 0.32, 0.1)]);
+        let mut hits = covered(&hint, &c(true));
+        let mut two = hint.clone();
+        two.push(TextLine { text: "Password reset".into(), rect: Rect { x: 0.1, y: 0.8, w: 0.3, h: 0.05 }, tokens: vec![], code: false });
+        propagate(&two, &mut hits);
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn asking_waits_for_every_connection() {
+        let d = tempfile::tempdir().unwrap();
+        let e = Engine::new(d.path().to_string_lossy().into(), config(true), Arc::new(FakeHost(Default::default()))).unwrap();
+        assert!(e.refresh_pages(77), "no extension: nothing to wait for, with or without a listener");
+        assert!(e.listen_for_pages());
+        assert!(e.refresh_pages(77));
+        let sock = d.path().join("bridge.sock");
+        use std::io::{BufRead, BufReader, Write};
+        let mut s = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+        s.write_all(b"{\"pid\":77}\n{\"v\":1,\"type\":\"tabs\",\"tabs\":[]}\n").unwrap();
+        wait(|| !e.s.outlets.get().unwrap().ask(77, 0).is_empty());
+        // Silent: not answered.
+        let t = Instant::now();
+        assert!(!e.refresh_pages(77));
+        assert!(t.elapsed() < Duration::from_secs(2));
+        let mut r = BufReader::new(s.try_clone().unwrap());
+        let h = std::thread::spawn(move || {
+            let mut line = String::new();
+            while r.read_line(&mut line).unwrap_or(0) > 0 {
+                let n = serde_json::from_str::<serde_json::Value>(&line).unwrap()["n"].as_u64().unwrap();
+                writeln!(s, "{{\"v\":1,\"type\":\"asked\",\"n\":{n}}}").unwrap();
+                line.clear();
+            }
+        });
+        assert!(e.refresh_pages(77));
+        assert!(e.refresh_pages(78));
+        e.shutdown();
+        drop(h);
     }
 }

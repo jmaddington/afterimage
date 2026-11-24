@@ -42,8 +42,6 @@ export function kindOf(el, style) {
 /** Remembers fields that were ever passwords, so "show password" doesn't turn one into ordinary text. */
 export class Watcher {
   #were = new WeakSet();
-  /** Secret fields on the page at the last look, filled in or not. */
-  candidates = 0;
   kind(el, style) {
     const k = kindOf(el, style);
     if (k === 'password') this.#were.add(el);
@@ -80,21 +78,18 @@ export function report(env, watcher) {
     v: 1, url: cleanAddress(env.url), top: env.top, width: round(env.width * ratio), height: round(env.height * ratio),
     fields: [], typing: false, unplaced: false,
   };
-  watcher.candidates = 0;
   try {
     for (const el of env.elements()) {
       const style = env.styleOf(el);
       const kind = watcher.kind(el, style);
       if (!kind) continue;
-      watcher.candidates += 1;
       if (style.display === 'none' || style.visibility === 'hidden') continue;
       const at = place(el.getBoundingClientRect(), env.width, env.height);
       if (!at) continue;
       if (el === env.focused && kind !== 'overlay') out.typing = true;
-      if (empty(el, env)) continue;
       // A frame doesn't know where it sits in the window, so it can only say that it holds something.
       if (!env.top || (env.pinch ?? 1) !== 1 || out.fields.length >= MAX_FIELDS) out.unplaced = true;
-      else out.fields.push({ kind, ...at });
+      else out.fields.push({ kind, ...at, ...(empty(el, env) ? { empty: true } : {}) });
     }
   } catch {
     out.unplaced = true;

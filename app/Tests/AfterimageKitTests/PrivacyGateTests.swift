@@ -24,7 +24,11 @@ final class FakeElement: ScreenElement {
 
 @Suite struct AccessibilityReadingTests {
     let frame = CGRect(x: 10, y: 20, width: 1000, height: 700)
-    func web(_ url: Any?) -> FakeElement { FakeElement("AXWebArea", url.map { ["AXURL": $0] } ?? [:]) }
+    func web(_ url: Any?) -> FakeElement {
+        var a: [String: Any] = ["AXPosition": CGPoint(x: 10, y: 100), "AXSize": CGSize(width: 1000, height: 600)]
+        if let url { a["AXURL"] = url }
+        return FakeElement("AXWebArea", a)
+    }
     func window(_ kids: [FakeElement], frame f: CGRect? = nil, title: String = "Page") -> FakeElement {
         let f = f ?? frame
         return FakeElement("AXWindow", ["AXTitle": title, "AXPosition": f.origin, "AXSize": f.size], children: kids)
@@ -82,15 +86,18 @@ final class FakeElement: ScreenElement {
         page.a["AXPosition"] = CGPoint(x: 10, y: 120)
         page.a["AXSize"] = CGSize(width: 1000, height: 600)
         let r = read(app([window([page, web("https://b.com")])]))
-        #expect(r.pages.map(\.url) == ["https://a.com/x"] && r.pages[0].frame == CGRect(x: 10, y: 120, width: 1000, height: 600) && r.complete)
+        #expect(r.pages.map(\.url) == ["https://a.com/x", "https://b.com"] && r.pages[0].frame == CGRect(x: 10, y: 120, width: 1000, height: 600) && r.complete)
         // No place, no entry: the engine then finds no page to put a field on and leaves the browser out.
         page.broken = ["AXPosition"]
         let bad = read(app([window([page])]))
         #expect(bad.pages.isEmpty && !bad.complete && bad.windows[0].urls == ["https://a.com/x"])
+        page.broken = []
+        page.a["AXSize"] = nil
+        #expect(!read(app([window([page])])).complete)
     }
     @Test func webContentIsNeverEntered() throws {
         let inner = FakeElement("AXButton", ["AXTitle": "page text"])
-        let page = FakeElement("AXWebArea", ["AXURL": "https://a.com"], children: [inner])
+        let page = FakeElement("AXWebArea", ["AXURL": "https://a.com", "AXPosition": CGPoint.zero, "AXSize": CGSize(width: 9, height: 9)], children: [inner])
         #expect(read(app([window([page])])).windows[0].controlLabels.isEmpty && inner.reads == 0)
     }
     @Test func tooManyElementsOrTooLongIsUnreadable() {

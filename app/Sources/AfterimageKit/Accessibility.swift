@@ -99,7 +99,9 @@ public enum Accessibility {
             let u = try e.read(kAXURLAttribute)
             let s = (u as? URL)?.absoluteString ?? (u as? String) ?? "unknown:"
             if !b.urls.contains(s) { b.urls.append(s) }
-            if let f = try frame(e) { pages.append((s, f)) }
+            // A page without a place can't have anything placed on it.
+            guard let f = try frame(e) else { throw Unreadable() }
+            pages.append((s, f))
             return []
         case "AXButton", "AXPopUpButton", "AXMenuButton", "AXStaticText", "AXImage":
             for k in [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute] {

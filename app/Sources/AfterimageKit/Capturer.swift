@@ -119,8 +119,6 @@ public actor Capturer {
 
         // Anything that became off-limits while we were looking spoils the whole frame.
         let quick = await look(exclusions, hiddenBefore, gate)
-        // Scrolling is reported a moment after it happens; give a page with secret fields time to say it moved.
-        if !hiddenBefore.covers.isEmpty { try? await Task.sleep(for: .milliseconds(450)) }
         let hiddenAfter = await hidden(exclusions)
         let after = await look(exclusions, hiddenAfter, gate)
         if let why = Self.spoiled(before, after, during: [quick], omitted: omitted) { return why }
@@ -176,9 +174,11 @@ public actor Capturer {
                     h.pids.insert(pid)
                     h.reasons[pid] = r
                 } else {
+                    // Measured now, not whenever it last changed: the same is done after the picture and must agree.
+                    let answered = engine.refreshPages(pid: pid)
                     let areas = reading.pages.map { PageArea(url: $0.url, rect: Rect(x: $0.frame.minX, y: $0.frame.minY, w: $0.frame.width, h: $0.frame.height), scale: scale(at: $0.frame)) }
                     let plan = planPage(ex: ex, hint: engine.pageHint(pid: pid), areas: areas, complete: reading.complete)
-                    if let r = plan.hide {
+                    if let r = plan.hide ?? (answered ? nil : .secretField) {
                         h.pids.insert(pid)
                         h.reasons[pid] = r
                     } else {

@@ -3,7 +3,7 @@
   const api = globalThis.browser ?? globalThis.chrome;
   const watcher = new Watcher();
   const SOON = 200, REPEAT = 4000, MOST = 20000;
-  let timer = 0, again = 0, last = '', sentAt = 0, dead = false;
+  let timer = 0, again = 0, last = '', sentAt = 0, heard = 0, dead = false;
 
   function shadow(el) {
     try {
@@ -46,6 +46,8 @@
       url: location.href, top: window === window.top, focused: focused(), ratio: devicePixelRatio,
       pinch: visualViewport?.scale ?? 1, filled,
     }, watcher);
+    // Which question this answers: a place is believed only if measured since the latest.
+    if (heard) r.n = heard;
     const s = JSON.stringify(r);
     const matters = r.fields.length > 0 || r.typing || r.unplaced;
     const now = Date.now();
@@ -59,8 +61,7 @@
       }
     }
     clearTimeout(again);
-    // Scripts and autofill change values without an event, so a page with secret fields is looked at again regardless.
-    if (matters || watcher.candidates > 0) again = setTimeout(soon, matters ? REPEAT : 1500);
+    if (matters) again = setTimeout(soon, REPEAT);
   }
   function soon() {
     if (!timer && !dead) timer = setTimeout(look, SOON);
@@ -69,6 +70,14 @@
   new MutationObserver(soon).observe(document, { subtree: true, childList: true, attributes: true, attributeFilter: ['type', 'style', 'class', 'hidden', 'name', 'id', 'autocomplete', 'src'] });
   for (const e of ['scroll', 'resize', 'focusin', 'focusout', 'input', 'change', 'load', 'transitionend', 'animationstart']) addEventListener(e, soon, { capture: true, passive: true });
   visualViewport?.addEventListener('resize', soon);
+  // The app asks just before and just after each picture.
+  api.runtime.onMessage.addListener((m, sender, reply) => {
+    if (m?.type !== 'measure' || sender.id !== api.runtime.id || !Number.isSafeInteger(m.n)) return;
+    heard = Math.max(heard, m.n);
+    clearTimeout(timer);
+    look();
+    reply(true);
+  });
   let was = document.visibilityState;
   document.addEventListener('visibilitychange', (e) => {
     const now = document.visibilityState;

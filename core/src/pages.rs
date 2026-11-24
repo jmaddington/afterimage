@@ -14,6 +14,8 @@ pub struct PageField {
     pub kind: SecretKind,
     /// Fractions of the visible page, top-left origin.
     pub rect: Rect,
+    /// Nothing typed in it yet. Covered all the same: it may be filled in between being measured and photographed.
+    pub empty: bool,
 }
 
 /// A tab with something to hide.
@@ -29,6 +31,8 @@ pub struct TabSeen {
     pub width: f64,
     pub height: f64,
     pub fields: Vec<PageField>,
+    /// Measured since the latest question was answered.
+    pub current: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, uniffi::Record)]
@@ -53,6 +57,9 @@ pub struct PageArea {
 pub struct Cover {
     pub kind: SecretKind,
     pub rect: Rect,
+    /// Holds at most a hint ("Card number"): hide it here, but don't hunt for the same words elsewhere.
+    #[uniffi(default = false)]
+    pub empty: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, uniffi::Record)]
@@ -74,7 +81,8 @@ pub fn clean_address(raw: &str) -> String {
 
 /// What to do about a browser, given what its extension says and what accessibility sees. Only ever adds hiding.
 /// AIDEV-NOTE: privacy-critical. A field is frosted in place only when exactly one visible page has its address AND that
-/// AIDEV-NOTE: page's on-screen size equals the size the extension measured. Any doubt leaves the browser out.
+/// AIDEV-NOTE: page's on-screen size equals the size the extension measured, in answer to the latest question. Any doubt
+/// AIDEV-NOTE: leaves the browser out.
 #[uniffi::export]
 pub fn plan_page(ex: &Exclusions, hint: &PageHint, areas: &[PageArea], complete: bool) -> PagePlan {
     let leave_out = |r| PagePlan { hide: Some(r), covers: vec![] };
@@ -96,13 +104,14 @@ pub fn plan_page(ex: &Exclusions, hint: &PageHint, areas: &[PageArea], complete:
         let same = |points: f64, pixels: f64| (points * area.scale - pixels).abs() <= 3.0;
         let r = area.rect;
         // NaN fails every comparison, so it lands here too.
-        let trusted = complete && !tab.sensitive && tab.urls.len() == 1 && pixels_ok(tab) && same(r.w, tab.width) && same(r.h, tab.height) && r.x.is_finite() && r.y.is_finite();
+        let trusted = complete && tab.current && !tab.sensitive && tab.urls.len() == 1 && pixels_ok(tab) && same(r.w, tab.width) && same(r.h, tab.height) && r.x.is_finite() && r.y.is_finite();
         if !trusted {
             return leave_out(HideReason::SecretField);
         }
         covers.extend(tab.fields.iter().map(|f| Cover {
             kind: f.kind,
             rect: Rect { x: r.x + f.rect.x * r.w, y: r.y + f.rect.y * r.h, w: f.rect.w * r.w, h: f.rect.h * r.h },
+            empty: f.empty,
         }));
     }
     PagePlan { hide: None, covers }
@@ -129,6 +138,8 @@ struct Frame {
     height: f64,
     fields: Vec<PageField>,
     sensitive: bool,
+    /// The latest question this frame had heard when it measured.
+    n: u64,
 }
 
 struct Tab {
@@ -142,6 +153,8 @@ struct Browser {
     frames: HashMap<(i64, i64), Frame>,
     tabs: HashMap<i64, Tab>,
     tabs_at: Option<Instant>,
+    /// The latest question every page has answered.
+    asked: u64,
     /// Something was said that couldn't be understood or remembered.
     muddled: Option<Instant>,
 }
@@ -157,6 +170,7 @@ pub struct Pages {
 enum Message {
     Page { tab: i64, frame: i64, said: Frame },
     Tabs(HashMap<i64, Tab>),
+    Asked(u64),
 }
 
 fn fresh(at: Instant, now: Instant) -> bool {
@@ -174,7 +188,7 @@ fn field(v: &Value) -> Option<PageField> {
         "card" | "account" => SecretKind::Financial,
         k => SecretKind::parse(k),
     };
-    Some(PageField { kind, rect: Rect { x: l, y: t, w: r - l, h: b - t } })
+    Some(PageField { kind, rect: Rect { x: l, y: t, w: r - l, h: b - t }, empty: v.get("empty").and_then(Value::as_bool).unwrap_or(false) })
 }
 
 fn text(v: &Value, k: &str) -> String {
@@ -197,7 +211,7 @@ fn parse(json: &str, now: Instant) -> Option<Message> {
             // A field that can't be placed is still a field; only the top page knows where it is.
             let sensitive = v.get("typing")?.as_bool()? | v.get("unplaced")?.as_bool()? | (fields.len() < raw.len()) | (frame != 0 && !raw.is_empty());
             let size = |k: &str| v.get(k).and_then(Value::as_f64).filter(|n| n.is_finite()).unwrap_or(0.0);
-            Some(Message::Page { tab, frame, said: Frame { at: now, url: text(&v, "url"), width: size("width"), height: size("height"), fields, sensitive } })
+            Some(Message::Page { tab, frame, said: Frame { at: now, url: text(&v, "url"), width: size("width"), height: size("height"), fields, sensitive, n: v.get("n").and_then(Value::as_u64).unwrap_or(0) } })
         }
         "tabs" => {
             let raw = v.get("tabs")?.as_array()?;
@@ -207,6 +221,7 @@ fn parse(json: &str, now: Instant) -> Option<Message> {
             let tab = |t: &Value| Some((t.get("tab")?.as_i64()?, Tab { active: t.get("active")?.as_bool()?, private: t.get("private")?.as_bool()?, url: text(t, "url") }));
             Some(Message::Tabs(raw.iter().map(tab).collect::<Option<_>>()?))
         }
+        "asked" => Some(Message::Asked(v.get("n")?.as_u64()?)),
         _ => None,
     }
 }
@@ -237,8 +252,17 @@ impl Pages {
                 b.tabs = tabs;
                 b.tabs_at = Some(now);
             }
+            Some(Message::Asked(n)) => {
+                b.asked = b.asked.max(n);
+                // Keeps a connection with nothing else to say from being forgotten.
+                b.tabs_at = b.tabs_at.or(Some(now));
+            }
             None => b.muddled = Some(now),
         }
+    }
+
+    pub fn answered(&self, pid: i32, source: u64, n: u64) -> bool {
+        self.browsers.get(&(pid, source)).is_some_and(|b| b.asked >= n)
     }
 
     pub fn hint(&self, pid: i32, now: Instant) -> PageHint {
@@ -257,6 +281,7 @@ impl Pages {
                 if *frame == 0 {
                     (s.width, s.height) = (f.width, f.height);
                     s.fields = f.fields.clone();
+                    s.current = b.asked > 0 && f.n >= b.asked;
                 }
             }
             for (id, mut s) in seen {
@@ -282,7 +307,7 @@ mod tests {
     use super::*;
 
     fn page(tab: i64, body: &str) -> String {
-        format!(r#"{{"v":1,"type":"page","tab":{tab},"window":1,"frame":0,"url":"https://a.com/x","width":2000,"height":1000,{body}}}"#)
+        format!(r#"{{"v":1,"type":"page","tab":{tab},"window":1,"frame":0,"url":"https://a.com/x","width":2000,"height":1000,"n":1,{body}}}"#)
     }
     const FIELD: &str = r#""fields":[{"kind":"password","x":0.1,"y":0.2,"w":0.3,"h":0.05}],"typing":false,"unplaced":false"#;
     const CLEAN: &str = r#""fields":[],"typing":false,"unplaced":false"#;
@@ -433,6 +458,7 @@ mod tests {
         for m in msgs {
             p.receive(7, 1, m, t);
         }
+        p.receive(7, 1, r#"{"v":1,"type":"asked","n":1}"#, t);
         p.hint(7, t)
     }
     fn tabs(active: bool, url: &str) -> String {
@@ -522,5 +548,47 @@ mod tests {
         assert_eq!(plan_page(&ex(), &hint_of(&[blank]), &[area("nonsense")], true).hide, Some(HideReason::SecretField));
         let file = page(3, FIELD).replace("https://a.com/x", "file:");
         assert_eq!(plan_page(&ex(), &hint_of(&[file]), &[area("file:///a"), area("file:///b")], true).hide, Some(HideReason::SecretField));
+    }
+
+    #[test]
+    fn a_place_is_trusted_only_if_measured_since_the_last_question() {
+        let asked = |n| format!(r#"{{"v":1,"type":"asked","n":{n}}}"#);
+        let measured = |n: &str| page(3, FIELD).replace("\"n\":1,", n);
+        for (msgs, want) in [
+            (vec![measured("\"n\":2,"), asked(2)], None),
+            (vec![measured("\"n\":3,"), asked(2)], None),
+            (vec![measured("\"n\":1,"), asked(2)], Some(HideReason::SecretField)),
+            (vec![measured(""), asked(2)], Some(HideReason::SecretField)),
+            (vec![measured("\"n\":2,")], Some(HideReason::SecretField)),
+        ] {
+            let (mut p, t) = (Pages::default(), Instant::now());
+            for m in &msgs {
+                p.receive(7, 1, m, t);
+            }
+            assert_eq!(plan_page(&ex(), &p.hint(7, t), &[area(URL)], true).hide, want, "{msgs:?}");
+        }
+    }
+
+    #[test]
+    fn answers_are_counted_per_connection() {
+        let asked = |n| format!(r#"{{"v":1,"type":"asked","n":{n}}}"#);
+        let (mut p, t) = (Pages::default(), Instant::now());
+        assert!(!p.answered(7, 1, 1));
+        p.receive(7, 1, &asked(1), t);
+        assert!(p.answered(7, 1, 1) && !p.answered(7, 1, 2) && !p.answered(7, 2, 1) && !p.answered(8, 1, 1));
+        p.receive(7, 1, &asked(5), t);
+        p.receive(7, 1, &asked(2), t);
+        assert!(p.answered(7, 1, 5));
+        p.receive(7, 1, r#"{"v":1,"type":"asked","n":"x"}"#, t);
+        assert!(p.hint(7, t).sensitive);
+    }
+
+    #[test]
+    fn an_empty_field_is_covered_but_its_hint_text_is_not_hunted_for() {
+        let f = FIELD.replace("\"kind\":\"password\",", "\"kind\":\"password\",\"empty\":true,");
+        let p = plan_page(&ex(), &hint_of(&[page(3, &f)]), &[area(URL)], true);
+        assert!(p.covers.len() == 1 && p.covers[0].empty);
+        let p = plan_page(&ex(), &hint_of(&[page(3, FIELD)]), &[area(URL)], true);
+        assert!(!p.covers[0].empty);
     }
 }

@@ -99,20 +99,17 @@ test('a pinch-zoomed page cannot be measured', () => {
   assert.equal(report(env([el('input', { type: 'password' })], { pinch: 1 }), new Watcher()).unplaced, false);
 });
 
-test('an empty field hides nothing but is watched', () => {
+test('an empty field is still covered, and marked', () => {
   const e = el('input', { type: 'password' }, undefined, { value: '' });
-  const w = new Watcher();
-  const r = report(env([e]), w);
-  assert.deepEqual(r.fields, []);
-  assert.equal(w.candidates, 1);
-  assert.equal(report(env([e], { focused: e }), w).typing, true);
+  const one = (over = {}) => report(env([e], over), new Watcher()).fields;
+  assert.equal(one().length, 1);
+  assert.equal(one()[0].empty, true);
+  assert.equal(report(env([e], { focused: e }), new Watcher()).typing, true);
   // The browser fills it in without telling the page what it wrote.
-  assert.equal(report(env([e], { filled: (x) => x === e }), w).fields.length, 1);
-  // Not an input, or not one whose emptiness can be known: assume it holds something.
-  assert.equal(report(env([el('div', {}, undefined, { value: undefined })], { styleOf: style({ webkitTextSecurity: 'disc' }) }), w).fields.length, 1);
-  assert.equal(report(env([], {}), w).fields.length, 0);
-  assert.equal(w.candidates, 0);
-  assert.equal(report(env([el('iframe', { src: 'chrome-extension://a/x' }, undefined, { value: '' })]), w).fields.length, 1);
+  assert.equal('empty' in one({ filled: (x) => x === e })[0], false);
+  // Emptiness that can't be known counts as full.
+  assert.equal('empty' in report(env([el('div', {}, undefined, { value: undefined })], { styleOf: style({ webkitTextSecurity: 'disc' }) }), new Watcher()).fields[0], false);
+  assert.equal('empty' in report(env([el('iframe', { src: 'chrome-extension://a/x' }, undefined, { value: '' })]), new Watcher()).fields[0], false);
 });
 
 test('typing in a secret field is reported', () => {

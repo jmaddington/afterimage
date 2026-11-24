@@ -13,6 +13,9 @@ function connect() {
     port = null;
   }
   if (!port) return retry();
+  port.onMessage.addListener((m) => {
+    if (m?.type === 'ask' && Number.isSafeInteger(m.n)) void measure(m.n);
+  });
   port.onDisconnect.addListener(() => {
     void api.runtime.lastError;
     port = null;
@@ -32,6 +35,18 @@ function send(m) {
   } catch {
     port = null;
   }
+}
+/** Every page that's showing measures itself; then the app hears that they have. */
+async function measure(n) {
+  await tabs();
+  const list = await api.tabs.query({});
+  const slow = new Promise((r) => setTimeout(r, 400, 'slow'));
+  // Pages that can't run the script (settings, stores) have nothing to say and reject at once.
+  const all = Promise.all(list.filter((t) => t.id != null && !t.discarded).map((t) =>
+    api.tabs.sendMessage(t.id, { type: 'measure', n }).then(() => true, () => true)));
+  if ((await Promise.race([all, slow])) === 'slow') return; // No answer is an answer: the app skips the picture.
+  await new Promise((r) => setTimeout(r, 40)); // Frames inside pages report in the same breath.
+  send({ type: 'asked', n });
 }
 async function tabs() {
   const list = await api.tabs.query({});
