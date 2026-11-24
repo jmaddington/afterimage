@@ -6,7 +6,10 @@ struct ViewerView: View {
     let shot: Shot
     @Environment(AppModel.self) private var model
     @State private var lines: [IndexedLine] = []
+    @State private var zoom: CGFloat = 1
+    @State private var pinchFrom: CGFloat = 1
     @AppStorage("inspector") private var inspector = true
+    @AppStorage("outlineHidden") private var outline = false
     @FocusState private var focused: Bool
 
     var body: some View {
@@ -20,15 +23,28 @@ struct ViewerView: View {
             Details(shot: shot, lines: lines).inspectorColumnWidth(min: 240, ideal: 290, max: 380)
         }
         .toolbar {
+            ToolbarItemGroup {
+                Button("Previous", systemImage: "chevron.left") { model.step(-1) }.help("Previous picture (←)").disabled(!model.canStep(-1))
+                Button("Next", systemImage: "chevron.right") { model.step(1) }.help("Next picture (→)").disabled(!model.canStep(1))
+            }
+            ToolbarItemGroup {
+                Button("Zoom Out", systemImage: "minus.magnifyingglass") { setZoom(zoom / 1.5) }.keyboardShortcut("-").disabled(zoom <= 1)
+                Button("Zoom In", systemImage: "plus.magnifyingglass") { setZoom(zoom * 1.5) }.keyboardShortcut("=").disabled(zoom >= Self.most)
+                Button("Zoom to Fit", systemImage: "arrow.up.left.and.arrow.down.right") { setZoom(1) }.keyboardShortcut("9").disabled(zoom == 1)
+            }
+            ToolbarItem {
+                Toggle("Outline Hidden Areas", systemImage: "eye.slash", isOn: $outline).help(outline ? "Stop outlining what was hidden" : "Outline what was hidden, and why")
+            }
             ToolbarItem { Button("Info", systemImage: "info.circle") { inspector.toggle() }.help(inspector ? "Hide details" : "Show details") }
         }
         .focusable().focusEffectDisabled().focused($focused)
         .onAppear { focused = true }
         .onKeyPress(.leftArrow) { model.step(-1); return .handled }
         .onKeyPress(.rightArrow) { model.step(1); return .handled }
-        .onKeyPress(.escape) { model.open = nil; return .handled }
+        .onKeyPress(.escape) { if zoom > 1 { setZoom(1) } else { model.open = nil }; return .handled }
         .onKeyPress(.space) { model.open = nil; return .handled }
         .onKeyPress(.delete) { model.askDelete([shot.id]); return .handled }
+        .onChange(of: shot.id) { zoom = 1; pinchFrom = 1 }
         .task(id: shot.id) {
             lines = []
             let id = shot.id
@@ -36,15 +52,38 @@ struct ViewerView: View {
         }
     }
 
+    private static let most: CGFloat = 8
+    private func setZoom(_ z: CGFloat) {
+        withAnimation(.smooth(duration: 0.18)) { zoom = min(max(z, 1), Self.most) }
+        pinchFrom = zoom
+    }
+
+    /// Fits the window at 1x; zoomed in, it scrolls like any document (two fingers, or the scroll bars).
     private var stage: some View {
+        GeometryReader { g in
+            let aspect = Double(max(shot.width, 1)) / Double(max(shot.height, 1))
+            let w = min(g.size.width, g.size.height * aspect)
+            ScrollView([.horizontal, .vertical]) {
+                picture
+                    .frame(width: w * zoom, height: w / aspect * zoom)
+                    .frame(minWidth: g.size.width, minHeight: g.size.height)
+            }
+            .scrollBounceBehavior(.basedOnSize, axes: [.horizontal, .vertical])
+            .scrollIndicators(zoom > 1 ? .automatic : .never)
+        }
+        .gesture(MagnifyGesture()
+            .onChanged { zoom = min(max(pinchFrom * $0.magnification, 1), Self.most) }
+            .onEnded { _ in pinchFrom = zoom })
+    }
+
+    private var picture: some View {
         Picture(path: shot.path, edge: 2880)
             .id(shot.id)
-            .aspectRatio(Double(max(shot.width, 1)) / Double(max(shot.height, 1)), contentMode: .fit)
             .overlay { GeometryReader { g in marks(g.size) } }
-            .clipShape(.rect(cornerRadius: 12))
-            .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(.primary.opacity(0.1)) }
+            .clipShape(.rect(cornerRadius: 12 / zoom))
+            .overlay { RoundedRectangle(cornerRadius: 12 / zoom).strokeBorder(.primary.opacity(0.1)) }
             .shadow(color: .black.opacity(0.2), radius: 20, y: 8)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .onTapGesture(count: 2) { setZoom(zoom > 1 ? 1 : 2.5) }
             .contextMenu { ShotMenu(shot: shot) }
             .accessibilityLabel(shot.description.isEmpty ? "Screenshot of \(shot.moment.appName)" : shot.description)
     }
@@ -58,10 +97,17 @@ struct ViewerView: View {
                     .offset(x: r.x * size.width - 4, y: r.y * size.height - 3)
             }
             ForEach(Array(shot.regions.enumerated()), id: \.offset) { _, g in
-                Color.clear.contentShape(.rect)
-                    .frame(width: g.rect.w * size.width, height: g.rect.h * size.height)
-                    .offset(x: g.rect.x * size.width, y: g.rect.y * size.height)
-                    .help("\(Words.kind(g.kind)) hidden")
+                Group {
+                    if outline {
+                        RoundedRectangle(cornerRadius: 3).strokeBorder(Color.orange, style: StrokeStyle(lineWidth: 1.5, dash: [5, 3]))
+                    } else {
+                        Color.clear
+                    }
+                }
+                .contentShape(.rect)
+                .frame(width: g.rect.w * size.width, height: g.rect.h * size.height)
+                .offset(x: g.rect.x * size.width, y: g.rect.y * size.height)
+                .help(["\(Words.kind(g.kind)) hidden", Words.why(g.why)].filter { !$0.isEmpty }.joined(separator: ". "))
             }
         }
         .allowsHitTesting(true)
@@ -133,7 +179,13 @@ struct Details: View {
                 if shot.regions.isEmpty {
                     Text("No secrets found").foregroundStyle(.secondary)
                 } else {
-                    ForEach(kinds, id: \.0) { k, n in LabeledContent(Words.kind(k), value: n == 1 ? "Hidden" : "\(n) hidden") }
+                    ForEach(reasons, id: \.0) { key, kind, why, n in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(n == 1 ? Words.kind(kind) : "\(Words.kind(kind)) × \(n)")
+                            if !why.isEmpty { Text(Words.why(why)).font(.callout).foregroundStyle(.secondary) }
+                        }
+                        .accessibilityElement(children: .combine)
+                    }
                 }
                 LabeledContent("Checked by", value: shot.aiChecked ? "Local model and rules" : "Rules only")
             }
@@ -159,7 +211,11 @@ struct Details: View {
         }
         .formStyle(.grouped).scrollContentBackground(.hidden)
     }
-    private var kinds: [(String, Int)] { Dictionary(grouping: shot.regions, by: \.kind).map { ($0.key, $0.value.count) }.sorted { $0.0 < $1.0 } }
+    /// One row per kind and reason, most common first.
+    private var reasons: [(String, String, String, Int)] {
+        Dictionary(grouping: shot.regions) { "\($0.kind)|\($0.why)" }
+            .map { ($0.key, $0.value[0].kind, $0.value[0].why, $0.value.count) }.sorted { ($1.3, $0.0) < ($0.3, $1.0) }
+    }
     private func row(_ k: String, _ v: String) -> some View {
         LabeledContent(k) { Text(v).textSelection(.enabled).multilineTextAlignment(.trailing).lineLimit(4) }
     }

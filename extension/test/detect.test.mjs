@@ -88,6 +88,30 @@ test('too many fields, or a page that will not be read, is unplaced', () => {
   assert.equal(report(env([bad]), new Watcher()).unplaced, true);
 });
 
+test('the size of the page is reported in device pixels', () => {
+  const r = report(env([el('input', { type: 'password' })], { ratio: 2 }), new Watcher());
+  assert.deepEqual([r.width, r.height], [2000, 1600]);
+});
+
+test('a pinch-zoomed page cannot be measured', () => {
+  assert.equal(report(env([el('input', { type: 'password' })], { pinch: 1.5 }), new Watcher()).unplaced, true);
+  assert.equal(report(env([], { pinch: 1.5 }), new Watcher()).unplaced, false);
+  assert.equal(report(env([el('input', { type: 'password' })], { pinch: 1 }), new Watcher()).unplaced, false);
+});
+
+test('an empty field is still covered, and marked', () => {
+  const e = el('input', { type: 'password' }, undefined, { value: '' });
+  const one = (over = {}) => report(env([e], over), new Watcher()).fields;
+  assert.equal(one().length, 1);
+  assert.equal(one()[0].empty, true);
+  assert.equal(report(env([e], { focused: e }), new Watcher()).typing, true);
+  // The browser fills it in without telling the page what it wrote.
+  assert.equal('empty' in one({ filled: (x) => x === e })[0], false);
+  // Emptiness that can't be known counts as full.
+  assert.equal('empty' in report(env([el('div', {}, undefined, { value: undefined })], { styleOf: style({ webkitTextSecurity: 'disc' }) }), new Watcher()).fields[0], false);
+  assert.equal('empty' in report(env([el('iframe', { src: 'chrome-extension://a/x' }, undefined, { value: '' })]), new Watcher()).fields[0], false);
+});
+
 test('typing in a secret field is reported', () => {
   const e = el('input', { type: 'password' });
   assert.equal(report(env([e], { focused: e }), new Watcher()).typing, true);

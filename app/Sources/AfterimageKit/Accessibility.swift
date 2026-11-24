@@ -21,6 +21,8 @@ public enum Accessibility {
     public struct Reading: Sendable {
         public var windows: [BrowserWindow] = []
         public var focusedURL: String?
+        /// Every page whose place on screen could be read.
+        public var pages: [(url: String, frame: CGRect)] = []
         /// False when anything couldn't be read. What was read still counts against the browser.
         public var complete = true
     }
@@ -59,7 +61,7 @@ public enum Accessibility {
             // Unknown counts as not minimised.
             if attempt({ try w.read(kAXMinimizedAttribute) as? Bool ?? false }) == true { continue }
             var b = BrowserWindow(title: nil, urls: [], controlLabels: [], fieldDescriptions: [])
-            _ = attempt { try fill(&b, w, deadline: deadline) }
+            _ = attempt { try fill(&b, &r.pages, w, deadline: deadline) }
             seen.append((w, b, attempt { try frame(w) } ?? nil))
         }
         // A window the server is drawing that accessibility didn't show us could hold anything.
@@ -73,7 +75,7 @@ public enum Accessibility {
         return r
     }
 
-    private static func fill<E: ScreenElement>(_ b: inout BrowserWindow, _ w: E, deadline: Date) throws {
+    private static func fill<E: ScreenElement>(_ b: inout BrowserWindow, _ pages: inout [(url: String, frame: CGRect)], _ w: E, deadline: Date) throws {
         b.title = try w.read(kAXTitleAttribute) as? String
         if let d = try w.read(kAXDocumentAttribute) as? String, d.contains(":") { b.urls.append(d) }
         // Breadth-first over the window's furniture. Web content itself is never entered.
@@ -85,18 +87,21 @@ public enum Accessibility {
             guard Date() < deadline, i < 900 else { throw Unreadable() }
             let e = queue[i]
             i += 1
-            do { queue.append(contentsOf: try visit(e, &b)) } catch { failed = true }
+            do { queue.append(contentsOf: try visit(e, &b, &pages)) } catch { failed = true }
         }
         if failed { throw Unreadable() }
     }
 
     /// Note what this element says and return what's inside it.
-    private static func visit<E: ScreenElement>(_ e: E, _ b: inout BrowserWindow) throws -> [E] {
+    private static func visit<E: ScreenElement>(_ e: E, _ b: inout BrowserWindow, _ pages: inout [(url: String, frame: CGRect)]) throws -> [E] {
         switch try role(e) {
         case "AXWebArea":
             let u = try e.read(kAXURLAttribute)
             let s = (u as? URL)?.absoluteString ?? (u as? String) ?? "unknown:"
             if !b.urls.contains(s) { b.urls.append(s) }
+            // A page without a place can't have anything placed on it.
+            guard let f = try frame(e) else { throw Unreadable() }
+            pages.append((s, f))
             return []
         case "AXButton", "AXPopUpButton", "AXMenuButton", "AXStaticText", "AXImage":
             for k in [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute] {

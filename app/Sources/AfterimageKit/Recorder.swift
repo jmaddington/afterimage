@@ -48,8 +48,8 @@ import Observation
         on(ws, NSWorkspace.sessionDidBecomeActiveNotification) { $0.woke() }
         on(DistributedNotificationCenter.default(), .init("com.apple.screenIsUnlocked")) { $0.woke() }
         on(DistributedNotificationCenter.default(), .init("com.apple.screenIsLocked")) { $0.policy.clear() }
-        let t = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in MainActor.assumeIsolated { self?.tick() } }
-        t.tolerance = 0.15
+        let t = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in MainActor.assumeIsolated { self?.tick() } }
+        t.tolerance = 0.08
         RunLoop.main.add(t, forMode: .common)
         timer = t
         Task { [capturer] in
@@ -140,8 +140,19 @@ import Observation
         let all = settings.allDisplays, generation = policy.generation
         engine.setConditions(onPower: Session.onPower, calm: Session.calm)
         Task {
-            let r = await capturer.capture(t, allDisplays: all) { self.gate() }
+            let (r, refused) = await capturer.capture(t, allDisplays: all) { self.gate() }
             capturing = false
+            if settings.developer {
+                let refusal = refused.map(Capturer.logPhrase)
+                let what: String = switch r {
+                case .queued(let n): n == 1 ? "Taken" : "Taken (\(n) displays)"
+                case .unchanged: "Nothing had changed"
+                case .skipped(let why): "Skipped, will retry: \(refusal ?? why)"
+                case .blocked(let why): "Not taken: \(refusal ?? why)"
+                case .failed(let why): "Failed: \(why)"
+                }
+                Task.detached { [engine] in engine.noteCapture(trigger: t.rawValue, outcome: what) }
+            }
             switch r {
             case .queued:
                 failures = 0
@@ -166,7 +177,7 @@ import Observation
     }
 
     private func pollWindow() {
-        guard Date().timeIntervalSince(lastWindowPoll) >= 1 else { return }
+        guard Date().timeIntervalSince(lastWindowPoll) >= 0.5 else { return }
         lastWindowPoll = Date()
         guard let app = NSWorkspace.shared.frontmostApplication else { return }
         let w = OnScreenWindow.front(of: app.processIdentifier, in: OnScreenWindow.all())

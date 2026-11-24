@@ -79,6 +79,17 @@ enum Words {
         default: "Secret"
         }
     }
+    /// What found a hidden spot, from the engine's short names.
+    static func why(_ w: String) -> String {
+        let names = ["model": "the local model", "extension": "the browser extension", "empty-field": "an empty secret field", "code": "a QR or bar code",
+                     "label": "the label beside it", "assignment": "a name = value rule", "card": "the card number rule", "ssn": "the Social Security rule",
+                     "iban": "the IBAN rule", "account": "the account number rule", "cvv": "the security code rule", "phrase": "“password is…”",
+                     "flag": "a command-line flag", "bearer": "an authorization header", "url-login": "a login inside an address", "setup-code": "a setup code",
+                     "known-key": "a known key format", "random": "its random look", "private-key": "a private key block", "wrapped": "the key it continues",
+                     "repeated": "the same secret elsewhere"]
+        let parts = w.split(separator: ",").map { names[String($0)] ?? String($0) }
+        return parts.isEmpty ? "" : "Found by " + parts.formatted(.list(type: .and))
+    }
     static func bytes(_ n: UInt64) -> String { Int64(n).formatted(.byteCount(style: .file)) }
     static func count(_ n: Int, _ one: String, _ many: String) -> String { n == 1 ? "1 \(one)" : "\(n.formatted()) \(many)" }
 }

@@ -17,6 +17,26 @@ pub struct AppRef {
 pub struct Region {
     pub kind: String,
     pub rect: Rect,
+    /// What hid it, e.g. "card" or "model,label". Empty on pictures from before this was kept.
+    #[serde(default)]
+    pub why: String,
+}
+
+/// One line of the developer log. Text is redacted before it gets here.
+#[derive(Debug, Clone, Default, uniffi::Record)]
+pub struct DevEntry {
+    pub id: i64,
+    /// Milliseconds since 1970.
+    pub at: i64,
+    pub shot_id: Option<i64>,
+    /// "check", "describe", "embed", "load", "unload", "capture".
+    pub kind: String,
+    pub model: String,
+    pub ms: u64,
+    pub ok: bool,
+    pub note: String,
+    pub request: String,
+    pub response: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, uniffi::Record)]
@@ -179,6 +199,11 @@ impl Store {
              CREATE INDEX IF NOT EXISTS shots_app ON shots(bundle_id, taken_at);
              CREATE INDEX IF NOT EXISTS shots_todo ON shots(id) WHERE indexed=0;
              CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(title, description, body, app, tokenize='unicode61 remove_diacritics 2');
+             CREATE TABLE IF NOT EXISTS dev(
+               id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, shot_id INTEGER REFERENCES shots(id) ON DELETE CASCADE,
+               kind TEXT NOT NULL, model TEXT NOT NULL, ms INTEGER NOT NULL, ok INTEGER NOT NULL, note TEXT NOT NULL,
+               request TEXT NOT NULL, response TEXT NOT NULL);
+             CREATE INDEX IF NOT EXISTS dev_shot ON dev(shot_id);
              INSERT INTO fts(fts, rank) VALUES('secure-delete', 1);
              PRAGMA user_version=1;",
         )?;
@@ -364,6 +389,39 @@ impl Store {
         Ok((n, failed))
     }
 
+    pub fn dev_add(&self, e: &DevEntry) -> Res<()> {
+        self.db
+            .execute("INSERT INTO dev(at,shot_id,kind,model,ms,ok,note,request,response) VALUES(?,?,?,?,?,?,?,?,?)",
+                params![e.at, e.shot_id, e.kind, e.model, e.ms as i64, e.ok, e.note, e.request, e.response])
+            .map(|_| ())
+    }
+
+    /// Newest first; `before` is the last id of the previous page.
+    pub fn dev_list(&self, limit: u32, before: Option<i64>) -> Res<Vec<DevEntry>> {
+        let mut st = self.db.prepare("SELECT id,at,shot_id,kind,model,ms,ok,note,request,response FROM dev WHERE id<? ORDER BY id DESC LIMIT ?")?;
+        st.query_map(params![before.unwrap_or(i64::MAX), limit], |r| {
+            Ok(DevEntry { id: r.get(0)?, at: r.get(1)?, shot_id: r.get(2)?, kind: r.get(3)?, model: r.get(4)?, ms: r.get::<_, i64>(5)? as u64,
+                          ok: r.get(6)?, note: r.get(7)?, request: r.get(8)?, response: r.get(9)? })
+        })?
+        .collect()
+    }
+
+    fn dev_delete(&self, sql: &str, p: impl rusqlite::Params) -> Res<()> {
+        if self.db.execute(sql, p)? > 0 {
+            let _ = self.db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+        }
+        Ok(())
+    }
+    pub fn dev_forget(&self, from: i64, to: i64) -> Res<()> {
+        self.dev_delete("DELETE FROM dev WHERE at>=? AND at<?", [from, to])
+    }
+    pub fn dev_clear(&self) -> Res<()> {
+        self.dev_delete("DELETE FROM dev", [])
+    }
+    pub fn dev_trim(&self, now_ms: i64, days: i64, most: i64) -> Res<()> {
+        self.dev_delete("DELETE FROM dev WHERE at<? OR id NOT IN (SELECT id FROM dev ORDER BY id DESC LIMIT ?)", [now_ms - days * 86_400_000, most])
+    }
+
     /// Ids that retention says must go: older than `max_age_days`, then oldest-first until under `max_bytes`.
     pub fn expired(&self, now_ms: i64, max_age_days: u32, max_bytes: u64) -> Res<Vec<i64>> {
         let mut out = Vec::new();
@@ -376,7 +434,8 @@ impl Store {
             let gone: std::collections::HashSet<i64> = out.iter().copied().collect();
             let mut st = self.db.prepare("SELECT id,bytes,kept FROM shots ORDER BY taken_at")?;
             let rows: Vec<(i64, i64, bool)> = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Res<_>>()?;
-            let mut total: i64 = rows.iter().filter(|r| !gone.contains(&r.0)).map(|r| r.1).sum();
+            // Kept pictures are never removed, so they aren't counted: otherwise enough of them would cost every new one.
+            let mut total: i64 = rows.iter().filter(|r| !gone.contains(&r.0) && !r.2).map(|r| r.1).sum();
             for (id, b, kept) in rows {
                 if total <= max_bytes as i64 {
                     break;
@@ -426,8 +485,8 @@ mod erased {
     }
 }
 
-pub fn region(kind: SecretKind, rect: Rect) -> Region {
-    Region { kind: kind.as_str().into(), rect }
+pub fn region(kind: SecretKind, rect: Rect, why: &str) -> Region {
+    Region { kind: kind.as_str().into(), rect, why: why.into() }
 }
 
 #[cfg(test)]
@@ -487,7 +546,9 @@ mod tests {
         s.set_kept(&ids[..1], true).unwrap();
         let now = 5 * day;
         assert_eq!(s.expired(now, 2, 0).unwrap(), vec![ids[1]]);
-        assert_eq!(s.expired(now, 0, 250).unwrap(), vec![ids[1], ids[2]]);
+        // 300 bytes can go; the kept 100 are outside the budget.
+        assert_eq!(s.expired(now, 0, 250).unwrap(), vec![ids[1]]);
+        assert_eq!(s.expired(now, 0, 150).unwrap(), vec![ids[1], ids[2]]);
         assert_eq!(s.expired(now, 0, 0).unwrap(), Vec::<i64>::new());
     }
 
@@ -504,5 +565,59 @@ mod tests {
         std::fs::write(d.path().join("Shots/stray.heic"), "x").unwrap();
         assert_eq!(s.sweep_orphans().unwrap(), 1);
         assert!(d.path().join("Shots/1.heic").exists());
+    }
+
+    #[test]
+    fn the_developer_log_goes_when_its_picture_does() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = Store::open(d.path()).unwrap();
+        let mk = |s: &mut Store, at: i64| s.insert(&NewShot { moment: Moment { taken_at: at, ..Default::default() }, path: format!("Shots/{at}"), thumb_path: format!("Shots/{at}t"), width: 1, height: 1, bytes: 1, regions: vec![], lines: vec![], ai_checked: true }).unwrap();
+        let (a, b) = (mk(&mut s, 100), mk(&mut s, 200));
+        let e = |shot, at| DevEntry { shot_id: shot, at, kind: "check".into(), request: format!("zebra{at}"), ..Default::default() };
+        for (shot, at) in [(Some(a), 150), (Some(b), 250), (None, 300)] {
+            s.dev_add(&e(shot, at)).unwrap();
+        }
+        // Newest first, in pages.
+        let all = s.dev_list(10, None).unwrap();
+        assert_eq!(all.iter().map(|x| x.at).collect::<Vec<_>>(), vec![300, 250, 150]);
+        assert_eq!(s.dev_list(1, Some(all[0].id)).unwrap()[0].at, 250);
+        s.delete(&[a]).unwrap();
+        assert_eq!(s.dev_list(10, None).unwrap().len(), 2);
+        // A picture that's already gone takes no more notes.
+        assert!(s.dev_add(&e(Some(a), 400)).is_err());
+        s.dev_forget(240, 260).unwrap();
+        assert_eq!(s.dev_list(10, None).unwrap().iter().map(|x| x.at).collect::<Vec<_>>(), vec![300]);
+        s.dev_clear().unwrap();
+        assert!(s.dev_list(10, None).unwrap().is_empty());
+        drop(s);
+        let raw: Vec<u8> = ["index.sqlite", "index.sqlite-wal"].iter().flat_map(|f| std::fs::read(d.path().join(f)).unwrap_or_default()).collect();
+        assert!(!String::from_utf8_lossy(&raw).contains("zebra"));
+    }
+
+    #[test]
+    fn the_developer_log_is_bounded() {
+        let d = tempfile::tempdir().unwrap();
+        let s = Store::open(d.path()).unwrap();
+        let now = 100 * 86_400_000;
+        for i in 0..30 {
+            s.dev_add(&DevEntry { at: now - i * 86_400_000, ..Default::default() }).unwrap();
+        }
+        s.dev_trim(now, 7, 1000).unwrap();
+        assert_eq!(s.dev_list(100, None).unwrap().len(), 8);
+        s.dev_trim(now, 7, 3).unwrap();
+        assert_eq!(s.dev_list(100, None).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn kept_pictures_over_the_limit_do_not_cost_every_new_one() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = Store::open(d.path()).unwrap();
+        let mut mk = |at: i64, bytes: u64| s.insert(&NewShot { moment: Moment { taken_at: at, ..Default::default() }, path: format!("Shots/{at}"), thumb_path: format!("Shots/{at}t"), width: 1, height: 1, bytes, regions: vec![], lines: vec![], ai_checked: true }).unwrap();
+        let (a, b, c, e) = (mk(1, 100), mk(2, 100), mk(3, 10), mk(4, 60));
+        s.set_kept(&[a, b], true).unwrap();
+        // Kept ones are outside the budget: only what can be removed is counted against it.
+        assert_eq!(s.expired(10, 0, 150).unwrap(), Vec::<i64>::new());
+        assert_eq!(s.expired(10, 0, 65).unwrap(), vec![c]);
+        let _ = e;
     }
 }

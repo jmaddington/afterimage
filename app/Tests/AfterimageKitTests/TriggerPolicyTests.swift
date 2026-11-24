@@ -32,8 +32,8 @@ import Testing
         var p = TriggerPolicy()
         p.captured(at: 100)
         p.event(.app, at: 100.5)
-        #expect(p.due(at: 102) == nil)
-        #expect(p.due(at: 104.1) == .app)
+        #expect(p.due(at: 101) == nil)
+        #expect(p.due(at: 101.6) == .app)
     }
     @Test func titleChangesAreRateLimited() {
         var p = TriggerPolicy()
@@ -99,6 +99,27 @@ import Testing
     }
 }
 
+@Suite struct SwitchingTests {
+    /// Switching every two seconds, as someone looking for something does: each stop is captured.
+    @Test func everySwitchTwoSecondsApartIsCaptured() {
+        var p = TriggerPolicy(); p.interval = 0
+        var taken: [Double] = []
+        for step in 0..<200 {
+            let t = 100 + Double(step) * 0.1
+            if step % 20 == 0 { p.event(.window, at: t) }
+            if p.due(at: t) != nil { p.captured(at: t); taken.append(t) }
+        }
+        #expect(taken.count == 10, "\(taken)")
+        #expect(zip(taken, 0...).allSatisfy { $0 - (100 + Double($1) * 2) < 1 })
+    }
+    @Test func rapidFlickingIsOneCaptureOfWhereItEnded() {
+        var p = TriggerPolicy(); p.interval = 0
+        for i in 0..<6 { p.event(.app, at: 100 + Double(i) * 0.2) }
+        #expect(p.due(at: 101.1) == nil)
+        #expect(p.due(at: 101.6) == .app)
+    }
+}
+
 @Suite struct FrontWindowTests {
     func w(_ id: CGWindowID, _ title: String, _ width: Double = 900, _ height: Double = 700, layer: Int = 0, alpha: Double = 1, pid: pid_t = 5) -> OnScreenWindow {
         OnScreenWindow(id: id, pid: pid, title: title, layer: layer, bounds: CGRect(x: 0, y: 0, width: width, height: height), alpha: alpha)
@@ -155,5 +176,48 @@ import Testing
         s.recording = false
         s.finishOnboarding()
         #expect(s.recording && s.onboarded && AppSettings(d).recording && AppSettings(d).onboarded)
+    }
+}
+
+@Suite struct BrowserLinkTests {
+    let dir = FileManager.default.temporaryDirectory.appending(path: "afterimage-link-\(UUID())")
+    func chrome() -> URL { dir.appending(path: "Google/Chrome") }
+
+    @Test func connectingWritesAHostFileTheBrowserWillAccept() throws {
+        try FileManager.default.createDirectory(at: chrome(), withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let link = BrowserLink(support: dir, bridge: "/Applications/Afterimage.app/Contents/MacOS/afterimage-bridge")
+        let b = try #require(link.browsers.first { $0.name == "Google Chrome" })
+        #expect(b.installed && !link.isConnected(b))
+        try link.connect(b)
+        #expect(link.isConnected(b))
+        let f = chrome().appending(path: "NativeMessagingHosts/com.jmaddington.afterimage.json")
+        let j = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: f)) as? [String: Any])
+        #expect(j["name"] as? String == "com.jmaddington.afterimage" && j["type"] as? String == "stdio")
+        #expect(j["path"] as? String == "/Applications/Afterimage.app/Contents/MacOS/afterimage-bridge")
+        #expect(j["allowed_origins"] as? [String] == ["chrome-extension://\(BrowserLink.chromeExtensionID)/"])
+        // Moved app: the old path no longer counts.
+        #expect(!BrowserLink(support: dir, bridge: "/elsewhere/afterimage-bridge").isConnected(b))
+        try link.disconnect(b)
+        #expect(!link.isConnected(b) && !FileManager.default.fileExists(atPath: f.path))
+    }
+    @Test func firefoxNamesTheExtensionNotAnOrigin() throws {
+        try FileManager.default.createDirectory(at: dir.appending(path: "Mozilla"), withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let link = BrowserLink(support: dir, bridge: "/x/afterimage-bridge")
+        let b = try #require(link.browsers.first { $0.name == "Firefox" })
+        try link.connect(b)
+        let j = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: dir.appending(path: "Mozilla/NativeMessagingHosts/com.jmaddington.afterimage.json"))) as? [String: Any])
+        #expect(j["allowed_extensions"] as? [String] == ["afterimage@jmaddington.com"] && j["allowed_origins"] == nil)
+    }
+    @Test func browsersThatAreNotThereAreNotOffered() {
+        let link = BrowserLink(support: dir, bridge: "/x/afterimage-bridge")
+        #expect(link.browsers.allSatisfy { !$0.installed })
+        #expect(throws: (any Error).self) { try link.connect(link.browsers[0]) }
+    }
+    @Test func theIDMatchesTheExtensionsKey() throws {
+        let m = URL(fileURLWithPath: #filePath).deletingLastPathComponent().appending(path: "../../../extension/host.chrome.json").standardizedFileURL
+        let j = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: m)) as? [String: Any])
+        #expect(j["allowed_origins"] as? [String] == ["chrome-extension://\(BrowserLink.chromeExtensionID)/"])
     }
 }

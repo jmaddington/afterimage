@@ -5,7 +5,9 @@
   "description": "Tells the Afterimage app where passwords and account numbers are, so it never photographs them. Nothing leaves your Mac.",
   "permissions": [
     "nativeMessaging",
-    "tabs"
+    "tabs",
+    "webNavigation",
+    "scripting"
   ],
   "host_permissions": [
     "<all_urls>"

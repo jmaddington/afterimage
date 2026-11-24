@@ -104,6 +104,12 @@ extension Shot {
         }
         reload()
         Task.detached { [engine] in _ = engine.listenForPages() }
+        // Any app registered to open web pages is treated as a browser, known to us or not. Checked again whenever an
+        // app opens: it may have been installed since.
+        registerWebApps()
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.registerWebApps() }
+        }
         if settings.onboarded { recorder.start() }
         #if DEBUG
         stage(ProcessInfo.processInfo.environment["AFTERIMAGE_STAGE"] ?? "")
@@ -114,6 +120,19 @@ extension Shot {
                 try? await Task.sleep(for: .seconds(8))
             }
         }
+    }
+
+    private func registerWebApps() {
+        guard let page = URL(string: "https://example.com") else { return }
+        registerBrowsers(bundleIds: NSWorkspace.shared.urlsForApplications(toOpen: page).compactMap { Bundle(url: $0)?.bundleIdentifier }.filter { $0 != Bundle.main.bundleIdentifier })
+    }
+
+    /// Arrow keys in the grid: sideways by one, up and down by a row.
+    func moveSelection(by n: Int) {
+        guard !shots.isEmpty else { return }
+        let at = shots.firstIndex { selection.contains($0.id) }
+        let to = at.map { min(max($0 + n, 0), shots.count - 1) } ?? 0
+        selection = [shots[to].id]
     }
 
     func finishOnboarding() {
@@ -218,6 +237,18 @@ extension Shot {
     }
 
     var openShot: Shot? { open.flatMap { id in shots.first { $0.id == id } } }
+    func canStep(_ by: Int) -> Bool {
+        guard let id = open, let i = shots.firstIndex(where: { $0.id == id }) else { return false }
+        return shots.indices.contains(i + by)
+    }
+    /// From the developer log: show this picture wherever the person was.
+    func show(_ id: Int64) {
+        query = ""
+        place = .all
+        selection = [id]
+        open = id
+        reload()
+    }
     func step(_ by: Int) {
         guard let id = open, let i = shots.firstIndex(where: { $0.id == id }), shots.indices.contains(i + by) else { return }
         open = shots[i + by].id

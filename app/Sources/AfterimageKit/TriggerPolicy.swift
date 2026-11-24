@@ -10,10 +10,12 @@ public enum Trigger: String, CaseIterable, Sendable {
 /// Decides when a burst of events becomes one capture. Pure, so it can be tested without a screen.
 public struct TriggerPolicy: Sendable {
     /// Quiet time after the last event, so animations finish.
-    public var settle: TimeInterval = 0.8
+    public var settle: TimeInterval = 0.5
     /// A busy stretch is captured at least this often, settled or not.
-    public var patience: TimeInterval = 3
-    public var minGap: TimeInterval = 4
+    public var patience: TimeInterval = 2
+    public var minGap: TimeInterval = 1.2
+    /// What was in the way needs longer than a switch does.
+    public var retryGap: TimeInterval = 3
     /// Title changes are chatty (terminals, players), so they get a longer leash.
     public var titleGap: TimeInterval = 15
     /// Zero turns the timer off.
@@ -44,7 +46,7 @@ public struct TriggerPolicy: Sendable {
         if let p = pending {
             if p == .manual { return p }
             let settled = now - last >= settle || now - first >= patience
-            let gap = p == .tab && !retrying ? titleGap : minGap
+            let gap = retrying ? retryGap : p == .tab ? titleGap : minGap
             if settled && (lastCapture.map { now - $0 >= gap } ?? true) { return p }
         }
         if interval > 0, enabled.contains(.interval), let l = lastCapture, now - l >= interval { return .interval }

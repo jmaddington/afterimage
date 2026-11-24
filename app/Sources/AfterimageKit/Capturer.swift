@@ -17,6 +17,8 @@ public enum CaptureOutcome: Sendable, Equatable {
 public actor Capturer {
     private let engine: Engine
     private var busy = false
+    /// Why the last capture was refused on privacy grounds, for a log that mustn't name the app.
+    private var lastRefusal: HideReason?
     public init(engine: Engine) { self.engine = engine }
 
     /// Asked of the recorder each time: why not to look right now (nil to go ahead), and what is off-limits.
@@ -26,6 +28,8 @@ public actor Capturer {
         var pids: Set<pid_t> = []
         var reasons: [pid_t: HideReason] = [:]
         var focusedURL: [pid_t: String] = [:]
+        /// Places to frost, by app, in screen points.
+        var covers: [pid_t: [Cover]] = [:]
     }
 
     /// Everything that bears on whether a picture may be kept, at one instant.
@@ -35,6 +39,7 @@ public actor Capturer {
         var front: pid_t?
         var hidden: Set<pid_t>
         var drawn: Set<pid_t>
+        var covers: [pid_t: [Cover]] = [:]
     }
 
     /// Why a picture taken between these looks can't be kept, or nil.
@@ -43,6 +48,9 @@ public actor Capturer {
         if let b = all.lazy.compactMap(\.blocked).first { return .blocked(b) }
         if all.contains(where: { $0.exclusions != before.exclusions }) { return .blocked("Your settings changed mid-capture") }
         if all.contains(where: { $0.front != before.front }) { return .skipped("The app changed mid-capture") }
+        // A field that moved may have been photographed anywhere in between.
+        let covers = all.map { $0.covers.filter { !omitted.contains($0.key) && !$0.value.isEmpty } }
+        if covers.contains(where: { $0 != covers[0] }) { return .skipped("The page moved mid-capture") }
         // Off-limits at any instant and drawn at any instant: they needn't be the same one.
         let hidden = all.reduce(into: Set<pid_t>()) { $0.formUnion($1.hidden) }
         let drawn = all.reduce(into: Set<pid_t>()) { $0.formUnion($1.drawn) }
@@ -54,7 +62,7 @@ public actor Capturer {
         let front = await MainActor.run { NSWorkspace.shared.frontmostApplication?.processIdentifier }
         // Status items and slivers can't show anything worth hiding.
         let drawn = OnScreenWindow.all().filter { $0.bounds.width > 48 && $0.bounds.height > 48 }.map(\.pid)
-        return Look(blocked: Session.isLocked ? "The screen is locked" : g.blocked, exclusions: g.exclusions, front: front, hidden: hidden.pids, drawn: Set(drawn))
+        return Look(blocked: Session.isLocked ? "The screen is locked" : g.blocked, exclusions: g.exclusions, front: front, hidden: hidden.pids, drawn: Set(drawn), covers: hidden.covers)
     }
 
     /// Vision's first request loads a model and can take a while; get it over with before it matters.
@@ -64,11 +72,18 @@ public actor Capturer {
         _ = try? Recognizer.lines(in: i)
     }
 
-    public func capture(_ trigger: Trigger, allDisplays: Bool, gate: @escaping Gate) async -> CaptureOutcome {
+    /// The outcome, and when it was a privacy refusal, which kind (for a log that mustn't name the app).
+    public func capture(_ trigger: Trigger, allDisplays: Bool, gate: @escaping Gate) async -> (outcome: CaptureOutcome, refusal: HideReason?) {
         // Actors are re-entrant across awaits; without this two cycles could mix one's pixels with the other's facts.
-        guard !busy else { return .blocked("Busy") }
+        guard !busy else { return (.blocked("Busy"), nil) }
         busy = true
         defer { busy = false }
+        lastRefusal = nil
+        let outcome = await run(trigger, allDisplays: allDisplays, gate: gate)
+        return (outcome, lastRefusal)
+    }
+
+    private func run(_ trigger: Trigger, allDisplays: Bool, gate: @escaping Gate) async -> CaptureOutcome {
 
         let front = await MainActor.run { NSWorkspace.shared.frontmostApplication.map { ($0.processIdentifier, $0.localizedName ?? "", $0.bundleIdentifier ?? "") } }
         guard let front else { return .skipped("No app is in front") }
@@ -76,7 +91,10 @@ public actor Capturer {
 
         let exclusions = await gate().exclusions
         var hiddenBefore = await hidden(exclusions)
-        if hiddenBefore.pids.contains(front.0) { return Self.refused(hiddenBefore.reasons[front.0], front.1) }
+        if hiddenBefore.pids.contains(front.0) {
+            lastRefusal = hiddenBefore.reasons[front.0] ?? .app
+            return Self.refused(hiddenBefore.reasons[front.0], front.1)
+        }
         let frontWindow = OnScreenWindow.front(of: front.0, in: OnScreenWindow.all())
 
         let content: SCShareableContent
@@ -85,7 +103,10 @@ public actor Capturer {
         } catch { return .failed(error.localizedDescription) }
         // Listing windows can take long enough for the facts to change.
         hiddenBefore = await hidden(exclusions)
-        if hiddenBefore.pids.contains(front.0) { return Self.refused(hiddenBefore.reasons[front.0], front.1) }
+        if hiddenBefore.pids.contains(front.0) {
+            lastRefusal = hiddenBefore.reasons[front.0] ?? .app
+            return Self.refused(hiddenBefore.reasons[front.0], front.1)
+        }
         let omit = content.applications.filter { hiddenBefore.pids.contains($0.processID) }
         let omitted = Set(omit.map(\.processID))
         let displays = pick(content.displays, front: frontWindow?.bounds, all: allDisplays)
@@ -138,7 +159,7 @@ public actor Capturer {
                 takenAt: Int64(at.timeIntervalSince1970 * 1000), trigger: trigger.rawValue, display: await Self.name(d.displayID),
                 appName: front.1, bundleId: front.2, windowTitle: frontWindow?.title ?? "", url: hiddenAfter.focusedURL[front.0] ?? "",
                 userName: Session.consoleUser, fullName: NSFullUserName(), host: Session.computerName, sessions: Session.loggedIn, runningApps: apps)
-            engine.ingest(frame: Frame(rgba: b.data, width: UInt32(b.width), height: UInt32(b.height), stride: UInt32(b.stride), lines: lines, moment: m, displayKey: key))
+            engine.ingest(frame: Frame(rgba: b.data, width: UInt32(b.width), height: UInt32(b.height), stride: UInt32(b.stride), lines: lines, moment: m, displayKey: key, covers: Self.onDisplay(before.covers.filter { !omitted.contains($0.key) }.values.flatMap { $0 }, d.frame)))
             queued += 1
         }
         return queued == 0 ? .unchanged : .queued(queued)
@@ -148,6 +169,12 @@ public actor Capturer {
         var h = Hidden()
         // Never photograph our own window: it shows other photographs.
         h.pids.insert(getpid())
+        let screens: [(CGRect, Double)] = await MainActor.run {
+            // Cocoa's origin is the main screen's bottom left; everything else here counts from its top left.
+            let top = NSScreen.screens.first?.frame.maxY ?? 0
+            return NSScreen.screens.map { (CGRect(x: $0.frame.minX, y: top - $0.frame.maxY, width: $0.frame.width, height: $0.frame.height), Double($0.backingScaleFactor)) }
+        }
+        func scale(at r: CGRect) -> Double { screens.max { Self.area($0.0, r) < Self.area($1.0, r) }.map { Self.area($0.0, r) > 0 ? $0.1 : 0 } ?? 0 }
         let running = await MainActor.run { NSWorkspace.shared.runningApplications.map { ($0.processIdentifier, $0.bundleIdentifier ?? "", $0.isHidden) } }
         let visible = OnScreenWindow.all()
         let drawing = Set(visible.map(\.pid))
@@ -156,16 +183,26 @@ public actor Capturer {
                 h.pids.insert(pid)
                 h.reasons[pid] = r
             } else if isBrowser(bundleId: bundle), drawing.contains(pid) {
-                if needsWaking(bundleId: bundle) { Accessibility.wake(pid: pid) }
+                // Chrome describes its page only when asked. Asked only where its extension is in use: that is when
+                // the page's place on screen is needed.
+                if needsWaking(bundleId: bundle) || engine.extensionHeard(pid: pid) { Accessibility.wake(pid: pid) }
                 let reading = Accessibility.read(pid: pid, visible: visible)
                 if let r = hideBrowser(ex: ex, bundleId: bundle, windows: reading.windows, complete: reading.complete) {
                     h.pids.insert(pid)
                     h.reasons[pid] = r
-                } else if let r = hidePage(ex: ex, hint: engine.pageHint(pid: pid)) {
-                    h.pids.insert(pid)
-                    h.reasons[pid] = r
-                } else if let u = reading.focusedURL {
-                    h.focusedURL[pid] = u
+                } else {
+                    // Measured now, not whenever it last changed: the same is done after the picture and must agree.
+                    let answered = engine.refreshPages(pid: pid)
+                    let areas = reading.pages.map { PageArea(url: $0.url, rect: Rect(x: $0.frame.minX, y: $0.frame.minY, w: $0.frame.width, h: $0.frame.height), scale: scale(at: $0.frame)) }
+                    let plan = planPage(ex: ex, hint: engine.pageHint(pid: pid), areas: areas, complete: reading.complete)
+                    if !plan.note.isEmpty { engine.noteCapture(trigger: "page", outcome: "Couldn’t place a field: \(plan.note)") }
+                    if let r = plan.hide ?? (answered ? nil : .noAnswer) {
+                        h.pids.insert(pid)
+                        h.reasons[pid] = r
+                    } else {
+                        if !plan.covers.isEmpty { h.covers[pid] = plan.covers }
+                        h.focusedURL[pid] = reading.focusedURL
+                    }
                 }
             }
         }
@@ -182,6 +219,14 @@ public actor Capturer {
         if let f = front, let best = d.max(by: { area($0.frame, f) < area($1.frame, f) }), area(best.frame, f) > 0 { return [best.id] }
         return d.map(\.id).filter { $0 == main }
     }
+    /// Points on the desktop to fractions of one display; nil for what isn't on it.
+    static func onDisplay(_ covers: [Cover], _ d: CGRect) -> [Cover] {
+        covers.compactMap { c in
+            let r = CGRect(x: c.rect.x, y: c.rect.y, width: c.rect.w, height: c.rect.h)
+            guard area(r, d) > 0 else { return nil }
+            return Cover(kind: c.kind, rect: Rect(x: (r.minX - d.minX) / d.width, y: (r.minY - d.minY) / d.height, w: r.width / d.width, h: r.height / d.height))
+        }
+    }
     private static func area(_ a: CGRect, _ b: CGRect) -> CGFloat {
         let r = a.intersection(b)
         return r.isNull ? 0 : r.width * r.height
@@ -190,7 +235,20 @@ public actor Capturer {
         NSScreen.screens.first { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID) == id }?.localizedName ?? "Display"
     }
     static func refused(_ r: HideReason?, _ app: String) -> CaptureOutcome {
-        r == .unreadable ? .skipped(phrase(r, app)) : .blocked(phrase(r, app))
+        r == .unreadable || r == .noAnswer ? .skipped(phrase(r, app)) : .blocked(phrase(r, app))
+    }
+    /// The same reasons without saying which app: which apps a person excludes is their business.
+    public static func logPhrase(_ r: HideReason) -> String {
+        switch r {
+        case .passwordManager: "A password manager was in front"
+        case .site: "An excluded site was open"
+        case .privateWindow: "A private window was open"
+        case .unreadable: "A browser’s address couldn’t be read"
+        case .secretField: "A browser was showing a secret that couldn’t be placed"
+        case .noAnswer: "A browser’s extension didn’t answer"
+        case .systemPrompt: "macOS was asking for something"
+        case .app: "An excluded app was in front"
+        }
     }
     static func phrase(_ r: HideReason?, _ app: String) -> String {
         switch r {
@@ -198,7 +256,8 @@ public actor Capturer {
         case .site: "A site you excluded is open in \(app)"
         case .privateWindow: "\(app) has a private window open"
         case .unreadable: "\(app)’s address couldn’t be read"
-        case .secretField: "\(app) is showing a password or account field"
+        case .secretField: "\(app) is showing a secret Afterimage can’t place"
+        case .noAnswer: "\(app)’s Afterimage extension didn’t answer"
         case .systemPrompt: "macOS is asking for something"
         case .app, nil: "\(app) is excluded"
         }

@@ -32,6 +32,8 @@ pub enum HideReason {
     Unreadable,
     SystemPrompt,
     SecretField,
+    /// The browser's extension was asked and didn't answer in time.
+    NoAnswer,
 }
 
 /// Desktop password managers. Matched whole, or as a dotted prefix ("com.1password" covers "com.1password.safari").
@@ -79,7 +81,35 @@ enum Family {
     Other,
 }
 
+static OTHER_BROWSERS: std::sync::LazyLock<std::sync::RwLock<std::collections::HashSet<String>>> = std::sync::LazyLock::new(Default::default);
+
+/// Apps this Mac says can open web pages. Any not already known is read like a browser, and left out when it can't be.
+#[uniffi::export]
+pub fn register_browsers(bundle_ids: Vec<String>) {
+    // Only ever added to while the app runs: an app that vanishes from the list for a moment is still a browser.
+    OTHER_BROWSERS.write().unwrap_or_else(|e| e.into_inner()).extend(bundle_ids.into_iter().map(|b| b.to_lowercase()));
+}
+
+/// Registered apps that have actually shown a web page. Terminals and the like register for links and never do.
+static SHOWN_PAGES: std::sync::LazyLock<std::sync::RwLock<std::collections::HashSet<String>>> = std::sync::LazyLock::new(Default::default);
+
+static PAGELESS_LOOKS: std::sync::LazyLock<std::sync::RwLock<std::collections::HashMap<String, (u8, Option<std::time::Instant>)>>> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(not(test))]
+const PAGELESS_GAP: std::time::Duration = std::time::Duration::from_millis(1200);
+#[cfg(test)]
+const PAGELESS_GAP: std::time::Duration = std::time::Duration::from_millis(30);
+
+fn only_registered(bundle: &str) -> bool {
+    family_of(bundle, false).is_none() && family_of(bundle, true).is_some()
+}
+
 fn family(bundle: &str) -> Option<Family> {
+    family_of(bundle, true)
+}
+
+/// `registered`: also count apps this Mac says can open web pages.
+fn family_of(bundle: &str, registered: bool) -> Option<Family> {
     let b = bundle.to_lowercase();
     let p = |list: &[&str]| list.iter().any(|x| b == *x || b.starts_with(&format!("{x}.")));
     if is_tor(&b) {
@@ -95,6 +125,10 @@ fn family(bundle: &str) -> Option<Family> {
     } else if p(&["company.thebrowser.browser", "company.thebrowser.dia", "com.sigmaos.sigmaos.macos", "ai.perplexity.comet",
                   "com.perplexity.comet", "com.openai.atlas", "com.duckduckgo.macos.browser"]) {
         Some(Family::Other)
+    } else if registered && SHOWN_PAGES.read().unwrap_or_else(|e| e.into_inner()).contains(&b) {
+        Some(Family::Other)
+    } else if registered && OTHER_BROWSERS.read().unwrap_or_else(|e| e.into_inner()).contains(&b) {
+        Some(Family::Other)
     } else {
         None
     }
@@ -108,7 +142,8 @@ pub fn is_browser(bundle_id: &str) -> bool {
 /// Firefox describes its pages to accessibility only once asked to.
 #[uniffi::export]
 pub fn needs_waking(bundle_id: &str) -> bool {
-    family(bundle_id) == Some(Family::Firefox)
+    // An unfamiliar browser may be built on Firefox; asking does no harm to one that isn't.
+    family(bundle_id) == Some(Family::Firefox) || only_registered(bundle_id)
 }
 
 fn is_tor(bundle_id: &str) -> bool {
@@ -401,6 +436,29 @@ pub fn hide_browser(ex: &Exclusions, bundle_id: &str, windows: &[BrowserWindow],
     if ex.tor && is_tor(bundle_id) {
         return Some(HideReason::App);
     }
+    if only_registered(bundle_id) {
+        let b = bundle_id.to_lowercase();
+        let private = ex.private_windows && windows.iter().any(|w| is_private(f, w));
+        if private || windows.iter().any(|w| !w.urls.is_empty()) {
+            SHOWN_PAGES.write().unwrap_or_else(|e| e.into_inner()).insert(b.clone());
+        }
+        // Not a browser only on evidence: a full look at its windows that found no page in any of them.
+        // And looked at properly: each window's own controls were read, three times running, with never a page.
+        let read = |w: &BrowserWindow| w.urls.is_empty() && w.control_labels.iter().chain(&w.field_descriptions).any(|l| !l.trim().is_empty());
+        let pageless = complete && !windows.is_empty() && windows.iter().all(read);
+        let mut looks = PAGELESS_LOOKS.write().unwrap_or_else(|e| e.into_inner());
+        let (n, last) = looks.entry(b.clone()).or_insert((0, None));
+        // One look counts per second or so: three in the same breath are one look.
+        let spaced = last.is_none_or(|t| t.elapsed() >= PAGELESS_GAP);
+        if !pageless {
+            (*n, *last) = (0, None);
+        } else if spaced {
+            (*n, *last) = (n.saturating_add(1), Some(std::time::Instant::now()));
+        }
+        if *n >= 3 && !SHOWN_PAGES.read().unwrap_or_else(|e| e.into_inner()).contains(&b) {
+            return None;
+        }
+    }
     let mut unreadable = !complete;
     let mut evasive = false;
     let mut found = None;
@@ -432,16 +490,6 @@ pub fn hide_browser(ex: &Exclusions, bundle_id: &str, windows: &[BrowserWindow],
         }
     }
     found.or((evasive || unreadable && ex.unreadable_browsers).then_some(HideReason::Unreadable))
-}
-
-/// What the browser extension adds to the decision. Never consulted to allow anything.
-/// AIDEV-TODO: frost placed fields instead of leaving the browser out, once page and screen coordinates are matched up.
-#[uniffi::export]
-pub fn hide_page(ex: &Exclusions, hint: &crate::pages::PageHint) -> Option<HideReason> {
-    if hint.private_window && ex.private_windows {
-        return Some(HideReason::PrivateWindow);
-    }
-    (hint.sensitive || !hint.fields.is_empty()).then_some(HideReason::SecretField)
 }
 
 /// Tidy what a person typed into a site rule; None if it could never match anything.
@@ -849,15 +897,45 @@ mod tests {
     }
 
     #[test]
-    fn the_extension_can_only_add_reasons() {
-        use crate::pages::{PageField, PageHint};
-        use crate::{Rect, SecretKind};
-        let field = PageField { kind: SecretKind::Password, rect: Rect { x: 0.0, y: 0.0, w: 0.1, h: 0.1 }, tab: 1, window: 1 };
-        let none = PageHint::default();
-        assert_eq!(hide_page(&ex(), &none), None);
-        assert_eq!(hide_page(&ex(), &PageHint { private_window: true, ..none.clone() }), Some(HideReason::PrivateWindow));
-        assert_eq!(hide_page(&Exclusions { private_windows: false, ..ex() }, &PageHint { private_window: true, ..none.clone() }), None);
-        assert_eq!(hide_page(&ex(), &PageHint { sensitive: true, ..none.clone() }), Some(HideReason::SecretField));
-        assert_eq!(hide_page(&ex(), &PageHint { fields: vec![field], ..none.clone() }), Some(HideReason::SecretField));
+    fn an_app_that_opens_web_pages_is_a_browser_once_it_shows_one() {
+        assert!(!is_browser("net.mullvad.mullvadbrowser"));
+        register_browsers(vec!["net.Mullvad.MullvadBrowser".into(), "one.ablaze.floorp".into(), "com.example.terminal".into()]);
+        assert!(is_browser("net.mullvad.mullvadbrowser") && is_browser("one.ablaze.floorp") && !is_browser("com.apple.finder") && needs_waking("one.ablaze.floorp"));
+        let e = sites(&["chase.com"]);
+        // A terminal also says it opens links. With no page in it, it's an ordinary app, readable or not.
+        let plain = BrowserWindow { urls: vec![], ..win("x") };
+        // Not on the first look: its tree may not have filled in yet.
+        let nap = || std::thread::sleep(std::time::Duration::from_millis(40));
+        assert_eq!(hide_browser(&e, "com.example.terminal", &[plain.clone()], true), Some(HideReason::Unreadable));
+        // Looks in the same breath count once.
+        for _ in 0..5 {
+            assert_eq!(hide_browser(&e, "com.example.terminal", &[plain.clone()], true), Some(HideReason::Unreadable));
+        }
+        nap();
+        assert_eq!(hide_browser(&e, "com.example.terminal", &[plain.clone()], true), Some(HideReason::Unreadable));
+        nap();
+        assert_eq!(hide_browser(&e, "com.example.terminal", &[plain.clone()], true), None);
+        let bare = BrowserWindow { urls: vec![], control_labels: vec![], ..win("x") };
+        assert_eq!(hide_browser(&e, "com.example.terminal", &[bare], true), Some(HideReason::Unreadable));
+        for _ in 0..3 {
+            hide_browser(&e, "com.example.terminal", &[plain.clone()], true);
+            nap();
+        }
+        assert_eq!(hide_browser(&e, "com.example.terminal", &[plain.clone()], true), None);
+        // Only a full look that finds no page says so; a failed look says nothing.
+        assert_eq!(hide_browser(&e, "com.example.terminal", &[plain.clone()], false), Some(HideReason::Unreadable));
+        assert_eq!(hide_browser(&e, "com.example.terminal", &[], false), Some(HideReason::Unreadable));
+        // A private-window marker makes it a browser on the spot.
+        // Registering again adds; nothing registered before is forgotten.
+        register_browsers(vec!["com.example.quiet".into()]);
+        assert!(is_browser("one.ablaze.floorp"));
+        let marked = BrowserWindow { title: Some("x — Private Browsing".into()), urls: vec![], ..win("x") };
+        assert_eq!(hide_browser(&ex(), "com.example.quiet", &[marked], true), Some(HideReason::PrivateWindow));
+        // One page seen, and from then on it is held to a browser's rules.
+        assert_eq!(hide_browser(&e, "net.mullvad.mullvadbrowser", &[win("https://chase.com/")], true), Some(HideReason::Site));
+        assert_eq!(hide_browser(&e, "net.mullvad.mullvadbrowser", &[], false), Some(HideReason::Unreadable));
+        assert_eq!(hide_browser(&e, "net.mullvad.mullvadbrowser", &[plain], true), Some(HideReason::Unreadable));
+        let private = BrowserWindow { title: Some("Chase — Private Browsing".into()), ..win("https://a.com") };
+        assert_eq!(hide_browser(&ex(), "one.ablaze.floorp", &[private], true), Some(HideReason::PrivateWindow));
     }
 }

@@ -1,5 +1,5 @@
 // Finds the secret-bearing fields on a page. Reports where they are and what kind, never what they hold.
-// AIDEV-NOTE: privacy-critical. Nothing here may read `.value` or text content into a report.
+// AIDEV-NOTE: privacy-critical. No value or page text may reach a report; only whether a field is empty is ever asked.
 
 const MAX_FIELDS = 200;
 
@@ -67,19 +67,29 @@ function place(box, width, height) {
   return { x: round(l / width), y: round(t / height), w: round((r - l) / width), h: round((b - t) / height) };
 }
 
+/** An empty box shows only its placeholder. Anything whose emptiness can't be known counts as full. */
+function empty(el, env) {
+  return (el.localName === 'input' || el.localName === 'textarea') && el.value === '' && !env.filled?.(el);
+}
+
 export function report(env, watcher) {
-  const out = { v: 1, url: cleanAddress(env.url), top: env.top, fields: [], typing: false, unplaced: false };
+  const ratio = env.ratio ?? 1;
+  const out = {
+    v: 1, url: cleanAddress(env.url), top: env.top, width: round(env.width * ratio), height: round(env.height * ratio),
+    fields: [], typing: false, unplaced: false,
+  };
   try {
     for (const el of env.elements()) {
       const style = env.styleOf(el);
       const kind = watcher.kind(el, style);
-      if (!kind || style.display === 'none' || style.visibility === 'hidden') continue;
+      if (!kind) continue;
+      if (style.display === 'none' || style.visibility === 'hidden') continue;
       const at = place(el.getBoundingClientRect(), env.width, env.height);
       if (!at) continue;
       if (el === env.focused && kind !== 'overlay') out.typing = true;
       // A frame doesn't know where it sits in the window, so it can only say that it holds something.
-      if (!env.top || out.fields.length >= MAX_FIELDS) out.unplaced = true;
-      else out.fields.push({ kind, ...at });
+      if (!env.top || (env.pinch ?? 1) !== 1 || out.fields.length >= MAX_FIELDS) out.unplaced = true;
+      else out.fields.push({ kind, ...at, ...(empty(el, env) ? { empty: true } : {}) });
     }
   } catch {
     out.unplaced = true;

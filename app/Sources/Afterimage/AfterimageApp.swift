@@ -14,6 +14,11 @@ import SwiftUI
         .defaultSize(width: 1240, height: 820)
         .commands { AppCommands(model: model) }
 
+        Window("Developer Log", id: "devlog") {
+            DevLogView().environment(model).environment(model.settings)
+        }
+        .defaultSize(width: 980, height: 620)
+
         Settings {
             SettingsView().environment(model).environment(model.settings).environment(model.recorder)
         }
