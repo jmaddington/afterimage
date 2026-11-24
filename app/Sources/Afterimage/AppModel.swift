@@ -104,6 +104,10 @@ extension Shot {
         }
         reload()
         Task.detached { [engine] in _ = engine.listenForPages() }
+        // Any app registered to open web pages is treated as a browser, known to us or not.
+        if let page = URL(string: "https://example.com") {
+            registerBrowsers(bundleIds: NSWorkspace.shared.urlsForApplications(toOpen: page).compactMap { Bundle(url: $0)?.bundleIdentifier }.filter { $0 != Bundle.main.bundleIdentifier })
+        }
         if settings.onboarded { recorder.start() }
         #if DEBUG
         stage(ProcessInfo.processInfo.environment["AFTERIMAGE_STAGE"] ?? "")

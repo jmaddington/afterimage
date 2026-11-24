@@ -107,7 +107,13 @@ re!(CVV_LABEL, r"(?i)^\s*(?:cvv2?|cvc2?|csc|security\s+code)\s*[:#]?\s*$");
 // key = value / key: value where the key names a secret.
 re!(ASSIGN, r#"([A-Za-z0-9_.\-\[\]'"]+)\s*(:=|=>|=|:)\s*(["']?)([^\s"',;]+)"#);
 // Where one pair of a query string ends and the next begins.
-re!(NEXT_PAIR, r"&[A-Za-z0-9_.\-\[\]]+=");
+re!(NEXT_PAIR, r"&[A-Za-z0-9_.\-\[\]%]+=");
+re!(NOT_A_VALUE_WHOLE, r"(?i)^(?:forgot|forgotten|reset|show|hide|sign\s*in|log\s*in|sign\s*up|continue|submit|cancel|save|remember|required|optional|must|characters?|enter|confirm|change|manager|generate|copy|username|email|user\s*name)\W*$");
+re!(TAIL_WORDS, r"^(?:[ \t]+[A-Za-z0-9\-]+){1,6}[ \t]*$");
+re!(MYSQL_P, r"(?i)\bmysql(?:dump|admin)?\b[^\n]*\s-p([^\s]+)");
+re!(CURL_U, r#"(?i)\b(?:curl|wget|http)\b[^\n]*\s(?:-u|--user)[=\s]+["']?[^\s:"']+:([^\s"']+)"#);
+re!(CODE_SHAPED, r"^[A-Z0-9]{4,}(?:-[A-Z0-9]{2,})+$|^[A-Z0-9]{8,}$");
+re!(PATH_TOKEN, r"^[A-Za-z0-9_\-]{20,}$");
 re!(SECRET_NEAR, r"(?i)pass|\bpin\b|code|secret|recovery|\bkey|token|ssn|social|combination");
 // "Secret key   8f14e4..." laid out in columns, with nothing but space between.
 re!(LABELLED, r"(?i)\b(?:api[\s_-]?key|secret(?:[\s_-]?key)?|client[\s_-]?secret|access[\s_-]?(?:key|token)|private[\s_-]?key|auth[\s_-]?token|token|password|passcode)\b\s{1,6}([A-Za-z0-9_\-+/=.~]{16,})");
@@ -115,7 +121,7 @@ re!(PLACEHOLDER, r"(?i)^<[^>]*>$|^your(?:[_\-](?:api|secret|token|key|password|h
 re!(DOTTED, r"^(?:self|this|args|settings|os|config|cfg|env|opts|options|params|props|req|request|ctx|process|row|obj|data|state|user|form)(?:\.[A-Za-z_]\w*)+$");
 // A call or a lookup: getpass.getpass(), os.environ["X"].
 re!(CODE_START, r"^[A-Za-z_][\w.]*[(\[]");
-re!(RECOVERY, r"(?i)\b(?:recovery|backup)\s+(?:codes?|keys?|phrase)\s*(?:([:=])\s*|\s+)(\S.*)$");
+re!(RECOVERY, r"(?i)\b(?:recovery|backup)\s+(?:codes?|keys?|phrases?)\b[ \t]*([:=])?[ \t]*");
 re!(PHONE_334, r"^\d{3}[\s.\-]\d{3}[\s.\-]\d{4}$");
 re!(FIN_QUAL, r"(?i)\b(?:number|num|no\.?|nbr|code|iban|routing|aba|swift|bic|sort\s*code)\b|#");
 // Long numbers that are plainly something else.
@@ -211,8 +217,8 @@ pub fn phone_like(t: &str) -> bool {
 /// Contact details the model sometimes reports as "other": a person wants to remember who they talked to.
 /// AIDEV-NOTE: privacy-critical. Never overrules a finding the model called a password, key, SSN or account number.
 pub fn keep_despite_model(value: &str, kind: SecretKind, near: &str) -> bool {
-    // "Door code hint: ..." makes anything beside it suspect.
-    if SECRET_NEAR.is_match(near) {
+    // "Door code hint: ..." makes anything beside it suspect, in whatever letters it's drawn.
+    if SECRET_NEAR.is_match(near) || SECRET_NEAR.is_match(&latinised(near, false).0) {
         return false;
     }
     let v = value.trim();
@@ -278,7 +284,7 @@ fn assigned(key: &str, quoted: bool, v: &str, closed: bool) -> Option<SecretKind
     if w.len() > at + 1 && ABOUT.contains(&w[w.len() - 1].as_str()) {
         return None;
     }
-    if MASKED.is_match(v) || NOT_A_VALUE.is_match(v) || PLACEHOLDER.is_match(v) {
+    if MASKED.is_match(v) || NOT_A_VALUE_WHOLE.is_match(v) || PLACEHOLDER.is_match(v) {
         return None;
     }
     let lower = v.to_lowercase();
@@ -427,30 +433,46 @@ fn scan_latin(text: &str, line: usize, hits: &mut Vec<Hit>) {
     while let Some(c) = ASSIGN.captures_at(text, from) {
         let (sep, v) = (c.get(2).unwrap(), c.get(4).unwrap());
         let quoted = !c[3].is_empty();
-        // In a query string the value stops where the next pair starts; anywhere else "&" is just a character.
-        let whole = match NEXT_PAIR.find(v.as_str()).filter(|_| !quoted) {
-            Some(next) => &v.as_str()[..next.start()],
-            None => v.as_str(),
+        let judge = |whole: &str| {
+            let balanced = |o: char, c: char| whole.matches(o).count() == whole.matches(c).count();
+            let closed = !quoted && whole.ends_with([')', ']']) && balanced('(', ')') && balanced('[', ']');
+            let trimmed = if quoted { whole } else { whole.trim_end_matches([')', ']', '}', '.']) };
+            // A real call gives up its closing bracket and is judged as one; anything else keeps every character.
+            match assigned(&c[1], quoted, trimmed, closed) {
+                None if closed => None,
+                None => None,
+                Some(k) => Some(k),
+            }
         };
-        let trimmed = if quoted { whole } else { whole.trim_end_matches([')', ']', '}', '.']) };
-        let closed = !quoted && whole.ends_with([')', ']']);
-        // A lookalike of a call that is really a password keeps its brackets and dots.
-        let (value, closed) = if closed && assigned(&c[1], quoted, trimmed, true).is_none() { (trimmed, true) } else if closed { (whole, false) } else { (trimmed, false) };
-        match assigned(&c[1], quoted, value, closed) {
+        // In a query string the value stops where the next pair starts; anywhere else "&" is just a character.
+        // Both readings are tried, and if either is a secret the whole of it goes.
+        let seg = NEXT_PAIR.find(v.as_str()).filter(|_| !quoted).map(|n| &v.as_str()[..n.start()]);
+        match seg.and_then(judge).or_else(|| judge(v.as_str())) {
             Some(kind) => {
-                let end = if value.len() < whole.len() && !closed { v.start() + whole.len() } else { v.start() + value.len() };
-                push(hits, line, v.start()..end.max(v.start() + value.len()), kind, "assignment");
-                from = v.start() + whole.len();
+                let mut end = v.end();
+                // "password: correct horse battery staple": a few plain words after it are more of it.
+                let rest = text[end..].split('\n').next().unwrap_or("");
+                if kind == SecretKind::Password && !quoted && TAIL_WORDS.is_match(rest) {
+                    end += rest.trim_end().len();
+                }
+                push(hits, line, v.start()..end, kind, "assignment");
+                from = end;
             }
             None => from = sep.end(),
         }
     }
-    for c in RECOVERY.captures_iter(text) {
-        let v = c.get(2).unwrap();
-        // With no colon it may be a sentence about recovery keys; a code has digits.
-        let first = v.as_str().split_whitespace().next().unwrap_or("");
-        if c.get(1).is_some() || first.len() >= 6 && first.chars().any(|c| c.is_ascii_digit()) {
-            push(hits, line, v.start()..text.trim_end().len(), Key, "label");
+    for l in RECOVERY.find_iter(text) {
+        let tail = text[l.end()..].split('\n').next().unwrap_or("").trim_end();
+        let first = tail.split_whitespace().next().unwrap_or("");
+        let colon = l.as_str().trim_end().ends_with([':', '=']);
+        // With no colon it may be a sentence about recovery keys; a code has digits or is all capitals.
+        if !tail.is_empty() && (colon || first.len() >= 6 && first.chars().any(|c| c.is_ascii_digit()) || CODE_SHAPED.is_match(first)) {
+            push(hits, line, l.end()..l.end() + tail.len(), Key, "label");
+        }
+    }
+    for re in [&*MYSQL_P, &*CURL_U] {
+        for c in re.captures_iter(text) {
+            push(hits, line, c.get(1).unwrap().range(), Password, "flag");
         }
     }
     for c in LABELLED.captures_iter(text) {
@@ -618,7 +640,10 @@ pub fn scrub_url(raw: &str) -> String {
     u.set_fragment(None);
     let _ = u.set_username("");
     let _ = u.set_password(None);
-    mask_text(u.as_str())
+    // A long run of letters and digits in a path is a reset link or a share token, not a page name.
+    let path: Vec<String> = u.path().split('/').map(|s| if PATH_TOKEN.is_match(s) && s.chars().any(|c| c.is_ascii_digit()) { "[hidden]".into() } else { s.to_owned() }).collect();
+    u.set_path(&path.join("/"));
+    mask_text(&u.as_str().replace("%5Bhidden%5D", "[hidden]"))
 }
 
 // The raw payload must be just a plain host and perhaps one everyday word. Judged as written, before any URL parser
@@ -1187,5 +1212,25 @@ mod tests {
         assert!(!keep_despite_model("Dana Whitfield", SecretKind::Other, "Door code hint: Dana Whitfield"));
         assert!(!keep_despite_model("Whitfield", SecretKind::Other, "Call them back"));
         assert!(!keep_despite_model("415-555-0142", SecretKind::Other, "alarm PIN 415-555-0142"));
+    }
+
+    // ---- P1s from the outside and security reviews ----
+    #[test]
+    fn p1_detector_gaps() {
+        for (t, secret) in [
+            ("password=a(b))", "a(b"), ("password=ab&show", "ab&show"), ("password=reset-me-9", "reset-me"), ("password=abc123&next=%2Fhome", "abc123"),
+            ("see backup codes 4821-9937, and Recovery phrases: witch collapse", "witch"), ("backup code ABCD-EFGH-JKLM", "ABCD"), ("recovery key QWERTYUIOP", "QWERTY"),
+            ("password: correct horse battery staple", "staple"), ("mysql -uroot -pTr0ub4dor9x shop", "Tr0ub4"), ("curl -u admin:Tr0ub4dor9x https://x.com", "Tr0ub4"),
+            ("curl --user admin:Tr0ub4dor9x https://x.com", "Tr0ub4"),
+        ] {
+            assert!(!masked(t).contains(secret), "{t}: {}", masked(t));
+        }
+        assert_eq!(masked("line one recovery code\nnext line stays"), "line one recovery code\nnext line stays");
+        assert_eq!(masked("password = getpass.getpass()"), "password = getpass.getpass()");
+        assert_eq!(masked("password: str = None  # set later"), "password: str = None  # set later");
+        assert!(!scrub_url("https://example.com/reset/9f8e7d6c5b4a39281706f5e4d3c2b1a0").contains("9f8e"));
+        assert_eq!(scrub_url("https://example.com/docs/getting-started"), "https://example.com/docs/getting-started");
+        // Beside a secret's label, in any alphabet's lookalikes.
+        assert!(!keep_despite_model("Dana Whitfield", SecretKind::Other, "Раsswоrd hint"));
     }
 }

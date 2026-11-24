@@ -630,23 +630,29 @@ impl Shared {
     fn ask(&self, l: &lm::Lm, c: &Config, lines: &[TextLine], chunk: &[(usize, String)], unsure: &mut HashSet<usize>) -> Result<Vec<Hit>, lm::LmError> {
         let view: Vec<(usize, &str)> = chunk.iter().map(|(i, t)| (*i, t.as_str())).collect();
         match l.find_secrets(&c.model, &view) {
-            Ok(f) => Ok(f
-                .into_iter()
-                .flat_map(|(i, v, k)| {
+            Ok(f) => {
+                let mut hits = Vec::new();
+                for (i, v, k) in f {
+                    // A line that doesn't exist: it isn't talking about this screen.
+                    if i >= lines.len() {
+                        return Err(lm::LmError::BadAnswer("line"));
+                    }
                     // It quoted text we had already masked: there's more on that line than we knew. Hide all of it.
                     let v = if v.contains("[hidden]") { String::new() } else { v };
                     let found = lm::locate(lines, i, &v, k);
                     let near = |j: usize| lines.get(j).map_or("", |l| l.text.as_str());
-                    let context = [near(i.wrapping_sub(1)), near(i), near(i + 1)].join("\n");
-                    if !v.is_empty() && detect::keep_despite_model(&v, k, &context) {
+                    // Everywhere it would be left showing, not just where the model pointed.
+                    let context: Vec<&str> = found.iter().map(|h| h.line).chain([i]).flat_map(|j| [near(j.wrapping_sub(1)), near(j), near(j + 1)]).collect();
+                    if !v.is_empty() && detect::keep_despite_model(&v, k, &context.join("\n")) {
                         // Overruled, not cleared: every line it touched is asked about again next time.
                         unsure.insert(i);
                         unsure.extend(found.iter().map(|h| h.line));
-                        return vec![];
+                        continue;
                     }
-                    found
-                })
-                .collect()),
+                    hits.extend(found);
+                }
+                Ok(hits)
+            }
             Err(lm::LmError::BadAnswer(_)) if chunk.len() >= 8 => {
                 let m = chunk.len() / 2;
                 let mut a = self.ask(l, c, lines, &chunk[..m + 2], unsure)?;
@@ -663,31 +669,40 @@ impl Shared {
         let r = self.process_taped(f, arrived, require_ai, &mut tape);
         let calls = take(&tape);
         match &r {
-            Ok(Some((id, hits, checked))) => self.note(devlog::checks(calls, &f.lines, checked.then_some(hits.as_slice()), Some(*id))),
+            Ok(Some((id, hits, checked, all))) => self.note(devlog::checks(calls, all, checked.then_some(hits.as_slice()), Some(*id))),
             Ok(None) => {} // Forgotten while it was being checked.
             Err(_) => self.note(devlog::checks(calls, &f.lines, None, None)),
         }
         r.map(|_| ())
     }
 
-    fn process_taped(&self, f: &mut Frame, arrived: u64, require_ai: bool, tape: &mut lm::Tape) -> Result<Option<(i64, Vec<Hit>, bool)>, String> {
+    fn process_taped(&self, f: &mut Frame, arrived: u64, require_ai: bool, tape: &mut lm::Tape) -> Result<Option<(i64, Vec<Hit>, bool, Vec<TextLine>)>, String> {
         let c = lock(&self.config).clone();
-        let mut hits = detect::scan(&f.lines);
+        // The window's title and address are checked like any other text on screen. They have no place in the
+        // picture, so they sit outside it.
+        let shown = f.lines.len();
+        let nowhere = Rect { x: -10.0, y: -10.0, w: 0.0, h: 0.0 };
+        let mut all = f.lines.clone();
+        for t in [f.moment.window_title.clone(), detect::scrub_url(&f.moment.url)] {
+            all.push(TextLine { text: t, rect: nowhere, tokens: vec![], code: false });
+        }
+        let all = all;
+        let mut hits = detect::scan(&all);
         hits.extend(covered(&f.lines, &f.covers));
         // What it found before any failure counts either way.
         let mut found = Vec::new();
-        let checked = self.ai_hits(&c, tape, &f.lines, &hits, &mut found);
+        let checked = self.ai_hits(&c, tape, &all, &hits, &mut found);
         hits.extend(found);
         let ai_checked = match checked {
             Ok(()) => true,
             Err(e) if require_ai => return Err(e.to_string()),
             Err(_) => false,
         };
-        detect::extend_wrapped(&f.lines, &mut hits);
-        propagate(&f.lines, &mut hits);
+        detect::extend_wrapped(&all, &mut hits);
+        propagate(&all, &mut hits);
 
         let mut regions: Vec<Region> = f.covers.iter().map(|c| region(c.kind, c.rect, "extension")).collect();
-        for h in &hits {
+        for h in hits.iter().filter(|h| h.line < shown) {
             let r = region(h.kind, detect::hit_rect(&f.lines[h.line], &h.range), h.why);
             match regions.iter_mut().find(|x| x.rect == r.rect) {
                 // Several things can agree; say so once each.
@@ -699,15 +714,16 @@ impl Shared {
         let rects: Vec<Rect> = regions.iter().map(|r| r.rect).collect();
         redact::frost(&mut f.rgba, f.width as usize, f.height as usize, f.stride as usize, &rects);
 
-        let values: Vec<String> = secret_values(&f.lines, &hits);
+        let values: Vec<String> = secret_values(&all, &hits);
         let scrub = |t: &str| values.iter().fold(detect::mask_text(t), |t, v| {
             let l = [TextLine { text: t, rect: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }, tokens: vec![], code: false }];
             let r: Vec<_> = detect::find_secret(&l, v).into_iter().map(|(_, r)| r).collect();
             detect::mask(&l[0].text, &r)
         });
         let mut m = f.moment.clone();
-        m.window_title = scrub(&m.window_title);
-        m.url = scrub(&detect::scrub_url(&m.url));
+        let masked = |i: usize| detect::mask(&all[i].text, &hits.iter().filter(|h| h.line == i).map(|h| h.range.clone()).collect::<Vec<_>>());
+        m.window_title = scrub(&masked(shown));
+        m.url = scrub(&masked(shown + 1));
         let lines: Vec<IndexedLine> = f
             .lines
             .iter()
@@ -743,7 +759,7 @@ impl Shared {
         }
         let new = NewShot { moment: m, path: path.clone(), thumb_path: thumb_path.clone(), width: e.width, height: e.height, bytes: e.bytes, regions, lines, ai_checked };
         match store.insert(&new) {
-            Ok(id) => Ok(Some((id, hits, ai_checked))),
+            Ok(id) => Ok(Some((id, hits, ai_checked, all))),
             Err(e) => {
                 drop(store);
                 remove();
@@ -1050,6 +1066,9 @@ mod tests {
         let e = Engine::new(d.path().to_string_lossy().into(), config(true), Arc::new(FakeHost(Default::default()))).unwrap();
         let mut f = frame(1000);
         f.lines = vec![TextLine { text: "https://example.com/menu".into(), rect: Rect { x: 0.1, y: 0.1, w: 0.2, h: 0.2 }, tokens: vec![], code: true }];
+        // No title or address either: they would be questions for the model.
+        f.moment.window_title.clear();
+        f.moment.url.clear();
         e.ingest(f);
         wait(|| e.stats().unwrap().count == 1 || e.status().discarded == 1);
         assert_eq!(e.status().discarded, 0);
@@ -1357,6 +1376,32 @@ mod tests {
         // ...and one that arrives afterwards with the same stamp is kept.
         e.ingest(frame(now_ms() + 60_000));
         wait(|| e.stats().unwrap().count == 1);
+        e.shutdown();
+    }
+
+    #[test]
+    fn the_title_and_address_are_checked_by_the_model_too_and_a_wild_line_number_is_no_answer() {
+        const TITLE: &str = r#"{"findings":[{"line":3,"value":"quartz-otter-9","kind":"password"}]}"#;
+        let d = tempfile::tempdir().unwrap();
+        let c = Config { lm_url: fake_lm(TITLE, 200), ..config(true) };
+        let e = Engine::new(d.path().to_string_lossy().into(), c, Arc::new(FakeHost(Default::default()))).unwrap();
+        let mut f = frame(1000);
+        f.lines.truncate(1);
+        f.lines.push(f.lines[0].clone());
+        f.lines.push(f.lines[0].clone());
+        f.moment.window_title = "notes about quartz-otter-9 today".into();
+        e.ingest(f);
+        wait(|| e.stats().unwrap().count == 1);
+        let s = e.list(Filter::default(), 1, 0).unwrap().remove(0);
+        assert_eq!(s.moment.window_title, "notes about [hidden] today");
+        assert!(s.regions.is_empty(), "a title has no place in the picture: {:?}", s.regions);
+        e.shutdown();
+        // Line 3 of a one-line screen with no title to speak of: the model is talking about something that isn't there.
+        let d = tempfile::tempdir().unwrap();
+        let c = Config { lm_url: fake_lm(r#"{"findings":[{"line":40,"value":"zzz","kind":"password"}]}"#, 200), ..config(true) };
+        let e = Engine::new(d.path().to_string_lossy().into(), c, Arc::new(FakeHost(Default::default()))).unwrap();
+        e.ingest(frame(1000));
+        wait(|| e.status().discarded == 1);
         e.shutdown();
     }
 }

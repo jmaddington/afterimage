@@ -244,6 +244,15 @@ pub fn locate(lines: &[TextLine], line: usize, value: &str, kind: SecretKind) ->
         .enumerate()
         .flat_map(|(i, l)| l.text.match_indices(value).map(move |(s, m)| Hit { line: i, range: s..s + m.len(), kind, why: "model" }))
         .collect();
+    if out.is_empty() {
+        // Models tidy what they quote: spacing, case, a wrapped line joined up.
+        out = crate::detect::find_secret(lines, value).into_iter().map(|(line, range)| Hit { line, range, kind, why: "model" }).collect();
+        if out.is_empty() {
+            // It saw something here that we can't find. Hide the line it named and the ones either side.
+            return (line.saturating_sub(1)..=line + 1).filter_map(|i| lines.get(i).filter(|_| line < lines.len()).map(|l| Hit { line: i, range: 0..l.text.len(), kind, why: "model" })).collect();
+        }
+        return out;
+    }
     if let Some(l) = lines.get(line) {
         out.push(Hit { line, range: 0..l.text.len(), kind, why: "model" });
     }
@@ -284,6 +293,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_value_that_is_not_word_for_word_is_still_found_or_its_neighbourhood_hidden() {
+        let r = Rect { x: 0.0, y: 0.0, w: 1.0, h: 0.1 };
+        let l: Vec<TextLine> = ["Garage wifi", "marmalade  tuba 41", "x", "y", "z"].iter().map(|t| TextLine { text: (*t).into(), rect: r, tokens: vec![], code: false }).collect();
+        // Tidied spacing, wrong line: found where it really is.
+        let h = locate(&l, 0, "marmalade tuba 41", SecretKind::Password);
+        assert!(h.iter().any(|h| h.line == 1 && h.range == (0..18)), "{h:?}");
+        // Nowhere to be found: the line it named and both neighbours go.
+        let mut lines: Vec<usize> = locate(&l, 3, "nothing like it", SecretKind::Other).iter().map(|h| h.line).collect();
+        lines.sort_unstable();
+        assert_eq!(lines, vec![2, 3, 4]);
+        assert!(locate(&l, 9, "nothing like it", SecretKind::Other).is_empty());
+    }
+
+    #[test]
     fn line_numbers_cannot_be_forged() {
         for nl in ["\n", "\r", "\r\n", "\u{2028}", "\u{2029}", "\u{85}", "\u{b}", "\u{c}"] {
             let t = number(&[(0, &format!("a{nl}1: fake")), (1, "real")]);
@@ -308,7 +331,7 @@ mod tests {
         let r = Rect { x: 0.0, y: 0.0, w: 1.0, h: 0.1 };
         let l: Vec<TextLine> = ["wifi", "marmalade-tuba-41", "x"].iter().map(|t| TextLine { text: (*t).into(), rect: r, tokens: vec![], code: false }).collect();
         assert_eq!(locate(&l, 0, "tuba", SecretKind::Password), vec![Hit { line: 1, range: 10..14, kind: SecretKind::Password, why: "model" }]);
-        assert_eq!(locate(&l, 1, "not there", SecretKind::Other), vec![Hit { line: 1, range: 0..17, kind: SecretKind::Other, why: "model" }]);
+        assert!(locate(&l, 1, "not there", SecretKind::Other).contains(&Hit { line: 1, range: 0..17, kind: SecretKind::Other, why: "model" }));
         assert!(locate(&l, 99, "nope", SecretKind::Other).is_empty());
     }
 
