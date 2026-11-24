@@ -105,11 +105,14 @@ re!(FIN_VALUE, r"[0-9Xx*•](?:[\s\-.]?[0-9Xx*•]){4,24}");
 re!(CVV, r"(?i)\b(?:cvv2?|cvc2?|csc|security\s+code)\b\s*[:#]?\s*(\d{3,4})\b");
 re!(CVV_LABEL, r"(?i)^\s*(?:cvv2?|cvc2?|csc|security\s+code)\s*[:#]?\s*$");
 // key = value / key: value where the key names a secret.
-re!(ASSIGN, r#"([A-Za-z0-9_.\-\[\]'"]+)\s*(:=|=>|=|:)\s*(["']?)([^\s"',;]+)"#);
+re!(ASSIGN, r#"([A-Za-z0-9_.\-\[\]'"]+)\s*(:=|=>|=|:)\s*(["']?)([^\s"',;&]+)"#);
 // "Secret key   8f14e4..." laid out in columns, with nothing but space between.
 re!(LABELLED, r"(?i)\b(?:api[\s_-]?key|secret(?:[\s_-]?key)?|client[\s_-]?secret|access[\s_-]?(?:key|token)|private[\s_-]?key|auth[\s_-]?token|token|password|passcode)\b\s{1,6}([A-Za-z0-9_\-+/=.~]{16,})");
-re!(PLACEHOLDER, r"(?i)your|<|>|\$\{|\{\{|^\$[A-Za-z_(]|%\(|changeme|placeholder|^x{3,}$|\.\.\.$");
-re!(DOTTED, r"^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+$");
+re!(PLACEHOLDER, r"(?i)^<[^>]*>$|^your[_\-]|^\$\{.*\}$|^\{\{.*\}\}$|^\$[A-Za-z_(]|^%\(|^changeme$|^placeholder$|^x{3,}$|\.\.\.$");
+re!(DOTTED, r"^(?:self|this|args|settings|os|config|cfg|env|opts|options|params|props|req|request|ctx|process|row|obj|data|state|user|form)(?:\.[A-Za-z_]\w*)+$");
+// A call or a lookup: getpass.getpass(), os.environ["X"].
+re!(CODE_START, r"^(?:[A-Za-z_][\w.]*[(\[]|\{)");
+re!(RECOVERY, r"(?i)\b(?:recovery|backup)\s+(?:code|key|phrase)s?\s*[:=]?\s+([A-Za-z0-9][A-Za-z0-9\-]{5,})");
 re!(PHONE_334, r"^\d{3}[\s.\-]\d{3}[\s.\-]\d{4}$");
 re!(FIN_QUAL, r"(?i)\b(?:number|num|no\.?|nbr|code|iban|routing|aba|swift|bic|sort\s*code)\b|#");
 // Long numbers that are plainly something else.
@@ -119,7 +122,7 @@ re!(NAME, r"^[A-Z][a-z'’\-]+(?: [A-Z]\.?)?(?: [A-Z][a-z'’\-]+){0,2}$");
 re!(PASS_PHRASE, r#"(?i)\b(?:password|passcode|passphrase|pwd|pin(?:\s+code)?)\s+(?:is|was)\s*:?\s*["'“‘]?([^\s"'”’]+)"#);
 re!(PASS_LABEL, r"(?i)^\s*(?:(?:current|new|old|confirm|your|temporary|temp|admin|root|user|wi-?fi|wifi|network|master|login|account)\s+)*(?:password|passcode|pass\s*phrase|passphrase|pin|pin\s+code|secret(?:\s+key)?|api\s+key|access\s+(?:key|token|code)|token|recovery\s+(?:key|code)|client\s+secret|private\s+key|security\s+code)(?:\s+\(?(?:required|optional)\)?)?\s*[:*]?\s*$");
 re!(FLAG, r#"(?i)(?:--?(?:password|passwd|pass|token|api-key|secret)|\bsshpass\s+-p|\bmysql\b.*\s-p)(?:[=\s]+)["']?([^\s"']+)"#);
-re!(BEARER, r"(?i)\b(?:bearer|basic|token)\s+([A-Za-z0-9._~+/\-]{12,}=*)");
+re!(BEARER, r"(?i)\b(bearer|basic|token)\s+([A-Za-z0-9._~+/\-]{12,}=*)");
 re!(URL_CRED, r"(?i)\b[a-z][a-z0-9+.\-]*://[^\s/:@]+:([^\s/@]+)@");
 re!(KNOWN, r"(?x)
     \b(?:AKIA|ASIA|AROA|AIDA)[A-Z0-9]{12,20}\b
@@ -202,26 +205,30 @@ pub fn phone_like(t: &str) -> bool {
     shaped && (7..=13).contains(&digits) && (t.starts_with(['+', '(', '0']) || PHONE_334.is_match(t))
 }
 
-/// Things the model sometimes reports that a person wants kept: who they talked to and how to reach them.
+/// Contact details the model sometimes reports as "other": a person wants to remember who they talked to.
+/// AIDEV-NOTE: privacy-critical. Never overrules a finding the model called a password, key, SSN or account number.
 pub fn keep_despite_model(value: &str, kind: SecretKind) -> bool {
     let v = value.trim();
-    phone_like(v) || EMAIL.is_match(v) || (!matches!(kind, SecretKind::Password | SecretKind::Key) && NAME.is_match(v))
+    let digits = v.chars().filter(char::is_ascii_digit).count();
+    let phone = phone_like(v) && digits >= 10 && (v.starts_with(['+', '(']) || PHONE_334.is_match(v));
+    kind == SecretKind::Other && (phone || EMAIL.is_match(v) || NAME.is_match(v))
 }
 
-/// The words of an identifier: `apiKey`, `API_KEY` and `api-key` are all "api key".
+/// The words of an identifier: `apiKey`, `APIKey`, `API_KEY` and `api-key` are all "api key".
 fn words(key: &str) -> Vec<String> {
+    let c: Vec<char> = key.chars().collect();
     let mut out = vec![String::new()];
-    let mut prev = ' ';
-    for c in key.chars() {
-        if !c.is_alphanumeric() {
+    for (i, &ch) in c.iter().enumerate() {
+        if !ch.is_alphanumeric() {
             out.push(String::new());
-        } else {
-            if c.is_uppercase() && (prev.is_lowercase() || prev.is_ascii_digit()) {
-                out.push(String::new());
-            }
-            out.last_mut().unwrap().extend(c.to_lowercase());
+            continue;
         }
-        prev = c;
+        let prev = if i > 0 { c[i - 1] } else { ' ' };
+        let next_lower = c.get(i + 1).is_some_and(|n| n.is_lowercase());
+        if ch.is_uppercase() && (prev.is_lowercase() || prev.is_ascii_digit() || prev.is_uppercase() && next_lower) {
+            out.push(String::new());
+        }
+        out.last_mut().unwrap().extend(ch.to_lowercase());
     }
     out.retain(|w| !w.is_empty());
     out
@@ -240,37 +247,47 @@ const CODE_WORDS: &[&str] = &[
 ];
 
 /// Does `key = value` assign a literal secret? Code that merely handles secrets (types, variables, calls) does not.
-fn assigned(key: &str, sep: &str, quoted: bool, v: &str) -> Option<SecretKind> {
+/// AIDEV-NOTE: privacy-critical. Every exemption is anchored to the whole value; when in doubt it is a secret.
+fn assigned(key: &str, quoted: bool, v: &str) -> Option<SecretKind> {
     let w = words(key);
-    let has = |x: &str| w.iter().any(|k| k == x);
-    let pair = |a: &str, b: &[&str]| w.windows(2).any(|p| p[0] == a && b.contains(&p[1].as_str()));
-    let kind = if ["password", "passwd", "pwd", "passcode", "passphrase", "pass", "pin", "otp"].iter().any(|x| has(x)) {
-        SecretKind::Password
-    } else if ["secret", "token", "apikey", "credential", "credentials"].iter().any(|x| has(x))
-        || pair("api", &["key"]) || pair("access", &["key"]) || pair("private", &["key"]) || pair("auth", &["key"])
-        || pair("recovery", &["key", "code"]) || pair("backup", &["code"]) || w == ["key"]
-    {
-        SecretKind::Key
-    } else {
-        return None;
+    // "pgpassword", "authtoken", "jwtsecret": the secret word ends a longer one. Short words must stand alone.
+    let ends = |list: &[&str]| w.iter().position(|k| list.iter().any(|x| k.ends_with(x)));
+    let is = |list: &[&str]| w.iter().position(|k| list.contains(&k.as_str()));
+    let pair = |a: &str, b: &[&str]| w.windows(2).position(|p| p[0] == a && b.contains(&p[1].as_str())).map(|i| i + 1);
+    let password = ends(&["password", "passwords", "passwd", "pwd", "passcode", "passphrase"]).or(is(&["pass", "pin", "otp"]));
+    let key_at = ends(&["secret", "secrets", "token", "apikey", "credential", "credentials"])
+        .or(pair("api", &["key"])).or(pair("access", &["key"])).or(pair("private", &["key"])).or(pair("auth", &["key"]))
+        .or(pair("recovery", &["key", "code"])).or(pair("backup", &["code"])).or((w == ["key"]).then_some(0));
+    let (kind, at) = match (password, key_at) {
+        (Some(i), _) => (SecretKind::Password, i),
+        (None, Some(i)) => (SecretKind::Key, i),
+        _ => return None,
     };
-    let lower = v.to_lowercase();
-    if w.iter().any(|k| ABOUT.contains(&k.as_str())) || MASKED.is_match(v) || NOT_A_VALUE.is_match(v) || PLACEHOLDER.is_match(v) {
+    // token_count, password_hash, api_key_header: the name ends by saying it's about the secret, not the secret.
+    if w.len() > at + 1 && ABOUT.contains(&w[w.len() - 1].as_str()) {
         return None;
     }
+    if MASKED.is_match(v) || NOT_A_VALUE.is_match(v) || PLACEHOLDER.is_match(v) {
+        return None;
+    }
+    let lower = v.to_lowercase();
     let n = v.chars().count();
     let plain = v.chars().all(|c| c.is_alphabetic() || c == '_');
     if !quoted {
-        // A call, an index, a path through an object, a keyword, or just another variable.
-        if v.contains(['(', '[', '{']) || DOTTED.is_match(v) || CODE_WORDS.contains(&lower.as_str()) || w.contains(&lower) || lower == words(key).join("_") {
+        // A call, a lookup, a path through a well-known object, a keyword, or the variable of the same name.
+        // "p(ss)w0rd" closes its bracket and carries on; a call doesn't.
+        let carries_on = v.rfind([')', ']']).is_some_and(|i| v[i + 1..].chars().any(char::is_alphanumeric));
+        if CODE_START.is_match(v) && !carries_on || DOTTED.is_match(v) || CODE_WORDS.contains(&lower.as_str()) || w.contains(&lower) || lower == w.join("_") {
             return None;
         }
-        if plain && (kind == SecretKind::Key || sep != ":") {
+        // An unquoted bare word is a variable when the name wants a key, or a type after a colon in code. As a
+        // password it is taken at its word: "password = swordfish".
+        if plain && kind == SecretKind::Key {
             return None;
         }
     }
     let ok = match kind {
-        SecretKind::Password if has("pin") || has("otp") => n >= 4,
+        SecretKind::Password if is(&["pin", "otp"]).is_some() => n >= 4,
         SecretKind::Password => n >= 3,
         _ => n >= 8 && (v.chars().any(|c| c.is_ascii_digit()) || quoted && n >= 12 && !plain),
     };
@@ -343,18 +360,21 @@ fn scan_latin(text: &str, line: usize, hits: &mut Vec<Hit>) {
         }
     }
     for m in CARD_GROUPS.find_iter(text) {
-        // More digit groups after it, or a label saying what it is: a tracking or order number, not a card.
-        let more = text[m.end()..].trim_start_matches([' ', '-', '.']).starts_with(|c: char| c.is_ascii_digit()) && text[m.end()..].len() - text[m.end()..].trim_start_matches([' ', '-', '.']).len() <= 2;
-        if !more && !NOT_A_CARD.is_match(&text[..m.start()]) {
+        let d: String = m.as_str().chars().filter(char::is_ascii_digit).collect();
+        let real = CARD_PREFIX.is_match(&d) && luhn(&d);
+        // A tracking number runs on past where a card would stop: another short group follows (not an expiry date)
+        // and the whole is too long. A label can also say it's something else, unless the number checks out as a card.
+        let rest = &text[m.end()..];
+        let after = rest.trim_start_matches([' ', '-', '.']);
+        let group = after.chars().take_while(char::is_ascii_digit).count();
+        let run_on = rest.len() - after.len() <= 2 && (2..=4).contains(&group) && !after[group..].starts_with('/') && d.len() + group > 19;
+        if real || !run_on && !NOT_A_CARD.is_match(&text[..m.start()]) {
             push(hits, line, m.range(), Financial, "card");
         }
     }
     for m in DIGIT_RUN.find_iter(text) {
-        if NOT_A_CARD.is_match(&text[..m.start()]) {
-            continue;
-        }
         let (at, d): (Vec<usize>, String) = m.as_str().char_indices().filter(|x| x.1.is_ascii_digit()).unzip();
-        if (13..=19).contains(&d.len()) && luhn(&d) {
+        if (13..=19).contains(&d.len()) && luhn(&d) && !NOT_A_CARD.is_match(&text[..m.start()]) {
             push(hits, line, m.range(), Financial, "card");
         }
         // A stray digit beside a card must not hide it; inside a longer run only real card shapes count.
@@ -373,13 +393,13 @@ fn scan_latin(text: &str, line: usize, hits: &mut Vec<Hit>) {
             push(hits, line, m.range(), Financial, "iban");
         }
     }
-    if let Some(label) = FIN_LABEL.find(text) {
+    for label in FIN_LABEL.find_iter(text) {
         // "Order number 88213" has no financial label; "Account number 4417 2280 9931" does.
         if let Some(v) = FIN_VALUE.find_at(text, label.end()) {
             let digits = v.as_str().chars().filter(char::is_ascii_digit).count();
             // A bare "card" or "account" is as likely a contact card or an account manager: the number must follow at
             // once, be long, and not be a phone number.
-            let named = FIN_QUAL.is_match(label.as_str());
+            let named = FIN_QUAL.is_match(&text[label.start()..v.start()]);
             let gap = v.start() - label.end();
             if named && gap <= 24 && digits >= 4 || !named && gap <= 2 && digits >= 8 && !phone_like(v.as_str()) {
                 push(hits, line, v.range(), Financial, "account");
@@ -389,13 +409,23 @@ fn scan_latin(text: &str, line: usize, hits: &mut Vec<Hit>) {
     for c in CVV.captures_iter(text) {
         push(hits, line, c.get(1).unwrap().range(), Financial, "cvv");
     }
-    for c in ASSIGN.captures_iter(text) {
-        let v = c.get(4).unwrap();
+    // A name that isn't a secret's gives up only itself: its value is looked at again as a name in its own right,
+    // so "user=dana&password=..." and "Name: password: ..." are both found.
+    let mut from = 0;
+    while let Some(c) = ASSIGN.captures_at(text, from) {
+        let (sep, v) = (c.get(2).unwrap(), c.get(4).unwrap());
         let quoted = !c[3].is_empty();
         let trimmed = if quoted { v.as_str() } else { v.as_str().trim_end_matches([')', ']', '}', '.']) };
-        if let Some(kind) = assigned(&c[1], &c[2], quoted, trimmed) {
-            push(hits, line, v.start()..v.start() + trimmed.len(), kind, "assignment");
+        match assigned(&c[1], quoted, trimmed) {
+            Some(kind) => {
+                push(hits, line, v.start()..v.start() + trimmed.len(), kind, "assignment");
+                from = v.end();
+            }
+            None => from = sep.end(),
         }
+    }
+    for c in RECOVERY.captures_iter(text) {
+        push(hits, line, c.get(1).unwrap().range(), Key, "label");
     }
     for c in LABELLED.captures_iter(text) {
         let v = c.get(1).unwrap();
@@ -412,9 +442,9 @@ fn scan_latin(text: &str, line: usize, hits: &mut Vec<Hit>) {
         }
     }
     for c in BEARER.captures_iter(text) {
-        let v = c.get(1).unwrap();
-        // "token authentication" is two words, not a credential.
-        if v.as_str().chars().any(|c| c.is_ascii_digit()) {
+        let v = c.get(2).unwrap();
+        // "token authentication" is two words, not a credential; after "Bearer" or "Basic" anything is.
+        if !c[1].eq_ignore_ascii_case("token") || v.as_str().chars().any(|c| c.is_ascii_digit()) {
             push(hits, line, v.range(), Key, "bearer");
         }
     }
@@ -1048,5 +1078,61 @@ mod tests {
         ] {
             assert!(!masked(t).contains(secret), "missed in {t:?}: {}", masked(t));
         }
+    }
+
+    // ---- security review of the rewrite, 2026-11-24 ----
+    #[test]
+    fn a_secret_is_not_swallowed_by_what_comes_before_it() {
+        for (t, secret) in [
+            ("user=dana&password=hunter22", "hunter22"), ("https://x.com/cb?state=abc&access_token=Zx81qwerty99", "Zx81qwerty99"), ("Name: password: x1y2z3", "x1y2z3"),
+            ("a=b password=swordfish9", "swordfish9"), ("grant_type=client_credentials&client_secret=q8Zr2LmN0pXv", "q8Zr2LmN0pXv"),
+        ] {
+            assert!(!masked(t).contains(secret), "{t}: {}", masked(t));
+        }
+    }
+
+    #[test]
+    fn secret_names_are_recognised_inside_longer_names() {
+        for (t, secret) in [
+            ("PGPASSWORD=swordfish", "swordfish"), ("authtoken=Zx81qwerty99", "Zx81"), ("jwtSecret: \"k3j4h5g6f7d8\"", "k3j4"), ("APIKey=a1b2c3d4e5f6", "a1b2"),
+            ("DB_PASSWORD=swordfish", "swordfish"), ("password = swordfish", "swordfish"), ("MYSQL_PWD=opensesame", "opensesame"), ("passwords: tuba41 heron7", "tuba41"),
+            ("Recovery code: 4821-9937-1120", "4821"), ("backup code 77291034", "77291034"), ("password=first.last", "first.last"), ("password=p(ss)w0rd", "p(ss)w0rd"),
+            ("password=your-eyes-only-9", "your-eyes"), ("api_key=abc<def>12345", "abc<def>"),
+        ] {
+            assert!(!masked(t).contains(secret), "{t}: {}", masked(t));
+        }
+    }
+
+    #[test]
+    fn every_financial_label_on_a_line_is_considered() {
+        for (t, secret) in [("Account manager Priya, account number 4417 2280 9931", "9931"), ("Card on file. Routing number: 021000021", "021000021")] {
+            assert!(!masked(t).contains(secret), "{t}: {}", masked(t));
+        }
+    }
+
+    #[test]
+    fn the_model_is_overruled_only_about_contact_details_it_called_other() {
+        use SecretKind::*;
+        for (v, k, keep) in [
+            ("(415) 555-0142", Other, true), ("+1 415 555 0142", Other, true), ("415-555-0142", Other, true), ("dana@example.com", Other, true), ("Dana Whitfield", Other, true),
+            ("415-555-0142", Password, false), ("Dana Whitfield", Password, false), ("dana@example.com", Key, false), ("219-09-9999", Ssn, false), ("0142 5550 4155", Financial, false),
+            ("020 7946", Other, false), ("marmalade-tuba-41", Other, false),
+        ] {
+            assert_eq!(keep_despite_model(v, k), keep, "{v} {k:?}");
+        }
+    }
+
+    #[test]
+    fn cards_survive_what_is_around_them() {
+        for t in ["4111 1111 1111 1111 08/29", "4111 1111 1111 1111 123", "Order 4111111111111111", "Invoice 4111 1111 1111 1111"] {
+            assert!(masked(t).contains("[hidden]"), "{t}");
+        }
+    }
+
+    #[test]
+    fn authorization_values_need_no_digit() {
+        assert!(!masked("Authorization: Bearer abcdefghijklmnopqrst").contains("abcdefgh"));
+        assert!(!masked("Authorization: Basic dXNlcjpwYXNzd29yZA==").contains("dXNl"));
+        assert_eq!(masked("token authentication is required"), "token authentication is required");
     }
 }

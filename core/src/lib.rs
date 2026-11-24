@@ -553,6 +553,7 @@ impl Shared {
         let l = l?;
         self.ensure(&l, &c.model, CONTEXT)?;
 
+        let mut unsure = HashSet::new();
         let mut at = 0;
         while at < text.len() {
             let mut end = at;
@@ -561,7 +562,7 @@ impl Shared {
                 chars += text[end].1.len();
                 end += 1;
             }
-            hits.extend(self.ask(&l, c, lines, &text[at..end])?);
+            hits.extend(self.ask(&l, c, lines, &text[at..end], &mut unsure)?);
             *lock(&self.last_lm_use) = Instant::now();
             if end == text.len() {
                 break;
@@ -569,7 +570,7 @@ impl Shared {
             // Overlap so a label and its value are never split. Always advance.
             at = end.saturating_sub(3).max(at + 1);
         }
-        let dirty: HashSet<usize> = hits.iter().chain(known).map(|h| h.line).collect();
+        let dirty: HashSet<usize> = hits.iter().chain(known).map(|h| h.line).chain(unsure).collect();
         let mut clean = lock(&self.clean);
         if clean.len() > 30_000 {
             clean.clear();
@@ -579,18 +580,25 @@ impl Shared {
     }
 
     /// One chunk; an unusable answer is retried on halves before giving up.
-    fn ask(&self, l: &lm::Lm, c: &Config, lines: &[TextLine], chunk: &[(usize, String)]) -> Result<Vec<Hit>, lm::LmError> {
+    fn ask(&self, l: &lm::Lm, c: &Config, lines: &[TextLine], chunk: &[(usize, String)], unsure: &mut HashSet<usize>) -> Result<Vec<Hit>, lm::LmError> {
         let view: Vec<(usize, &str)> = chunk.iter().map(|(i, t)| (*i, t.as_str())).collect();
         match l.find_secrets(&c.model, &view) {
             Ok(f) => Ok(f
                 .into_iter()
-                .filter(|(_, v, k)| !v.contains("[hidden]") && !detect::keep_despite_model(v, *k))
+                .filter(|(i, v, k)| {
+                    let keep = detect::keep_despite_model(v, *k);
+                    // Overruled, not cleared: the line is asked about again next time.
+                    if keep {
+                        unsure.insert(*i);
+                    }
+                    !v.contains("[hidden]") && !keep
+                })
                 .flat_map(|(i, v, k)| lm::locate(lines, i, &v, k))
                 .collect()),
             Err(lm::LmError::BadAnswer(_)) if chunk.len() >= 8 => {
                 let m = chunk.len() / 2;
-                let mut a = self.ask(l, c, lines, &chunk[..m + 2])?;
-                a.extend(self.ask(l, c, lines, &chunk[m.saturating_sub(2)..])?);
+                let mut a = self.ask(l, c, lines, &chunk[..m + 2], unsure)?;
+                a.extend(self.ask(l, c, lines, &chunk[m.saturating_sub(2)..], unsure)?);
                 Ok(a)
             }
             Err(e) => Err(e),
