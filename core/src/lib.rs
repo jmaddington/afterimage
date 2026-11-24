@@ -513,7 +513,7 @@ impl Shared {
     }
 
     /// Ask the model about every line it hasn't already cleared. Err means "not checked".
-    fn ai_hits(&self, c: &Config, tape: &mut lm::Tape, lines: &[TextLine], known: &[Hit]) -> Result<Vec<Hit>, lm::LmError> {
+    fn ai_hits(&self, c: &Config, tape: &mut lm::Tape, lines: &[TextLine], known: &[Hit], hits: &mut Vec<Hit>) -> Result<(), lm::LmError> {
         let keys: Vec<u64> = (0..lines.len()).map(|i| self.line_key(lines, i)).collect();
         let todo: Vec<usize> = {
             let clean = lock(&self.clean);
@@ -522,7 +522,7 @@ impl Shared {
                 .collect()
         };
         if todo.is_empty() {
-            return Ok(vec![]);
+            return Ok(());
         }
         // Neighbours come along for context; what the rules already caught is masked before it leaves the process.
         let mut send: Vec<usize> = todo.iter().flat_map(|&i| i.saturating_sub(2)..=(i + 1).min(lines.len() - 1)).collect();
@@ -542,7 +542,6 @@ impl Shared {
         let l = l?;
         self.ensure(&l, &c.model, CONTEXT)?;
 
-        let mut hits = Vec::new();
         let mut at = 0;
         while at < text.len() {
             let mut end = at;
@@ -565,7 +564,7 @@ impl Shared {
             clean.clear();
         }
         clean.extend(todo.iter().filter(|i| !dirty.contains(i)).map(|&i| keys[i]));
-        Ok(hits)
+        Ok(())
     }
 
     /// One chunk; an unusable answer is retried on halves before giving up.
@@ -593,22 +592,23 @@ impl Shared {
         let r = self.process_taped(f, require_ai, &mut tape);
         let calls = take(&tape);
         match &r {
-            Ok(Some((id, hits))) => self.note(devlog::checks(calls, &f.lines, Some(hits), Some(*id))),
+            Ok(Some((id, hits, checked))) => self.note(devlog::checks(calls, &f.lines, checked.then_some(hits.as_slice()), Some(*id))),
             Ok(None) => {} // Forgotten while it was being checked.
             Err(_) => self.note(devlog::checks(calls, &f.lines, None, None)),
         }
         r.map(|_| ())
     }
 
-    fn process_taped(&self, f: &mut Frame, require_ai: bool, tape: &mut lm::Tape) -> Result<Option<(i64, Vec<Hit>)>, String> {
+    fn process_taped(&self, f: &mut Frame, require_ai: bool, tape: &mut lm::Tape) -> Result<Option<(i64, Vec<Hit>, bool)>, String> {
         let c = lock(&self.config).clone();
         let mut hits = detect::scan(&f.lines);
         hits.extend(covered(&f.lines, &f.covers));
-        let ai_checked = match self.ai_hits(&c, tape, &f.lines, &hits) {
-            Ok(h) => {
-                hits.extend(h);
-                true
-            }
+        // What it found before any failure counts either way.
+        let mut found = Vec::new();
+        let checked = self.ai_hits(&c, tape, &f.lines, &hits, &mut found);
+        hits.extend(found);
+        let ai_checked = match checked {
+            Ok(()) => true,
             Err(e) if require_ai => return Err(e.to_string()),
             Err(_) => false,
         };
@@ -672,7 +672,7 @@ impl Shared {
         }
         let new = NewShot { moment: m, path: path.clone(), thumb_path: thumb_path.clone(), width: e.width, height: e.height, bytes: e.bytes, regions, lines, ai_checked };
         match store.insert(&new) {
-            Ok(id) => Ok(Some((id, hits))),
+            Ok(id) => Ok(Some((id, hits, ai_checked))),
             Err(e) => {
                 drop(store);
                 remove();
@@ -1050,11 +1050,17 @@ mod tests {
 
     /// A stand-in LM Studio: answers every check with one finding and remembers nothing.
     fn fake_lm(answer: &'static str, status: u16) -> String {
+        fake_lm_until(answer, status, if status == 200 { usize::MAX } else { 0 })
+    }
+    /// Answers `good` checks properly, then refuses.
+    fn fake_lm_until(answer: &'static str, status: u16, good: usize) -> String {
         use std::io::{Read, Write};
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", l.local_addr().unwrap());
         std::thread::spawn(move || {
             for mut s in l.incoming().flatten() {
+                let asked = asked.clone();
                 std::thread::spawn(move || {
                     let mut buf = Vec::new();
                     let mut chunk = [0; 4096];
@@ -1073,8 +1079,8 @@ mod tests {
                     }
                     let (code, body) = if h.starts_with("get /api/v1/models") {
                         (200, r#"{"models":[{"key":"m","loaded_instances":[{}],"type":"llm"}]}"#.to_owned())
-                    } else if status != 200 {
-                        (status, r#"{"error":{"message":"bad prompt: quartz-otter-9 was in it"}}"#.to_owned())
+                    } else if asked.fetch_add(1, SeqCst) >= good {
+                        (if status == 200 { 400 } else { status }, r#"{"error":{"message":"bad prompt: quartz-otter-9 was in it"}}"#.to_owned())
                     } else {
                         (200, serde_json::json!({"choices":[{"finish_reason":"stop","message":{"content":answer}}]}).to_string())
                     };
@@ -1211,5 +1217,26 @@ mod tests {
         assert!(e.refresh_pages(78));
         e.shutdown();
         drop(h);
+    }
+
+    /// Rules-only fallback: the model answered about the first part of the screen, then failed.
+    #[test]
+    fn what_the_model_found_before_failing_still_counts_and_no_words_are_logged() {
+        let d = tempfile::tempdir().unwrap();
+        let c = Config { lm_url: fake_lm_until(FOUND, 200, 1), developer: true, ..config(false) };
+        let e = Engine::new(d.path().to_string_lossy().into(), c, Arc::new(FakeHost(Default::default()))).unwrap();
+        let mut f = secretive(1000);
+        for i in 0..120 {
+            f.lines.push(TextLine { text: format!("ordinary words number {i}"), rect: Rect { x: 0.1, y: 0.9, w: 0.1, h: 0.001 }, tokens: vec![], code: false });
+        }
+        e.ingest(f);
+        wait(|| e.stats().unwrap().count == 1);
+        let s = e.list(Filter::default(), 1, 0).unwrap().remove(0);
+        assert!(!s.ai_checked);
+        let all = format!("{:?}{:?}", e.lines(s.id).unwrap(), e.dev_log(50, None).unwrap());
+        assert!(!all.contains("quartz"), "{all}");
+        let log = e.dev_log(50, None).unwrap();
+        assert!(log.iter().filter(|x| x.kind == "check").count() >= 2 && log.iter().all(|x| x.kind != "check" || x.request.is_empty() && x.response.is_empty()), "{log:?}");
+        e.shutdown();
     }
 }

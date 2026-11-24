@@ -29,7 +29,8 @@ fn pretty(v: &Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_default()
 }
 
-/// Calls made while a frame was being checked. `hits` is final; None means the frame wasn't saved.
+/// Calls made while a frame was being checked. `hits` is final; None means the frame wasn't saved or the check
+/// didn't finish, and then no words are kept.
 pub fn checks(calls: Vec<Call>, lines: &[TextLine], hits: Option<&[Hit]>, shot: Option<i64>) -> Vec<DevEntry> {
     calls
         .into_iter()
@@ -41,7 +42,7 @@ pub fn checks(calls: Vec<Call>, lines: &[TextLine], hits: Option<&[Hit]>, shot: 
             e.shot_id = shot;
             let Some(hits) = hits else {
                 if e.note.is_empty() {
-                    e.note = "the picture wasn\u{2019}t saved".into();
+                    e.note = if shot.is_some() { "the check didn\u{2019}t finish" } else { "the picture wasn\u{2019}t saved" }.into();
                 }
                 e.ok = false;
                 return e;
@@ -94,7 +95,14 @@ pub fn about(calls: Vec<Call>, shot: i64) -> Vec<DevEntry> {
                     req["messages"][0]["content"][1] = json!({"type": "image_url", "image_url": format!("[picture {shot}]")});
                     let v = c.result.unwrap_or_default();
                     let text = v["choices"][0]["message"]["content"].as_str().unwrap_or_default();
-                    e.response = pretty(&json!({"finish_reason": v["choices"][0]["finish_reason"].as_str(), "usage": v["usage"].as_object(), "content": detect::mask_text(text)}));
+                    // Decoded first: a rule can't see a key hiding behind a JSON escape.
+                    let content = match serde_json::from_str::<Value>(text) {
+                        Ok(p) if p["description"].is_string() => json!({
+                            "description": detect::mask_text(p["description"].as_str().unwrap_or_default()),
+                            "tags": p["tags"].as_array().into_iter().flatten().filter_map(Value::as_str).map(detect::mask_text).collect::<Vec<_>>()}),
+                        _ => json!({"unreadable_answer_characters": text.chars().count()}),
+                    };
+                    e.response = pretty(&json!({"finish_reason": v["choices"][0]["finish_reason"].as_str(), "usage": v["usage"].as_object(), "content": content}));
                 }
                 "embed" => {
                     let n = c.result.ok().and_then(|v| v["data"][0]["embedding"].as_array().map(Vec::len)).unwrap_or(0);
@@ -122,4 +130,30 @@ pub fn search(calls: Vec<Call>) -> Vec<DevEntry> {
             settings(c, e)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn described(content: &str) -> Call {
+        Call { path: "/v1/chat/completions", at: 1, ms: 1, lines: vec![], request: json!({"model": "m", "messages": [{"role": "user", "content": [{"type": "text", "text": "p"}, {"type": "image_url", "image_url": {"url": "data:..."}}]}]}),
+               result: Ok(json!({"choices": [{"finish_reason": "stop", "message": {"content": content}}]})) }
+    }
+
+    #[test]
+    fn captions_are_masked_as_text_not_as_json() {
+        let c = json!({"description": "first line\nAKIAIOSFODNN7EXAMPLE and \"password: hunter2zebra\"", "tags": ["ok", "token=Zx81qwertyuiop"]}).to_string();
+        let e = about(vec![described(&c)], 5).remove(0);
+        for x in ["AKIAIOSFODNN7", "hunter2zebra", "Zx81qwerty", "data:..."] {
+            assert!(!format!("{e:?}").contains(x), "{x}: {e:?}");
+        }
+        assert!(e.response.contains("first line") && e.response.contains("ok") && e.request.contains("[picture 5]"));
+    }
+
+    #[test]
+    fn a_caption_that_cannot_be_read_is_only_counted() {
+        let e = about(vec![described("AKIAIOSFODNN7EXAMPLE {")], 5).remove(0);
+        assert!(!e.response.contains("AKIA") && e.response.contains("unreadable_answer_characters"), "{}", e.response);
+    }
 }
