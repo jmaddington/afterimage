@@ -70,6 +70,9 @@ pub struct PagePlan {
     pub hide: Option<HideReason>,
     /// Otherwise frost these, in screen points.
     pub covers: Vec<Cover>,
+    /// For the developer log: why a field couldn't be placed. Numbers and flags only.
+    #[uniffi(default = "")]
+    pub note: String,
 }
 
 /// The address as `extension/detect.js` writes it: origin and path, or just the scheme of anything that isn't the web.
@@ -87,7 +90,7 @@ pub fn clean_address(raw: &str) -> String {
 /// AIDEV-NOTE: leaves the browser out.
 #[uniffi::export]
 pub fn plan_page(ex: &Exclusions, hint: &PageHint, areas: &[PageArea], complete: bool) -> PagePlan {
-    let leave_out = |r| PagePlan { hide: Some(r), covers: vec![] };
+    let leave_out = |r| PagePlan { hide: Some(r), covers: vec![], note: String::new() };
     if hint.private_window && ex.private_windows {
         return leave_out(HideReason::PrivateWindow);
     }
@@ -102,14 +105,20 @@ pub fn plan_page(ex: &Exclusions, hint: &PageHint, areas: &[PageArea], complete:
         if (tab.background || tab.hidden) && complete && !named.is_empty() && named.len() == tab.urls.len() && showing.is_empty() {
             continue;
         }
-        let [area] = showing.as_slice() else { return leave_out(HideReason::SecretField) };
+        let [area] = showing.as_slice() else {
+            return PagePlan { note: format!("{} pages on screen have this tab's address ({} names for it)", showing.len(), tab.urls.len()), ..leave_out(HideReason::SecretField) };
+        };
         let same = |points: f64, pixels: f64| (points * area.scale - pixels).abs() <= 3.0;
         let r = area.rect;
         // NaN fails every comparison, so it lands here too.
         // A page that thinks it's hidden while the screen shows it doesn't know where it is.
         let trusted = complete && !tab.hidden && tab.current && !tab.sensitive && tab.urls.len() == 1 && pixels_ok(tab) && same(r.w, tab.width) && same(r.h, tab.height) && r.x.is_finite() && r.y.is_finite();
         if !trusted {
-            return leave_out(HideReason::SecretField);
+            let note = format!(
+                "page says {}x{} px; screen shows {:.0}x{:.0} pt at {}x; complete={complete} hidden={} current={} sensitive={} names={}",
+                tab.width, tab.height, r.w, r.h, area.scale, tab.hidden, tab.current, tab.sensitive, tab.urls.len()
+            );
+            return PagePlan { note, ..leave_out(HideReason::SecretField) };
         }
         covers.extend(tab.fields.iter().map(|f| Cover {
             kind: f.kind,
@@ -117,7 +126,7 @@ pub fn plan_page(ex: &Exclusions, hint: &PageHint, areas: &[PageArea], complete:
             empty: f.empty,
         }));
     }
-    PagePlan { hide: None, covers }
+    PagePlan { hide: None, covers, note: String::new() }
 }
 
 fn pixels_ok(tab: &TabSeen) -> bool {

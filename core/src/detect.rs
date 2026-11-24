@@ -122,6 +122,8 @@ re!(DOTTED, r"^(?:self|this|args|settings|os|config|cfg|env|opts|options|params|
 // A call or a lookup: getpass.getpass(), os.environ["X"].
 re!(CODE_START, r"^[A-Za-z_][\w.]*[(\[]");
 re!(RECOVERY, r"(?i)\b(?:recovery|backup)\s+(?:codes?|keys?|phrases?)\b[ \t]*([:=])?[ \t]*");
+// A row that starts by naming its own field is that field, not the value of the label above it.
+re!(FIELD_START, r"(?i)^\s*(?:card|account|routing|name|member|e-?mail|user(?:name)?|phone|address|notes?|date|expir\w*|cvv|cvc|zip|city|state|country|first|last|company)\b");
 re!(PHONE_334, r"^\d{3}[\s.\-]\d{3}[\s.\-]\d{4}$");
 re!(FIN_QUAL, r"(?i)\b(?:number|num|no\.?|nbr|code|iban|routing|aba|swift|bic|sort\s*code)\b|#");
 // Long numbers that are plainly something else.
@@ -539,7 +541,7 @@ pub fn scan(lines: &[TextLine]) -> Vec<Hit> {
         if PASS_LABEL.is_match(t) {
             for j in neighbours(lines, i) {
                 let v = &latin[j];
-                if (plausible_value(v) || plausible_value(&lines[j].text)) && !PASS_LABEL.is_match(v) {
+                if (plausible_value(v) || plausible_value(&lines[j].text)) && !PASS_LABEL.is_match(v) && !FIELD_START.is_match(v) {
                     push(&mut hits, j, 0..lines[j].text.len(), SecretKind::Password, "label");
                 }
             }
@@ -1232,5 +1234,16 @@ mod tests {
         assert_eq!(scrub_url("https://example.com/docs/getting-started"), "https://example.com/docs/getting-started");
         // Beside a secret's label, in any alphabet's lookalikes.
         assert!(!keep_despite_model("Dana Whitfield", SecretKind::Other, "Раsswоrd hint"));
+    }
+
+    /// Seen live: an empty-looking password row above "Card number 4111…" took the whole card row for its value.
+    #[test]
+    fn the_next_field_is_not_this_fields_value() {
+        let l = vec![line("Password", 0.1, 0.10), line("Card number 4111 1111 1111 1111", 0.1, 0.14), line("Notes for the plumber", 0.1, 0.18)];
+        let h = scan(&l);
+        assert!(!h.iter().any(|x| x.line == 1 && x.range.start == 0), "{h:?}");
+        assert!(h.iter().any(|x| x.line == 1 && x.why == "card"));
+        let l = vec![line("Password", 0.1, 0.10), line("blue-heron-7", 0.1, 0.14)];
+        assert!(scan(&l).iter().any(|x| x.line == 1));
     }
 }

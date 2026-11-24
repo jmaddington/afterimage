@@ -183,7 +183,9 @@ public actor Capturer {
                 h.pids.insert(pid)
                 h.reasons[pid] = r
             } else if isBrowser(bundleId: bundle), drawing.contains(pid) {
-                if needsWaking(bundleId: bundle) { Accessibility.wake(pid: pid) }
+                // Chrome describes its page only when asked. Asked only where its extension is in use: that is when
+                // the page's place on screen is needed.
+                if needsWaking(bundleId: bundle) || engine.extensionHeard(pid: pid) { Accessibility.wake(pid: pid) }
                 let reading = Accessibility.read(pid: pid, visible: visible)
                 if let r = hideBrowser(ex: ex, bundleId: bundle, windows: reading.windows, complete: reading.complete) {
                     h.pids.insert(pid)
@@ -193,6 +195,7 @@ public actor Capturer {
                     let answered = engine.refreshPages(pid: pid)
                     let areas = reading.pages.map { PageArea(url: $0.url, rect: Rect(x: $0.frame.minX, y: $0.frame.minY, w: $0.frame.width, h: $0.frame.height), scale: scale(at: $0.frame)) }
                     let plan = planPage(ex: ex, hint: engine.pageHint(pid: pid), areas: areas, complete: reading.complete)
+                    if !plan.note.isEmpty { engine.noteCapture(trigger: "page", outcome: "Couldn’t place a field: \(plan.note)") }
                     if let r = plan.hide ?? (answered ? nil : .noAnswer) {
                         h.pids.insert(pid)
                         h.reasons[pid] = r

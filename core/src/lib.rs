@@ -778,7 +778,8 @@ fn covered(lines: &[TextLine], covers: &[pages::Cover]) -> Vec<Hit> {
         let h = (r.y + r.h).min(c.y + c.h) - r.y.max(c.y);
         if w > 0.0 && h > 0.0 { w * h } else { 0.0 }
     };
-    let touches = |r: &Rect, c: &Rect| overlap(r, c) > 0.03 * (r.w * r.h).min(c.w * c.h);
+    // A tenth of the smaller one: enough to catch a word half out of its box, not a label that brushes its edge.
+    let touches = |r: &Rect, c: &Rect| overlap(r, c) > 0.10 * (r.w * r.h).min(c.w * c.h);
     let mut hits = Vec::new();
     for c in covers {
         let why = if c.empty { HINT } else { "extension" };
@@ -1269,6 +1270,8 @@ mod tests {
         let hidden = |lines: &[TextLine]| { let h = covered(lines, &c(false)); detect::mask(&lines[0].text, &h.into_iter().map(|h| h.range).collect::<Vec<_>>()) };
         // A word only partly inside.
         assert_eq!(hidden(&l("Name quartz-otter end", vec![tok(0, 4, 0.10, 0.10), tok(5, 12, 0.55, 0.30), tok(18, 3, 0.88, 0.02)])), "Name [hidden] end");
+        // A label that merely brushes the box (seen live: "Password" beside its field) stays.
+        assert_eq!(hidden(&l("Password quartz", vec![tok(0, 8, 0.20, 0.105), tok(9, 6, 0.32, 0.10)])), "Password [hidden]");
         // A word whose box is missing could be anywhere on the line.
         assert_eq!(hidden(&l("Name quartz", vec![tok(0, 4, 0.10, 0.10)])), "[hidden]");
         // The line crosses the place but no word's box does: the boxes are wrong.
