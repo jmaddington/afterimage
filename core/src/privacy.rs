@@ -204,30 +204,48 @@ static MANAGER_RULES: std::sync::LazyLock<Vec<Rule>> = std::sync::LazyLock::new(
 
 const WRAPPERS: &[&str] = &["view-source", "blob", "feed", "chrome-distiller", "safari-reader", "read"];
 
-/// This address and every address it carries inside. A wrapper can add suspicion, never remove it.
-fn layers(u: &url::Url) -> Vec<url::Url> {
+/// More addresses, or deeper encoding, than any honest page needs.
+const MAX_LAYERS: usize = 32;
+const MAX_DECODES: usize = 6;
+
+/// This address and every address it carries inside, plain or percent-encoded. A wrapper can add suspicion, never
+/// remove it. False when there was too much to look through, so nothing can be vouched for.
+fn layers(u: &url::Url) -> (Vec<url::Url>, bool) {
     let mut out = vec![u.clone()];
     let mut i = 0;
-    while i < out.len() && out.len() < 12 {
+    while i < out.len() {
         let u = out[i].clone();
         i += 1;
         // Ordinary pages may mention any address; only browser-made schemes display one.
         if matches!(u.scheme(), "http" | "https" | "file") {
             continue;
         }
-        let rest = u.as_str().split_once(':').map_or("", |x| x.1);
-        let mut found: Vec<url::Url> = url::Url::parse(rest).into_iter().collect();
-        found.extend(u.query_pairs().filter_map(|(_, v)| url::Url::parse(&v).ok()));
-        for mark in ["https://", "http://"] {
-            found.extend(rest.match_indices(mark).filter_map(|(at, _)| url::Url::parse(&rest[at..]).ok()));
+        let mut rest = u.as_str().split_once(':').map_or("", |x| x.1).to_lowercase();
+        let mut found: Vec<url::Url> = u.query_pairs().filter_map(|(_, v)| url::Url::parse(&v).ok()).collect();
+        for n in 0.. {
+            found.extend(url::Url::parse(&rest));
+            for mark in ["https://", "http://"] {
+                found.extend(rest.match_indices(mark).filter_map(|(at, _)| url::Url::parse(&rest[at..]).ok()));
+            }
+            let next = percent_encoding::percent_decode_str(&rest).decode_utf8_lossy().to_lowercase();
+            if next == rest {
+                break;
+            }
+            if n == MAX_DECODES {
+                return (out, false);
+            }
+            rest = next;
         }
         for f in found {
             if f.has_host() && !out.contains(&f) {
+                if out.len() == MAX_LAYERS {
+                    return (out, false);
+                }
                 out.push(f);
             }
         }
     }
-    out
+    (out, true)
 }
 
 /// Could this address be showing a site we can't identify? Anything unfamiliar counts.
@@ -335,7 +353,8 @@ pub fn hide_browser(ex: &Exclusions, bundle_id: &str, windows: Option<Vec<Browse
                 unreadable = true;
                 continue;
             };
-            let all = layers(&u);
+            let (all, complete) = layers(&u);
+            unreadable |= !complete;
             if ex.password_managers && all.iter().any(|u| manager_url(u, w.title.as_deref().unwrap_or(""))) {
                 return Some(HideReason::PasswordManager);
             }
@@ -619,5 +638,32 @@ mod tests {
         assert_eq!(hide_browser(&ex(), CHROME, Some(vec![w])), Some(HideReason::Unreadable));
         let blank = BrowserWindow { title: Some("  ".into()), control_labels: vec![" ".into()], ..win("https://a.com") };
         assert_eq!(hide_browser(&ex(), CHROME, Some(vec![blank])), Some(HideReason::Unreadable));
+    }
+
+    #[test]
+    fn encoded_addresses_inside_extensions_are_checked() {
+        let e = sites(&["chase.com"]);
+        let base = "chrome-extension://cjpalhdlnbpafiamejdnhcphjbkeiagm";
+        for tail in ["view.html#https%3A%2F%2Fchase.com%2Fx", "https%3A%2F%2Fwww.chase.com/x", "v#page=https%3a%2f%2fchase.com", "v?p=https%253A%252F%252Fchase.com%252F",
+                     "v#https%25253A%25252F%25252Fchase.com", "v#HTTPS://CHASE.COM/x", "v#HtTpS%3A%2F%2FCHASE.com", "v?%68ttps://chase.com", "v#x=view-source%3Ahttps%3A%2F%2Fchase.com"] {
+            assert_eq!(hid(&e, &format!("{base}/{tail}")), Some(HideReason::Site), "{tail}");
+        }
+        assert_eq!(hid(&ex(), &format!("{base}/v#https%3A%2F%2Fvault.bitwarden.com")), Some(HideReason::PasswordManager));
+        assert_eq!(hid(&e, &format!("{base}/v#https%3A%2F%2Fexample.com")), None);
+        assert_eq!(hid(&e, &format!("{base}/100%")), None);
+    }
+
+    #[test]
+    fn too_many_nested_addresses_to_check_is_unreadable() {
+        let many: String = (0..200).map(|i| format!("https://a{i}.com,")).collect();
+        let base = "chrome-extension://cjpalhdlnbpafiamejdnhcphjbkeiagm/v#";
+        assert!(hid(&sites(&["chase.com"]), &format!("{base}{many}")).is_some());
+        assert!(hid(&sites(&["chase.com"]), &format!("{base}{many}https://chase.com/")).is_some());
+        // Encoded deeper than anyone honest would.
+        let mut deep = "https://chase.com".to_owned();
+        for _ in 0..12 {
+            deep = deep.replace('%', "%25").replace(':', "%3A").replace('/', "%2F");
+        }
+        assert!(hid(&sites(&["chase.com"]), &format!("{base}{deep}")).is_some());
     }
 }
