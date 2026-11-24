@@ -41,6 +41,9 @@ struct LibraryView: View {
         @Bindable var model = model
         NavigationSplitView {
             Sidebar().navigationSplitViewColumnWidth(min: 190, ideal: 220, max: 300)
+                .safeAreaInset(edge: .bottom, alignment: .leading, spacing: 0) {
+                    Text(Words.version).font(.caption).foregroundStyle(.secondary).textSelection(.enabled).padding(.horizontal, 16).padding(.vertical, 10)
+                }
         } detail: {
             ZStack {
                 GridView().opacity(model.open == nil ? 1 : 0).allowsHitTesting(model.open == nil)
@@ -57,6 +60,7 @@ struct LibraryView: View {
         .searchable(text: $model.query, placement: .toolbar, prompt: "Words, or what you remember")
         .searchFocused($searchFocused)
         .onChange(of: model.focusSearch) { searchFocused = true }
+        .onAppear { model.installKeys() }
         .onChange(of: model.query) { model.open = nil }
     }
 

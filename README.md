@@ -157,7 +157,7 @@ This is early software (v0.1.x). Treat it accordingly.
 - Running the model on a linked machine through LM Link has not been tried.
 - There is no automatic update; new versions are on the Releases page.
 
-## Licence
+## Credits
 
-MIT (see [NOTICE](NOTICE)). Afterimage includes material adapted from
-[Dayflow](https://github.com/JerryZLiu/Dayflow), which is MIT licensed; NOTICE lists what.
+Afterimage includes material adapted from [Dayflow](https://github.com/JerryZLiu/Dayflow), which is MIT licensed;
+[NOTICE](NOTICE) lists what.

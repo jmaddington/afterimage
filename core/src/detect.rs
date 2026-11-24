@@ -165,8 +165,27 @@ re!(KNOWN, r"(?x)
 re!(QR_SECRET, r"(?is)otpauth(?:-migration)?://.*|\bWIFI:.*\bP:.*");
 // Query keys whose values are worth hunting for elsewhere on the screen.
 re!(SECRET_KEY, r"(?i)secret|token|pass|pwd|key|code|auth|sig|otp|pin|session|credential|^data$");
-re!(PEM_BEGIN, r"-{2,}\s*BEGIN [A-Z0-9 ]*(?:PRIVATE KEY|SECRET)");
-re!(PEM_END, r"-{2,}\s*END [A-Z0-9 ]*(?:PRIVATE KEY|SECRET)");
+// Dashes are often read as one long one. Certificates are hidden with keys: people keep both in the same files.
+re!(PEM_BEGIN, r"[-—–_=]+\s*BEGIN [A-Z0-9 ]*(?:PRIVATE KEY|SECRET|CERTIFICATE|PGP [A-Z ]*BLOCK)");
+re!(PEM_END, r"[-—–_=]+\s*END [A-Z0-9 ]*(?:PRIVATE KEY|SECRET|CERTIFICATE|PGP [A-Z ]*BLOCK)");
+
+/// A line of a base64 block: long, nothing but the base64 alphabet (a stray space or two from OCR aside), and mixed
+/// the way encoded bytes are. A path, a sentence or a hex hash is not.
+fn block_line(t: &str) -> bool {
+    let t = t.trim();
+    if t.split_whitespace().count() > 3 {
+        return false;
+    }
+    let c: Vec<char> = t.chars().filter(|c| !c.is_whitespace()).collect();
+    let n = c.len();
+    let count = |f: fn(&char) -> bool| c.iter().filter(|x| f(x)).count();
+    n >= 40
+        && c.iter().all(|x| x.is_ascii_alphanumeric() || matches!(x, '+' | '/' | '='))
+        && count(|x| x.is_ascii_uppercase()) * 8 >= n
+        && count(|x| x.is_ascii_lowercase()) * 8 >= n
+        && count(|x| x.is_ascii_digit()) >= 1
+        && count(|x| *x == '/') * 8 <= n
+}
 re!(LONG_TOKEN, r"[A-Za-z0-9_+/=\-]{24,}");
 re!(UUID, r"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$");
 re!(NOT_A_VALUE, r"(?i)\b(?:forgot|forgotten|reset|show|hide|sign\s*in|log\s*in|sign\s*up|continue|submit|cancel|save|remember|required|optional|must|characters?|enter|confirm|change|manager|generate|copy|username|email|user\s*name)\b");
@@ -275,7 +294,10 @@ fn assigned(key: &str, quoted: bool, v: &str, closed: bool) -> Option<SecretKind
     // However the capitals fall ("APIkey"), the name run together still ends the same way.
     let joined = w.concat();
     let run = |list: &[&str]| list.iter().any(|x| joined.ends_with(x)).then(|| w.len() - 1);
-    let password = ends(&["password", "passwords", "passwd", "pwd", "passcode", "passphrase"]).or(is(&["pass", "pin", "otp"])).or(run(&["password", "passwd", "passphrase", "passcode"]));
+    // "pass" is also a verb: "Tests pass: 150". It names a password alone or after what it's the password to.
+    const PASS_OF: &[&str] = &["db", "database", "root", "admin", "user", "my", "your", "wifi", "wi", "fi", "login", "mysql", "pg", "postgres", "redis", "ssh", "ftp", "sftp", "smtp", "imap", "mail", "email", "http", "proxy", "new", "old", "the", "app", "api", "vpn", "sudo", "master", "account", "router", "network"];
+    let pass = w.iter().position(|k| k == "pass").filter(|&i| i == 0 || PASS_OF.contains(&w[i - 1].as_str()));
+    let password = ends(&["password", "passwords", "passwd", "pwd", "passcode", "passphrase"]).or(is(&["pin", "otp"])).or(pass).or(run(&["password", "passwd", "passphrase", "passcode"]));
     let key_at = ends(&["secret", "secrets", "token", "apikey", "credential", "credentials"])
         .or(pair("api", &["key"])).or(pair("access", &["key"])).or(pair("private", &["key"])).or(pair("auth", &["key"]))
         .or(pair("recovery", &["key", "code"])).or(pair("backup", &["code"])).or((w == ["key"]).then_some(0))
@@ -438,12 +460,18 @@ fn scan_latin(text: &str, line: usize, hits: &mut Vec<Hit>) {
     while let Some(c) = ASSIGN.captures_at(text, from) {
         let (sep, v) = (c.get(2).unwrap(), c.get(4).unwrap());
         let quoted = !c[3].is_empty();
+        // "pass" alone is judged with the word before it: "db pass: x" is a password, "Tests pass: 150" is a verb.
+        let before = text[..c.get(1).unwrap().start()].split_whitespace().next_back().filter(|w| w.chars().all(char::is_alphabetic));
+        let name = match before {
+            Some(b) if c[1].eq_ignore_ascii_case("pass") => format!("{b} {}", &c[1]),
+            _ => c[1].to_owned(),
+        };
         let judge = |whole: &str| {
             let balanced = |o: char, c: char| whole.matches(o).count() == whole.matches(c).count();
             let closed = !quoted && whole.ends_with([')', ']']) && balanced('(', ')') && balanced('[', ']');
             let trimmed = if quoted { whole } else { whole.trim_end_matches([')', ']', '}', '.']) };
             // A real call gives up its closing bracket and is judged as one; anything else keeps every character.
-            match assigned(&c[1], quoted, trimmed, closed) {
+            match assigned(&name, quoted, trimmed, closed) {
                 None if closed => None,
                 None => None,
                 Some(k) => Some(k),
@@ -545,6 +573,17 @@ pub fn scan(lines: &[TextLine]) -> Vec<Hit> {
     let mut hits = Vec::new();
     let mut in_pem = false;
     let latin: Vec<String> = lines.iter().map(|l| latinised(&l.text, false).0).collect();
+    // Three or more block lines in a row are key material whether or not a header is in view.
+    let mut i = 0;
+    while i < lines.len() {
+        let run = lines[i..].iter().take_while(|l| !l.code && block_line(&l.text)).count();
+        if run >= 3 {
+            for j in i..i + run {
+                push(&mut hits, j, 0..lines[j].text.len(), SecretKind::Key, "key-block");
+            }
+        }
+        i += run.max(1);
+    }
     for (i, l) in lines.iter().enumerate() {
         let t = &latin[i];
         if l.code {
@@ -1373,6 +1412,40 @@ mod tests {
         assert!(got.contains(&"correct") && got.contains(&"correct horse battery token=Zx81qwerty99") && got.contains(&"Zx81qwerty99"), "{got:?}");
         for (t, secret) in [("mysql -p'half open9", "open9"), ("mysql -pab'cd9 x", "cd9"), ("curl -u dana:pa'ss9 x", "ss9"), ("curl -u \"dana:open quote9", "quote9")] {
             assert!(!masked(t).contains(secret), "{t}: {}", masked(t));
+        }
+    }
+
+    #[test]
+    fn a_verb_is_not_a_password_label() {
+        // Seen live: every "Tests pass: 150" in a terminal was being frosted.
+        for t in ["Tests pass: 150 Rust, 57 Swift", "- Tests pass: 150 Rust", "All checks pass: 12 of 12", "If they pass: merge it"] {
+            assert_eq!(masked(t), t);
+        }
+        for t in ["pass: hunter22", "db pass: hunter22", "root pass = hunter22", "wifi pass: hunter22", "mysql_pass=hunter22", "PASS=hunter22"] {
+            assert!(!masked(t).contains("hunter22"), "{t}");
+        }
+    }
+
+    #[test]
+    fn certificates_and_headerless_key_blocks_are_hidden() {
+        let b = ["MIIDdzCCAl+gAwIBAgIEAgAAuTANBgkqhkiG9w0BAQUFADBaMQswCQYDVQQGEwJJ", "RTESMBAGA1UEChMJQmFsdGltb3JlMRMwEQYDVQQLEwpDeWJlclRydXN0MSIwIAYD", "VQQDExlCYWx0aW1vcmUgQ3liZXJUcnVzdCBSb290MB4XDTAwMDUxMjE4NDYwMFoX", "DTI1MDUxMjIzNTkwMFowWjELMAkGA1UEBhMCSUUxEjAQBgNVBAoTCUJhbHRpbW9y"];
+        let hidden = |l: &[TextLine]| scan(l).iter().map(|h| h.line).collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>();
+        // A certificate, header and all.
+        let cert = vec![line("-----BEGIN CERTIFICATE-----", 0.1, 0.1), line(b[0], 0.1, 0.2), line("-----END CERTIFICATE-----", 0.1, 0.3), line("ok then", 0.1, 0.4)];
+        assert_eq!(hidden(&cert), [0, 1, 2]);
+        // The header scrolled off, or the dashes were read as something else: the body alone is enough.
+        let body = vec![line("cat server.pem", 0.1, 0.1), line(b[0], 0.1, 0.2), line(b[1], 0.1, 0.3), line(b[2], 0.1, 0.4), line(b[3], 0.1, 0.5), line("done", 0.1, 0.6)];
+        assert_eq!(hidden(&body), [1, 2, 3, 4]);
+        assert_eq!(scan(&body)[0].why, "key-block");
+        // Read with a stray space in the middle, as OCR does.
+        let spaced = vec![line(&format!("{} {}", &b[0][..30], &b[0][30..]), 0.1, 0.2), line(b[1], 0.1, 0.3), line(b[2], 0.1, 0.4)];
+        assert_eq!(hidden(&spaced), [0, 1, 2]);
+        let dashes = vec![line("—BEGIN OPENSSH PRIVATE KEY—", 0.1, 0.1), line("b3BlbnNzaC1rZXk", 0.1, 0.2)];
+        assert_eq!(hidden(&dashes), [0, 1]);
+        // Paths and sentences are not a block, however long and however many.
+        for ok in [vec![line("/Users/dana/Library/Application Support/Afterimage/Shots/20416/one.heic", 0.1, 0.1), line("/Users/dana/Library/Application Support/Afterimage/Shots/20416/two.heic", 0.1, 0.2), line("/Users/dana/Library/Application Support/Afterimage/Shots/20416/six.heic", 0.1, 0.3)],
+                   vec![line("thequickbrownfoxjumpsoverthelazydogthequickbrownfox", 0.1, 0.1), line("thequickbrownfoxjumpsoverthelazydogthequickbrownfox", 0.1, 0.2), line("thequickbrownfoxjumpsoverthelazydogthequickbrownfox", 0.1, 0.3)]] {
+            assert!(hidden(&ok).is_empty(), "{:?}", ok[0].text);
         }
     }
 }

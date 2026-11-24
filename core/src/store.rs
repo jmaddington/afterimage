@@ -463,16 +463,10 @@ impl Store {
         })?
         .collect()
     }
-    /// Forget a span of time: stretches inside it go; ones that straddle its edge are cut back to it.
+    /// Forget a span of time: every stretch that touches it goes whole. A stretch can't be cut, because its title may
+    /// have been learnt during the part being forgotten.
     pub fn activity_forget(&self, from: i64, to: i64) -> Res<()> {
-        let tx = self.db.unchecked_transaction()?;
-        tx.execute("DELETE FROM activity WHERE start>=? AND end<?", [from, to])?;
-        tx.execute("UPDATE activity SET end=? WHERE start<? AND end>=? AND end<?", [from, from, from, to])?;
-        tx.execute("UPDATE activity SET start=? WHERE start>=? AND start<? AND end>=?", [to, from, to, to])?;
-        // One that covers the whole range from outside is the same window before and after; its middle can't be cut out
-        // of a single row, so the whole of it goes.
-        tx.execute("DELETE FROM activity WHERE start<? AND end>=?", [from, to])?;
-        tx.commit()?;
+        self.db.execute("DELETE FROM activity WHERE start<? AND end>=?", [to, from])?;
         let _ = self.db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
         Ok(())
     }
@@ -735,11 +729,14 @@ mod tests {
         let got = s.activity_list(150, 250, 10).unwrap();
         assert_eq!(got.iter().map(|x| x.app.as_str()).collect::<Vec<_>>(), ["A", "B"]);
         assert_eq!(got[0].others[0].app, "Notes");
-        // Forget 180..350: A is cut back, B goes, C starts later.
-        s.activity_forget(180, 350).unwrap();
+        // Forget 250..260: only B touches it.
+        s.activity_forget(250, 260).unwrap();
         let left: Vec<(String, i64, i64)> = s.activity_list(0, 1000, 10).unwrap().into_iter().map(|x| (x.app, x.start, x.end)).collect();
-        assert_eq!(left, [("A".to_owned(), 100, 180), ("C".to_owned(), 350, 900)]);
-        // Forget the middle of C: all of C goes.
+        assert_eq!(left, [("A".to_owned(), 100, 200), ("C".to_owned(), 300, 900)]);
+        // Forget 180..190, inside A: all of A goes. Then the middle of C: all of C.
+        s.activity_forget(180, 190).unwrap();
+        assert_eq!(s.activity_list(0, 1000, 10).unwrap().len(), 1);
+        s.activity_open(&span(10, 20, "D")).unwrap();
         s.activity_forget(400, 500).unwrap();
         assert_eq!(s.activity_list(0, 1000, 10).unwrap().len(), 1);
         s.activity_expire(500).unwrap();
