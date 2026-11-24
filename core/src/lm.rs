@@ -179,7 +179,12 @@ impl Lm {
             .map(|f| {
                 let line = f["line"].as_u64().ok_or(LmError::BadAnswer("line"))? as usize;
                 let value = f["value"].as_str().ok_or(LmError::BadAnswer("value"))?.to_owned();
-                Ok((line, value, SecretKind::parse(f["kind"].as_str().unwrap_or("other"))))
+                // A kind we don't know can't be argued with later.
+                let kind = match f["kind"].as_str() {
+                    Some(k @ ("password" | "ssn" | "financial" | "key" | "other")) => SecretKind::parse(k),
+                    _ => SecretKind::Key,
+                };
+                Ok((line, value, kind))
             })
             .collect()
     }

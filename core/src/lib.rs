@@ -589,15 +589,20 @@ impl Shared {
         match l.find_secrets(&c.model, &view) {
             Ok(f) => Ok(f
                 .into_iter()
-                .filter(|(i, v, k)| {
-                    let keep = detect::keep_despite_model(v, *k);
-                    // Overruled, not cleared: the line is asked about again next time.
-                    if keep {
-                        unsure.insert(*i);
+                .flat_map(|(i, v, k)| {
+                    // It quoted text we had already masked: there's more on that line than we knew. Hide all of it.
+                    let v = if v.contains("[hidden]") { String::new() } else { v };
+                    let found = lm::locate(lines, i, &v, k);
+                    let near = |j: usize| lines.get(j).map_or("", |l| l.text.as_str());
+                    let context = [near(i.wrapping_sub(1)), near(i), near(i + 1)].join("\n");
+                    if !v.is_empty() && detect::keep_despite_model(&v, k, &context) {
+                        // Overruled, not cleared: every line it touched is asked about again next time.
+                        unsure.insert(i);
+                        unsure.extend(found.iter().map(|h| h.line));
+                        return vec![];
                     }
-                    !v.contains("[hidden]") && !keep
+                    found
                 })
-                .flat_map(|(i, v, k)| lm::locate(lines, i, &v, k))
                 .collect()),
             Err(lm::LmError::BadAnswer(_)) if chunk.len() >= 8 => {
                 let m = chunk.len() / 2;
