@@ -81,13 +81,15 @@ enum Family {
 fn family(bundle: &str) -> Option<Family> {
     let b = bundle.to_lowercase();
     let p = |list: &[&str]| list.iter().any(|x| b == *x || b.starts_with(&format!("{x}.")));
-    if p(&["com.google.chrome", "org.chromium.chromium", "com.brave.browser", "com.microsoft.edgemac", "com.vivaldi.vivaldi",
+    if is_tor(&b) {
+        Some(Family::Firefox)
+    } else if p(&["com.google.chrome", "org.chromium.chromium", "com.brave.browser", "com.microsoft.edgemac", "com.vivaldi.vivaldi",
            "com.operasoftware.opera", "com.operasoftware.operagx", "ru.yandex.desktop.yandex-browser", "com.naver.whale", "com.coccoc.coccoc"]) {
         Some(Family::Chromium)
     } else if p(&["com.apple.safari", "com.apple.safaritechnologypreview", "com.kagi.kagimacos"]) {
         Some(Family::Safari)
     } else if p(&["org.mozilla.firefox", "org.mozilla.firefoxdeveloperedition", "org.mozilla.nightly", "org.mozilla.librewolf",
-                  "io.gitlab.librewolf-community.librewolf", "app.zen-browser.zen", "org.torproject.torbrowser"]) {
+                  "io.gitlab.librewolf-community.librewolf", "app.zen-browser.zen"]) {
         Some(Family::Firefox)
     } else if p(&["company.thebrowser.browser", "company.thebrowser.dia", "com.sigmaos.sigmaos.macos", "ai.perplexity.comet",
                   "com.perplexity.comet", "com.openai.atlas", "com.duckduckgo.macos.browser"]) {
@@ -309,6 +311,8 @@ fn layers(u: &url::Url) -> (Vec<url::Url>, bool) {
 fn opaque(u: &url::Url, carries_page: bool) -> bool {
     match u.scheme() {
         "http" | "https" => host_of(u).is_empty(),
+        // Firefox's own window furniture: whatever page is inside it wasn't seen.
+        "chrome" if host_of(u) == "browser" => true,
         "file" | "chrome" | "edge" | "brave" | "vivaldi" | "opera" | "arc" | "comet" | "chrome-extension" | "favorites" | "topsites" | "bookmarks" | "history" => false,
         "about" if u.path() == "reader" => !carries_page,
         "about" => matches!(u.path(), "blank" | "srcdoc"),
@@ -812,5 +816,21 @@ mod tests {
         for b in [CHROME, SAFARI, "company.thebrowser.Browser", "com.apple.finder"] {
             assert!(!needs_waking(b), "{b}");
         }
+    }
+
+    #[test]
+    fn every_tor_build_is_a_browser() {
+        for b in ["org.torproject.torbrowser", "org.torproject.TorBrowser.alpha", "org.torproject.something"] {
+            assert!(is_browser(b) && needs_waking(b), "{b}");
+            assert_eq!(hide_browser(&ex(), b, &[win("https://a.com")], true), Some(HideReason::App), "{b}");
+        }
+    }
+
+    #[test]
+    fn firefoxs_own_furniture_is_not_a_page() {
+        for u in ["chrome://browser/content/browser.xhtml", "chrome://browser/content/spotlight.html"] {
+            assert_eq!(hide_browser(&Exclusions { private_windows: false, ..ex() }, "org.mozilla.firefox", &[win(u)], true), Some(HideReason::Unreadable), "{u}");
+        }
+        assert_eq!(hid(&ex(), "chrome://newtab/"), None);
     }
 }
