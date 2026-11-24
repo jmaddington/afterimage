@@ -47,6 +47,8 @@ extension Shot {
     let settings: AppSettings
     let recorder: Recorder
     let engine: Engine
+    /// Where the library is kept.
+    let library: URL
     private let host = ImageHost()
 
     var shots: [Shot] = []
@@ -84,6 +86,7 @@ extension Shot {
         v.isExcludedFromBackup = true
         try? root.setResourceValues(v)
         do {
+            library = root
             engine = try Engine(root: root.path, config: settings.config, host: host)
         } catch {
             let a = NSAlert()
@@ -127,25 +130,39 @@ extension Shot {
     /// The port agents are being served on, or nil.
     private(set) var agentPort: Int?
     private(set) var agentProblem: String?
-    private var agentWanted: String?
+    /// What is running now, and the queue of changes to it. One at a time, in order.
+    private var agentApplied: String?
+    private var agentChange: Task<Void, Never>?
+    /// Holds the token for the copy-and-paste command; readable by this user only.
+    var agentTokenFile: String { library.appending(path: "agent-token").path }
 
     /// Start or stop the agent connection to match the settings. Off unless developer mode and the switch are both on.
+    /// AIDEV-NOTE: privacy-critical. Changes are applied strictly in order and each reads the settings afresh, so
+    /// AIDEV-NOTE: switching off (or changing the token) can never be overtaken by an older "on".
     private func applyAgentAccess() {
-        let on = settings.developer && settings.agentAccess
-        if on && settings.agentToken.isEmpty { settings.newAgentToken(); return }
-        let want = on ? "\(settings.agentPort)|\(settings.agentToken)" : nil
-        guard want != agentWanted else { return }
-        agentWanted = want
-        let (port, token, zone) = (settings.agentPort, settings.agentToken, TimeZone.current.secondsFromGMT())
-        Task {
+        let before = agentChange
+        agentChange = Task {
+            await before?.value
+            let on = settings.developer && settings.agentAccess
+            if on && settings.agentToken.isEmpty { settings.newAgentToken() }
+            let (port, token, zone) = (settings.agentPort, settings.agentToken, TimeZone.current.secondsFromGMT())
+            let want = on ? "\(port)|\(token)" : nil
+            guard want != agentApplied else { return }
+            let file = agentTokenFile
             let r: Result<Int?, Error> = await Task.detached { [engine] in
                 engine.mcpStop()
+                try? FileManager.default.removeItem(atPath: file)
                 guard on else { return .success(nil) }
-                return Result { Int(try engine.mcpStart(port: UInt16(clamping: port), token: token, utcOffsetSecs: Int32(zone))) }
+                return Result {
+                    let p = Int(try engine.mcpStart(port: UInt16(clamping: port), token: token, utcOffsetSecs: Int32(zone)))
+                    FileManager.default.createFile(atPath: file, contents: Data(token.utf8), attributes: [.posixPermissions: 0o600])
+                    return p
+                }
             }.value
+            agentApplied = want
             switch r {
             case .success(let p): (agentPort, agentProblem) = (p, nil)
-            case .failure(let e): (agentPort, agentProblem) = (nil, e.localizedDescription)
+            case .failure(let e): (agentPort, agentProblem, agentApplied) = (nil, e.localizedDescription, nil)
             }
         }
     }

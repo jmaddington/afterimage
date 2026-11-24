@@ -1,6 +1,5 @@
 import AfterimageEngine
 import Foundation
-import Security
 import Observation
 
 /// Everything a person can choose, persisted in UserDefaults.
@@ -79,13 +78,14 @@ import Observation
     }
 
     public func newAgentToken() {
-        var bytes = [UInt8](repeating: 0, count: 24)
-        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
-        agentToken = bytes.map { String(format: "%02x", $0) }.joined()
+        // The system generator can't hand back an unfilled buffer.
+        var g = SystemRandomNumberGenerator()
+        agentToken = (0..<24).map { _ in String(format: "%02x", UInt8.random(in: .min ... .max, using: &g)) }.joined()
     }
-    /// What to paste into a terminal to connect Claude Code.
-    public func agentCommand(port: Int) -> String {
-        "claude mcp add --transport http afterimage http://127.0.0.1:\(port)/mcp --header \"Authorization: Bearer \(agentToken)\""
+    /// What to paste into a terminal to connect Claude Code. The token itself isn't in it: it is read from a file
+    /// only this user can open, so it stays out of the clipboard and shell history.
+    public func agentCommand(port: Int, tokenFile: String) -> String {
+        "claude mcp add --transport http afterimage http://127.0.0.1:\(port)/mcp --header \"Authorization: Bearer $(cat '\(tokenFile)')\""
     }
 
     public var exclusions: Exclusions {

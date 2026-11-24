@@ -180,7 +180,7 @@ private struct IntelligenceSettings: View {
                             LabeledContent("Connect Claude Code") {
                                 Button("Copy Command") {
                                     NSPasteboard.general.clearContents()
-                                    NSPasteboard.general.setString(settings.agentCommand(port: port), forType: .string)
+                                    NSPasteboard.general.setString(settings.agentCommand(port: port, tokenFile: model.agentTokenFile), forType: .string)
                                 }
                             }
                             LabeledContent("Address", value: "http://127.0.0.1:\(port)/mcp")
