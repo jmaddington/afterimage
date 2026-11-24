@@ -1,5 +1,5 @@
 // Finds the secret-bearing fields on a page. Reports where they are and what kind, never what they hold.
-// AIDEV-NOTE: privacy-critical. Nothing here may read `.value` or text content into a report.
+// AIDEV-NOTE: privacy-critical. No value or page text may reach a report; only whether a field is empty is ever asked.
 
 const MAX_FIELDS = 200;
 
@@ -42,6 +42,8 @@ export function kindOf(el, style) {
 /** Remembers fields that were ever passwords, so "show password" doesn't turn one into ordinary text. */
 export class Watcher {
   #were = new WeakSet();
+  /** Secret fields on the page at the last look, filled in or not. */
+  candidates = 0;
   kind(el, style) {
     const k = kindOf(el, style);
     if (k === 'password') this.#were.add(el);
@@ -67,18 +69,31 @@ function place(box, width, height) {
   return { x: round(l / width), y: round(t / height), w: round((r - l) / width), h: round((b - t) / height) };
 }
 
+/** An empty box shows only its placeholder. Anything whose emptiness can't be known counts as full. */
+function empty(el, env) {
+  return (el.localName === 'input' || el.localName === 'textarea') && el.value === '' && !env.filled?.(el);
+}
+
 export function report(env, watcher) {
-  const out = { v: 1, url: cleanAddress(env.url), top: env.top, fields: [], typing: false, unplaced: false };
+  const ratio = env.ratio ?? 1;
+  const out = {
+    v: 1, url: cleanAddress(env.url), top: env.top, width: round(env.width * ratio), height: round(env.height * ratio),
+    fields: [], typing: false, unplaced: false,
+  };
+  watcher.candidates = 0;
   try {
     for (const el of env.elements()) {
       const style = env.styleOf(el);
       const kind = watcher.kind(el, style);
-      if (!kind || style.display === 'none' || style.visibility === 'hidden') continue;
+      if (!kind) continue;
+      watcher.candidates += 1;
+      if (style.display === 'none' || style.visibility === 'hidden') continue;
       const at = place(el.getBoundingClientRect(), env.width, env.height);
       if (!at) continue;
       if (el === env.focused && kind !== 'overlay') out.typing = true;
+      if (empty(el, env)) continue;
       // A frame doesn't know where it sits in the window, so it can only say that it holds something.
-      if (!env.top || out.fields.length >= MAX_FIELDS) out.unplaced = true;
+      if (!env.top || (env.pinch ?? 1) !== 1 || out.fields.length >= MAX_FIELDS) out.unplaced = true;
       else out.fields.push({ kind, ...at });
     }
   } catch {

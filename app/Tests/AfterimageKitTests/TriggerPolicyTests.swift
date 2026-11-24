@@ -32,8 +32,8 @@ import Testing
         var p = TriggerPolicy()
         p.captured(at: 100)
         p.event(.app, at: 100.5)
-        #expect(p.due(at: 102) == nil)
-        #expect(p.due(at: 104.1) == .app)
+        #expect(p.due(at: 101) == nil)
+        #expect(p.due(at: 101.6) == .app)
     }
     @Test func titleChangesAreRateLimited() {
         var p = TriggerPolicy()
@@ -96,6 +96,27 @@ import Testing
         var p = TriggerPolicy(); p.captured(at: 100)
         p.event(.app, at: 100.5); p.missed(.tab, at: 101, since: p.generation)
         #expect(p.due(at: 104.1) == .app)
+    }
+}
+
+@Suite struct SwitchingTests {
+    /// Switching every two seconds, as someone looking for something does: each stop is captured.
+    @Test func everySwitchTwoSecondsApartIsCaptured() {
+        var p = TriggerPolicy(); p.interval = 0
+        var taken: [Double] = []
+        for step in 0..<200 {
+            let t = 100 + Double(step) * 0.1
+            if step % 20 == 0 { p.event(.window, at: t) }
+            if p.due(at: t) != nil { p.captured(at: t); taken.append(t) }
+        }
+        #expect(taken.count == 10, "\(taken)")
+        #expect(zip(taken, 0...).allSatisfy { $0 - (100 + Double($1) * 2) < 1 })
+    }
+    @Test func rapidFlickingIsOneCaptureOfWhereItEnded() {
+        var p = TriggerPolicy(); p.interval = 0
+        for i in 0..<6 { p.event(.app, at: 100 + Double(i) * 0.2) }
+        #expect(p.due(at: 101.1) == nil)
+        #expect(p.due(at: 101.6) == .app)
     }
 }
 

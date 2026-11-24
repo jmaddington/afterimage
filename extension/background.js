@@ -35,12 +35,16 @@ function send(m) {
 }
 async function tabs() {
   const list = await api.tabs.query({});
-  send({ type: 'tabs', tabs: list.filter((t) => t.id != null).slice(0, 1000).map((t) => ({ tab: t.id, window: t.windowId, active: t.active, private: t.incognito })) });
+  send({ type: 'tabs', tabs: list.filter((t) => t.id != null).slice(0, 1000).map((t) => ({ tab: t.id, window: t.windowId, active: t.active, private: t.incognito, url: cleanAddress(t.url ?? '') })) });
 }
 
 api.runtime.onMessage.addListener((m, sender) => {
   if (m?.type !== 'page' || sender.id !== api.runtime.id || sender.tab?.id == null) return;
   send({ ...m, tab: sender.tab.id, window: sender.tab.windowId, frame: sender.frameId ?? 0 });
+});
+// Where a tab has got to matters as much as which one is showing.
+api.tabs.onUpdated.addListener((_, change) => {
+  if (change.url) void tabs();
 });
 for (const e of ['onActivated', 'onRemoved', 'onCreated', 'onAttached', 'onReplaced']) api.tabs[e]?.addListener(() => void tabs());
 api.runtime.onStartup?.addListener(connect);

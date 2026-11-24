@@ -26,6 +26,8 @@ public actor Capturer {
         var pids: Set<pid_t> = []
         var reasons: [pid_t: HideReason] = [:]
         var focusedURL: [pid_t: String] = [:]
+        /// Places to frost, by app, in screen points.
+        var covers: [pid_t: [Cover]] = [:]
     }
 
     /// Everything that bears on whether a picture may be kept, at one instant.
@@ -35,6 +37,7 @@ public actor Capturer {
         var front: pid_t?
         var hidden: Set<pid_t>
         var drawn: Set<pid_t>
+        var covers: [pid_t: [Cover]] = [:]
     }
 
     /// Why a picture taken between these looks can't be kept, or nil.
@@ -43,6 +46,9 @@ public actor Capturer {
         if let b = all.lazy.compactMap(\.blocked).first { return .blocked(b) }
         if all.contains(where: { $0.exclusions != before.exclusions }) { return .blocked("Your settings changed mid-capture") }
         if all.contains(where: { $0.front != before.front }) { return .skipped("The app changed mid-capture") }
+        // A field that moved may have been photographed anywhere in between.
+        let covers = all.map { $0.covers.filter { !omitted.contains($0.key) && !$0.value.isEmpty } }
+        if covers.contains(where: { $0 != covers[0] }) { return .skipped("The page moved mid-capture") }
         // Off-limits at any instant and drawn at any instant: they needn't be the same one.
         let hidden = all.reduce(into: Set<pid_t>()) { $0.formUnion($1.hidden) }
         let drawn = all.reduce(into: Set<pid_t>()) { $0.formUnion($1.drawn) }
@@ -54,7 +60,7 @@ public actor Capturer {
         let front = await MainActor.run { NSWorkspace.shared.frontmostApplication?.processIdentifier }
         // Status items and slivers can't show anything worth hiding.
         let drawn = OnScreenWindow.all().filter { $0.bounds.width > 48 && $0.bounds.height > 48 }.map(\.pid)
-        return Look(blocked: Session.isLocked ? "The screen is locked" : g.blocked, exclusions: g.exclusions, front: front, hidden: hidden.pids, drawn: Set(drawn))
+        return Look(blocked: Session.isLocked ? "The screen is locked" : g.blocked, exclusions: g.exclusions, front: front, hidden: hidden.pids, drawn: Set(drawn), covers: hidden.covers)
     }
 
     /// Vision's first request loads a model and can take a while; get it over with before it matters.
@@ -113,6 +119,8 @@ public actor Capturer {
 
         // Anything that became off-limits while we were looking spoils the whole frame.
         let quick = await look(exclusions, hiddenBefore, gate)
+        // Scrolling is reported a moment after it happens; give a page with secret fields time to say it moved.
+        if !hiddenBefore.covers.isEmpty { try? await Task.sleep(for: .milliseconds(450)) }
         let hiddenAfter = await hidden(exclusions)
         let after = await look(exclusions, hiddenAfter, gate)
         if let why = Self.spoiled(before, after, during: [quick], omitted: omitted) { return why }
@@ -138,7 +146,7 @@ public actor Capturer {
                 takenAt: Int64(at.timeIntervalSince1970 * 1000), trigger: trigger.rawValue, display: await Self.name(d.displayID),
                 appName: front.1, bundleId: front.2, windowTitle: frontWindow?.title ?? "", url: hiddenAfter.focusedURL[front.0] ?? "",
                 userName: Session.consoleUser, fullName: NSFullUserName(), host: Session.computerName, sessions: Session.loggedIn, runningApps: apps)
-            engine.ingest(frame: Frame(rgba: b.data, width: UInt32(b.width), height: UInt32(b.height), stride: UInt32(b.stride), lines: lines, moment: m, displayKey: key))
+            engine.ingest(frame: Frame(rgba: b.data, width: UInt32(b.width), height: UInt32(b.height), stride: UInt32(b.stride), lines: lines, moment: m, displayKey: key, covers: Self.onDisplay(before.covers.filter { !omitted.contains($0.key) }.values.flatMap { $0 }, d.frame)))
             queued += 1
         }
         return queued == 0 ? .unchanged : .queued(queued)
@@ -148,6 +156,12 @@ public actor Capturer {
         var h = Hidden()
         // Never photograph our own window: it shows other photographs.
         h.pids.insert(getpid())
+        let screens: [(CGRect, Double)] = await MainActor.run {
+            // Cocoa's origin is the main screen's bottom left; everything else here counts from its top left.
+            let top = NSScreen.screens.first?.frame.maxY ?? 0
+            return NSScreen.screens.map { (CGRect(x: $0.frame.minX, y: top - $0.frame.maxY, width: $0.frame.width, height: $0.frame.height), Double($0.backingScaleFactor)) }
+        }
+        func scale(at r: CGRect) -> Double { screens.max { Self.area($0.0, r) < Self.area($1.0, r) }.map { Self.area($0.0, r) > 0 ? $0.1 : 0 } ?? 0 }
         let running = await MainActor.run { NSWorkspace.shared.runningApplications.map { ($0.processIdentifier, $0.bundleIdentifier ?? "", $0.isHidden) } }
         let visible = OnScreenWindow.all()
         let drawing = Set(visible.map(\.pid))
@@ -161,11 +175,16 @@ public actor Capturer {
                 if let r = hideBrowser(ex: ex, bundleId: bundle, windows: reading.windows, complete: reading.complete) {
                     h.pids.insert(pid)
                     h.reasons[pid] = r
-                } else if let r = hidePage(ex: ex, hint: engine.pageHint(pid: pid)) {
-                    h.pids.insert(pid)
-                    h.reasons[pid] = r
-                } else if let u = reading.focusedURL {
-                    h.focusedURL[pid] = u
+                } else {
+                    let areas = reading.pages.map { PageArea(url: $0.url, rect: Rect(x: $0.frame.minX, y: $0.frame.minY, w: $0.frame.width, h: $0.frame.height), scale: scale(at: $0.frame)) }
+                    let plan = planPage(ex: ex, hint: engine.pageHint(pid: pid), areas: areas, complete: reading.complete)
+                    if let r = plan.hide {
+                        h.pids.insert(pid)
+                        h.reasons[pid] = r
+                    } else {
+                        if !plan.covers.isEmpty { h.covers[pid] = plan.covers }
+                        h.focusedURL[pid] = reading.focusedURL
+                    }
                 }
             }
         }
@@ -181,6 +200,14 @@ public actor Capturer {
         if all || d.count <= 1 { return d.map(\.id) }
         if let f = front, let best = d.max(by: { area($0.frame, f) < area($1.frame, f) }), area(best.frame, f) > 0 { return [best.id] }
         return d.map(\.id).filter { $0 == main }
+    }
+    /// Points on the desktop to fractions of one display; nil for what isn't on it.
+    static func onDisplay(_ covers: [Cover], _ d: CGRect) -> [Cover] {
+        covers.compactMap { c in
+            let r = CGRect(x: c.rect.x, y: c.rect.y, width: c.rect.w, height: c.rect.h)
+            guard area(r, d) > 0 else { return nil }
+            return Cover(kind: c.kind, rect: Rect(x: (r.minX - d.minX) / d.width, y: (r.minY - d.minY) / d.height, w: r.width / d.width, h: r.height / d.height))
+        }
     }
     private static func area(_ a: CGRect, _ b: CGRect) -> CGFloat {
         let r = a.intersection(b)
@@ -198,7 +225,7 @@ public actor Capturer {
         case .site: "A site you excluded is open in \(app)"
         case .privateWindow: "\(app) has a private window open"
         case .unreadable: "\(app)’s address couldn’t be read"
-        case .secretField: "\(app) is showing a password or account field"
+        case .secretField: "\(app) is showing a secret Afterimage can’t place"
         case .systemPrompt: "macOS is asking for something"
         case .app, nil: "\(app) is excluded"
         }

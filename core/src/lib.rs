@@ -13,6 +13,7 @@ mod store;
 
 pub use detect::{Rect, SecretKind, TextLine, Token};
 pub use lm::ModelInfo;
+pub use pages::{Cover, PageArea, PageHint, PagePlan, plan_page};
 pub use privacy::*;
 pub use store::*;
 
@@ -78,6 +79,9 @@ pub struct Frame {
     pub lines: Vec<TextLine>,
     pub moment: Moment,
     pub display_key: String,
+    /// Places known to hold secrets whatever the text says, as fractions of the picture.
+    #[uniffi(default = [])]
+    pub covers: Vec<pages::Cover>,
 }
 
 #[derive(Debug, Clone, PartialEq, uniffi::Enum)]
@@ -159,7 +163,8 @@ fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
 
-const QUEUE_CAP: usize = 6;
+/// About 30 MB each on a Retina display; deep enough for a flurry of window switches.
+const QUEUE_CAP: usize = 12;
 const CONTEXT: u32 = 8192;
 const CHUNK_CHARS: usize = 5000;
 const CHUNK_LINES: usize = 90;
@@ -253,6 +258,11 @@ impl Engine {
         let need = frame.stride as usize * frame.height as usize;
         if frame.rgba.len() < need || (frame.stride as usize) < frame.width as usize * 4 || need == 0 {
             log::error!("rejected a malformed frame [AIMG-BADFRAME]");
+            return;
+        }
+        // A secret whose place makes no sense can't be covered.
+        if frame.covers.iter().any(|c| ![c.rect.x, c.rect.y, c.rect.w, c.rect.h].iter().all(|n| n.is_finite()) || c.rect.w < 0.0 || c.rect.h < 0.0) {
+            log::error!("rejected a frame with a senseless cover [AIMG-BADCOVER]");
             return;
         }
         let mut q = lock(&self.s.queue);
@@ -506,6 +516,7 @@ impl Shared {
     fn process(&self, f: &mut Frame, require_ai: bool) -> Result<(), String> {
         let c = lock(&self.config).clone();
         let mut hits = detect::scan(&f.lines);
+        hits.extend(covered(&f.lines, &f.covers));
         let ai_checked = match self.ai_hits(&c, &f.lines, &hits) {
             Ok(h) => {
                 hits.extend(h);
@@ -517,7 +528,7 @@ impl Shared {
         detect::extend_wrapped(&f.lines, &mut hits);
         propagate(&f.lines, &mut hits);
 
-        let mut regions: Vec<Region> = Vec::new();
+        let mut regions: Vec<Region> = f.covers.iter().map(|c| region(c.kind, c.rect)).collect();
         for h in &hits {
             let r = region(h.kind, detect::hit_rect(&f.lines[h.line], &h.range));
             if !regions.iter().any(|x| x.rect == r.rect) {
@@ -577,6 +588,28 @@ impl Shared {
         }
         Ok(())
     }
+}
+
+/// Text lying in a covered place. A word counts once a fair part of it is inside.
+fn covered(lines: &[TextLine], covers: &[pages::Cover]) -> Vec<Hit> {
+    let inside = |r: &Rect, c: &Rect| {
+        let w = (r.x + r.w).min(c.x + c.w) - r.x.max(c.x);
+        let h = (r.y + r.h).min(c.y + c.h) - r.y.max(c.y);
+        w > 0.0 && h > 0.0 && w * h >= 0.25 * (r.w * r.h)
+    };
+    let mut hits = Vec::new();
+    for c in covers {
+        for (i, l) in lines.iter().enumerate().filter(|(_, l)| !l.code) {
+            if l.tokens.is_empty() && inside(&l.rect, &c.rect) {
+                hits.push(Hit { line: i, range: 0..l.text.len(), kind: c.kind });
+            }
+            let byte = |scalar: u32| l.text.char_indices().nth(scalar as usize).map_or(l.text.len(), |x| x.0);
+            for t in l.tokens.iter().filter(|t| inside(&t.rect, &c.rect)) {
+                hits.push(Hit { line: i, range: byte(t.start)..byte(t.start + t.len), kind: c.kind });
+            }
+        }
+    }
+    hits
 }
 
 fn secret_values(lines: &[TextLine], hits: &[Hit]) -> Vec<String> {
@@ -734,7 +767,7 @@ mod tests {
     fn frame(at: i64) -> Frame {
         let l = |t: &str, y: f64| TextLine { text: t.into(), rect: Rect { x: 0.1, y, w: 0.5, h: 0.1 }, tokens: vec![], code: false };
         Frame {
-            rgba: vec![200; 100 * 100 * 4], width: 100, height: 100, stride: 400, display_key: "d".into(),
+            covers: vec![], rgba: vec![200; 100 * 100 * 4], width: 100, height: 100, stride: 400, display_key: "d".into(),
             lines: vec![l("hello world", 0.1), l("password: hunter22", 0.5), l("again hunter22 here", 0.8)],
             moment: Moment { taken_at: at, window_title: "login hunter22".into(), url: "https://x.com/a?t=hunter22".into(), ..Default::default() },
         }
@@ -854,10 +887,57 @@ mod tests {
         let (mut s, sock) = (std::os::unix::net::UnixStream::pair().unwrap(), d.path().join("bridge.sock"));
         let t = std::thread::spawn(move || bridge::forward(&mut s.1, &sock, 77));
         std::io::Write::write_all(&mut s.0, &input).unwrap();
-        wait(|| e.page_hint(77).sensitive);
-        assert!(!e.page_hint(78).sensitive);
+        wait(|| e.page_hint(77).tabs.iter().any(|t| t.sensitive));
+        assert!(e.page_hint(78).tabs.is_empty());
         drop(s.0);
         t.join().unwrap().unwrap();
+        e.shutdown();
+    }
+
+    #[test]
+    fn covered_places_are_frosted_and_their_text_hidden_everywhere() {
+        let d = tempfile::tempdir().unwrap();
+        let h = Arc::new(FakeHost(Default::default()));
+        let e = Engine::new(d.path().to_string_lossy().into(), config(false), h.clone()).unwrap();
+        let tok = |start, len, x: f64, w: f64, y: f64| Token { start, len, rect: Rect { x, y, w, h: 0.05 } };
+        let mut f = frame(1000);
+        f.lines = vec![
+            TextLine { text: "Member marmot-88421 ok".into(), rect: Rect { x: 0.1, y: 0.3, w: 0.8, h: 0.05 }, tokens: vec![tok(0, 6, 0.1, 0.2, 0.3), tok(7, 12, 0.35, 0.3, 0.3), tok(20, 2, 0.8, 0.1, 0.3)], code: false },
+            TextLine { text: "no tokens here 5512".into(), rect: Rect { x: 0.3, y: 0.5, w: 0.4, h: 0.05 }, tokens: vec![], code: false },
+            TextLine { text: "repeat marmot-88421 below".into(), rect: Rect { x: 0.1, y: 0.8, w: 0.5, h: 0.05 }, tokens: vec![], code: false },
+        ];
+        f.moment.window_title = "marmot-88421".into();
+        f.covers = vec![Cover { kind: SecretKind::Financial, rect: Rect { x: 0.33, y: 0.29, w: 0.35, h: 0.07 } }, Cover { kind: SecretKind::Other, rect: Rect { x: 0.3, y: 0.5, w: 0.4, h: 0.05 } }];
+        e.ingest(f);
+        wait(|| e.stats().unwrap().count == 1);
+        let s = e.list(Filter::default(), 10, 0).unwrap().remove(0);
+        let all = format!("{:?}{:?}", s, e.lines(s.id).unwrap());
+        assert!(!all.contains("marmot") && !all.contains("5512"), "{all}");
+        assert!(all.contains("Member [hidden] ok") && all.contains("repeat [hidden] below"), "{all}");
+        // Frosted even where nothing was read.
+        let px = &lock(&h.0)[0];
+        assert_ne!(&px[33 * 400 + 45 * 4..][..8], &[200; 8]);
+        assert_eq!(&px[..8], &[200; 8]);
+        assert!(s.regions.iter().any(|r| r.kind == "financial"));
+        e.shutdown();
+    }
+
+    #[test]
+    fn a_cover_that_makes_no_sense_means_the_frame_is_not_saved() {
+        let d = tempfile::tempdir().unwrap();
+        let e = Engine::new(d.path().to_string_lossy().into(), config(false), Arc::new(FakeHost(Default::default()))).unwrap();
+        for r in [Rect { x: f64::NAN, y: 0.0, w: 0.1, h: 0.1 }, Rect { x: 0.0, y: 0.0, w: -0.1, h: 0.1 }, Rect { x: 0.0, y: 0.0, w: f64::INFINITY, h: 0.1 }] {
+            let mut f = frame(1000);
+            f.covers = vec![Cover { kind: SecretKind::Other, rect: r }];
+            e.ingest(f);
+        }
+        std::thread::sleep(Duration::from_millis(800));
+        assert_eq!(e.stats().unwrap().count, 0);
+        // Partly off the display is ordinary: clipped.
+        let mut f = frame(2000);
+        f.covers = vec![Cover { kind: SecretKind::Other, rect: Rect { x: -0.5, y: 0.9, w: 0.7, h: 0.5 } }];
+        e.ingest(f);
+        wait(|| e.stats().unwrap().count == 1);
         e.shutdown();
     }
 }

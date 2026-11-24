@@ -28,13 +28,23 @@
     return f;
   }
 
+  function filled(el) {
+    for (const s of [':autofill', ':-webkit-autofill']) {
+      try {
+        if (el.matches(s)) return true;
+      } catch {} // Not every browser knows both.
+    }
+    return false;
+  }
+
   function look() {
     timer = 0;
     // Out of sight: say nothing and let the last report lapse. "Hidden" can be wrong for a moment, so it never clears one.
     if (dead || document.visibilityState === 'hidden') return;
     const r = report({
       elements: () => all(document), styleOf: (el) => getComputedStyle(el), width: innerWidth, height: innerHeight,
-      url: location.href, top: window === window.top, focused: focused(),
+      url: location.href, top: window === window.top, focused: focused(), ratio: devicePixelRatio,
+      pinch: visualViewport?.scale ?? 1, filled,
     }, watcher);
     const s = JSON.stringify(r);
     const matters = r.fields.length > 0 || r.typing || r.unplaced;
@@ -49,14 +59,16 @@
       }
     }
     clearTimeout(again);
-    if (matters) again = setTimeout(soon, REPEAT);
+    // Scripts and autofill change values without an event, so a page with secret fields is looked at again regardless.
+    if (matters || watcher.candidates > 0) again = setTimeout(soon, matters ? REPEAT : 1500);
   }
   function soon() {
     if (!timer && !dead) timer = setTimeout(look, SOON);
   }
 
   new MutationObserver(soon).observe(document, { subtree: true, childList: true, attributes: true, attributeFilter: ['type', 'style', 'class', 'hidden', 'name', 'id', 'autocomplete', 'src'] });
-  for (const e of ['scroll', 'resize', 'focusin', 'focusout', 'input', 'load', 'transitionend']) addEventListener(e, soon, { capture: true, passive: true });
+  for (const e of ['scroll', 'resize', 'focusin', 'focusout', 'input', 'change', 'load', 'transitionend', 'animationstart']) addEventListener(e, soon, { capture: true, passive: true });
+  visualViewport?.addEventListener('resize', soon);
   let was = document.visibilityState;
   document.addEventListener('visibilitychange', (e) => {
     const now = document.visibilityState;

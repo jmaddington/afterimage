@@ -48,8 +48,8 @@ import Observation
         on(ws, NSWorkspace.sessionDidBecomeActiveNotification) { $0.woke() }
         on(DistributedNotificationCenter.default(), .init("com.apple.screenIsUnlocked")) { $0.woke() }
         on(DistributedNotificationCenter.default(), .init("com.apple.screenIsLocked")) { $0.policy.clear() }
-        let t = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in MainActor.assumeIsolated { self?.tick() } }
-        t.tolerance = 0.15
+        let t = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in MainActor.assumeIsolated { self?.tick() } }
+        t.tolerance = 0.08
         RunLoop.main.add(t, forMode: .common)
         timer = t
         Task { [capturer] in
@@ -166,7 +166,7 @@ import Observation
     }
 
     private func pollWindow() {
-        guard Date().timeIntervalSince(lastWindowPoll) >= 1 else { return }
+        guard Date().timeIntervalSince(lastWindowPoll) >= 0.5 else { return }
         lastWindowPoll = Date()
         guard let app = NSWorkspace.shared.frontmostApplication else { return }
         let w = OnScreenWindow.front(of: app.processIdentifier, in: OnScreenWindow.all())
