@@ -85,7 +85,7 @@ enum Words {
                      "label": "the label beside it", "assignment": "a name = value rule", "card": "the card number rule", "ssn": "the Social Security rule",
                      "iban": "the IBAN rule", "account": "the account number rule", "cvv": "the security code rule", "phrase": "“password is…”",
                      "flag": "a command-line flag", "bearer": "an authorization header", "url-login": "a login inside an address", "setup-code": "a setup code",
-                     "known-key": "a known key format", "random": "its random look", "private-key": "a private key block", "wrapped": "the key it continues",
+                     "known-key": "a known key format", "random": "its random look", "private-key": "a private key block", "key-block": "a block of key or certificate data", "wrapped": "the key it continues",
                      "repeated": "the same secret elsewhere"]
         let parts = w.split(separator: ",").map { names[String($0)] ?? String($0) }
         return parts.isEmpty ? "" : "Found by " + parts.formatted(.list(type: .and))

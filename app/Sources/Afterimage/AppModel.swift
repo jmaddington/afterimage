@@ -7,6 +7,7 @@ import SwiftUI
 enum Place: Hashable {
     case all, kept, hidden
     case app(String)
+    case display(String)
 }
 
 enum DateScope: String, CaseIterable, Identifiable {
@@ -54,6 +55,8 @@ extension Shot {
     var shots: [Shot] = []
     var groups: [DayGroup] = []
     var apps: [AppCount] = []
+    /// Displays that have pictures; shown in the sidebar when there is more than one.
+    var displays: [AppCount] = []
     var stats = Stats(count: 0, bytes: 0, kept: 0, hidden: 0, pending: 0, reindexing: 0, oldest: nil)
     var status: Status?
     var loaded = false
@@ -172,6 +175,40 @@ extension Shot {
         registerBrowsers(bundleIds: NSWorkspace.shared.urlsForApplications(toOpen: page).compactMap { Bundle(url: $0)?.bundleIdentifier }.filter { $0 != Bundle.main.bundleIdentifier })
     }
 
+    /// How many pictures the grid shows across; the grid keeps it current.
+    var perRow = 4
+    /// Counts selection moves made from the keyboard, so the grid can scroll to follow.
+    var keyed = 0
+    private var keyMonitor: Any?
+
+    /// Plain keys in the library window, whatever view holds focus: arrows, Return, Space, Delete.
+    /// AIDEV-NOTE: SwiftUI's onKeyPress only reaches the focused view, and focus wanders (search field, sidebar).
+    func installKeys() {
+        guard keyMonitor == nil else { return }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
+            MainActor.assumeIsolated {
+                guard let self, let w = e.window, w.isKeyWindow, w.identifier?.rawValue.contains("library") == true else { return e }
+                let busy = w.attachedSheet != nil || self.confirmDelete != nil || self.confirmForget != nil || self.problem != nil
+                guard let a = LibraryKeys.action(keyCode: e.keyCode, modifiers: e.modifierFlags, typing: w.firstResponder is NSText, busy: busy, viewing: self.open != nil) else { return e }
+                switch a {
+                case .move(let dx, let dy):
+                    if self.open != nil { self.step(dx) } else { self.moveSelection(by: dx + dy * self.perRow); self.keyed += 1 }
+                case .open:
+                    guard self.selection.count == 1, let id = self.selection.first else { return e }
+                    self.open = id
+                case .close: self.open = nil
+                case .delete:
+                    guard self.open != nil || !self.selection.isEmpty else { return e }
+                    self.askDelete(self.open.map { [$0] })
+                case .deleteNow:
+                    guard self.open != nil || !self.selection.isEmpty else { return e }
+                    self.delete(self.open.map { [$0] } ?? Array(self.selection))
+                }
+                return nil
+            }
+        }
+    }
+
     /// Arrow keys in the grid: sideways by one, up and down by a row.
     func moveSelection(by n: Int) {
         guard !shots.isEmpty else { return }
@@ -216,6 +253,7 @@ extension Shot {
         case .kept: f.onlyKept = true
         case .hidden: f.onlyHidden = true
         case .app(let b): f.bundleId = b
+        case .display(let d): f.display = d
         }
         return f
     }
@@ -259,11 +297,12 @@ extension Shot {
                     searching ? try engine.search(filter: f, semantic: false, limit: 200) : try engine.list(filter: f, limit: n, offset: 0)
                 }.value
                 show(first)
-                let side = try await Task.detached { [engine] in (try engine.apps(), try engine.stats()) }.value
+                let side = try await Task.detached { [engine] in (try engine.apps(), try engine.stats(), try engine.displays()) }.value
                 if g == generation {
-                    (apps, stats) = side
+                    (apps, stats, displays) = side
                     // The last picture of an app takes its row with it.
                     if case .app(let b) = place, !apps.contains(where: { $0.bundleId == b }) { place = .all }
+                    if case .display(let d) = place, !displays.contains(where: { $0.name == d }) { place = .all }
                 }
                 // Words now, meaning a moment later.
                 if searching {
@@ -317,7 +356,13 @@ extension Shot {
         if let o = open, ids.contains(o), let i = shots.firstIndex(where: { $0.id == o }) {
             open = (shots[(i + 1)...].first ?? shots[..<i].last)?.id
         }
-        selection.subtract(ids)
+        // In the grid too: the next Delete or arrow key carries on from here.
+        let gone = Set(ids)
+        if open == nil, !selection.isEmpty, selection.isSubset(of: gone), let i = shots.lastIndex(where: { gone.contains($0.id) }) {
+            selection = Set([shots[(i + 1)...].first { !gone.contains($0.id) } ?? shots[..<i].last { !gone.contains($0.id) }].compactMap { $0?.id })
+        } else {
+            selection.subtract(ids)
+        }
         run { _ = try $0.delete(ids: ids) }
     }
     func forget(_ f: Forget) {

@@ -190,7 +190,7 @@ struct Shared {
     question: AtomicU64,
     mcp: Mutex<Option<mcp::Server>>,
     /// The stretch of activity being added to, and when it was last written down.
-    // AIDEV-NOTE: lock order is now_doing, then store. `cleared` and `forgotten` are never held while taking another.
+    // AIDEV-NOTE: lock order is now_doing, then store, then cleared. `forgotten` is never held while taking another.
     now_doing: Mutex<Option<Doing>>,
     /// Window key -> its title as a saved picture left it. In memory only.
     cleared: Mutex<HashMap<u64, String>>,
@@ -373,11 +373,12 @@ impl Engine {
 
     /// What is in front right now. Called every second or so while recording; cheap unless something changed.
     pub fn note_activity(&self, ex: Exclusions, sample: ActivitySample) -> Result<(), EngineError> {
+        // Taken first, so a forget can't fall between reading a title and writing it.
+        let mut doing = lock(&self.s.now_doing);
         let (mut span, key) = {
             let cleared = lock(&self.s.cleared);
             activity::describe(&ex, &sample, &|k| cleared.get(&k).cloned())
         };
-        let mut doing = lock(&self.s.now_doing);
         // Asked to be forgotten while this was on its way here. Checked under the lock `forget` also takes.
         if lock(&self.s.forgotten).iter().any(|x| (x.from..x.to).contains(&sample.at) && sample.at <= x.asked) {
             return Ok(());
@@ -445,6 +446,9 @@ impl Engine {
     pub fn apps(&self) -> Result<Vec<AppCount>, EngineError> {
         Ok(lock(&self.s.store).apps()?)
     }
+    pub fn displays(&self) -> Result<Vec<AppCount>, EngineError> {
+        Ok(lock(&self.s.store).displays()?)
+    }
     pub fn stats(&self) -> Result<Stats, EngineError> {
         let model = lock(&self.s.config).embed_model.clone();
         let store = lock(&self.s.store);
@@ -461,7 +465,12 @@ impl Engine {
     }
 
     pub fn delete(&self, ids: Vec<i64>) -> Result<u64, EngineError> {
-        let (n, failed) = lock(&self.s.store).delete(&ids)?;
+        let (n, failed) = {
+            let mut store = lock(&self.s.store);
+            // A title earned from a picture that's going is earned again or not at all.
+            lock(&self.s.cleared).clear();
+            store.delete(&ids)?
+        };
         self.s.host.library_changed();
         if failed > 0 {
             return Err(EngineError::Failed(format!("{failed} files couldn't be removed. Afterimage will try again next time it opens.")));
@@ -485,12 +494,12 @@ impl Engine {
         drop(f);
         q.frames.retain(|(_, f)| !(from..to).contains(&f.moment.taken_at));
         drop(q);
-        lock(&self.s.cleared).clear();
         // Held together, in this order, so a sample can't write between the delete and the reset.
         let mut doing = lock(&self.s.now_doing);
         let store = lock(&self.s.store);
         store.dev_forget(from, to)?;
         store.activity_forget(from, to)?;
+        lock(&self.s.cleared).clear();
         // What is going on right now is inside "everything so far".
         if doing.as_ref().is_some_and(|d| d.span.end >= from && d.span.start < to) {
             *doing = None;
@@ -682,6 +691,7 @@ impl Shared {
         if ids.is_empty() {
             return Ok(0);
         }
+        lock(&self.cleared).clear();
         let (n, _) = st.delete(&ids)?;
         drop(st);
         self.host.library_changed();
@@ -887,17 +897,18 @@ impl Shared {
         let title = (activity::key(&m.bundle_id, &f.moment.window_title), m.window_title.clone());
         let new = NewShot { moment: m, path: path.clone(), thumb_path: thumb_path.clone(), width: e.width, height: e.height, bytes: e.bytes, regions, lines, ai_checked };
         let inserted = store.insert(&new);
+        if inserted.is_ok() {
+            // This window's title has now been through everything the picture went through. Under the store lock,
+            // so a forget is wholly before or wholly after.
+            let mut cleared = lock(&self.cleared);
+            if cleared.len() >= 512 {
+                cleared.clear();
+            }
+            cleared.insert(title.0, title.1);
+        }
         drop(store);
         match inserted {
-            Ok(id) => {
-                // This window's title has now been through everything the picture went through.
-                let mut cleared = lock(&self.cleared);
-                if cleared.len() >= 512 {
-                    cleared.clear();
-                }
-                cleared.insert(title.0, title.1);
-                Ok(Some((id, hits, ai_checked, all)))
-            }
+            Ok(id) => Ok(Some((id, hits, ai_checked, all))),
             Err(e) => {
                 remove();
                 Err(format!("The library couldn't be updated: {e}"))
@@ -1078,7 +1089,7 @@ fn describe_one(s: &Shared) -> Result<bool, String> {
         why
     };
     let img = s.host.model_image(shot.path.clone()).map_err(|e| fail(e.to_string()))?;
-    let (d, tags) = match l.describe(&c.model, &img, &shot.moment.app_name, &shot.moment.window_title) {
+    let (d, tags) = match l.describe(&c.model, &img, &shot.moment.app_name, &shot.moment.window_title, &body) {
         Ok(x) => x,
         Err(e @ lm::LmError::Offline) => return Err(e.to_string()),
         Err(e) => return Err(fail(e.to_string())),

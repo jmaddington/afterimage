@@ -188,7 +188,24 @@ private struct IntelligenceSettings: View {
                                     NSPasteboard.general.setString(settings.agentCommand(port: port, tokenFile: model.agentTokenFile), forType: .string)
                                 }
                             }
+                            LabeledContent("Connect another app") {
+                                Button("Copy Settings") {
+                                    // It holds the token: kept off other devices and out of clipboard managers' histories.
+                                    let board = NSPasteboard.general
+                                    board.prepareForNewContents(with: .currentHostOnly)
+                                    board.setString(AppSettings.agentConfig(port: port, token: settings.agentToken), forType: .string)
+                                    board.setString("", forType: NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType"))
+                                }.help("Contains the token. Paste it only into the app’s own settings.")
+                            }
                             LabeledContent("Address", value: "http://127.0.0.1:\(port)/mcp")
+                            DisclosureGroup("How to connect") {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Text("**Claude Code**\n1. Click Copy Command, paste it into Terminal and press Return.\n2. Start `claude` and type `/mcp`. “afterimage” should say connected.\n3. Ask something like “Use afterimage to tell me what I worked on today.”")
+                                    Text("**Claude Desktop, Cursor and other apps**\n1. Click Copy Settings.\n2. Paste it into the app’s MCP settings file. If the file already lists servers, add just the “afterimage” part.\n3. Restart that app.")
+                                    Text("**Good to know**\nAfterimage has to be open for an agent to connect. After New Token, connect again: in Terminal run `claude mcp remove afterimage`, then repeat the steps. The agent has five tools: activity, timeline, search, get_shot and get_image.")
+                                }
+                                .font(.callout).foregroundStyle(.secondary).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                            }
                             Button("New Token") { settings.newAgentToken() }.help("Cuts off any agent using the current one")
                         } else {
                             Text(model.agentProblem ?? "Starting…").foregroundStyle(.secondary)

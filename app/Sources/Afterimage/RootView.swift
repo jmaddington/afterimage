@@ -41,6 +41,9 @@ struct LibraryView: View {
         @Bindable var model = model
         NavigationSplitView {
             Sidebar().navigationSplitViewColumnWidth(min: 190, ideal: 220, max: 300)
+                .safeAreaInset(edge: .bottom, alignment: .leading, spacing: 0) {
+                    Text(Words.version).font(.caption).foregroundStyle(.secondary).textSelection(.enabled).padding(.horizontal, 16).padding(.vertical, 10)
+                }
         } detail: {
             ZStack {
                 GridView().opacity(model.open == nil ? 1 : 0).allowsHitTesting(model.open == nil)
@@ -57,6 +60,7 @@ struct LibraryView: View {
         .searchable(text: $model.query, placement: .toolbar, prompt: "Words, or what you remember")
         .searchFocused($searchFocused)
         .onChange(of: model.focusSearch) { searchFocused = true }
+        .onAppear { model.installKeys() }
         .onChange(of: model.query) { model.open = nil }
     }
 
@@ -66,6 +70,7 @@ struct LibraryView: View {
         case .kept: "Kept"
         case .hidden: "With Secrets Hidden"
         case .app(let b): model.apps.first { $0.bundleId == b }?.name ?? "App"
+        case .display(let d): d
         }
     }
     private var subtitle: String {
@@ -189,6 +194,13 @@ struct Sidebar: View {
                 Label("Library", systemImage: "photo.on.rectangle").badge(Int(model.stats.count)).tag(Place.all)
                 Label("Kept", systemImage: "bookmark").badge(Int(model.stats.kept)).tag(Place.kept)
                 Label("Secrets Hidden", systemImage: "eye.slash").badge(Int(model.stats.hidden)).tag(Place.hidden)
+            }
+            if model.displays.count > 1 {
+                Section("Displays") {
+                    ForEach(model.displays, id: \.name) { d in
+                        Label(d.name, systemImage: "display").badge(Int(d.count)).tag(Place.display(d.name))
+                    }
+                }
             }
             if !model.apps.isEmpty {
                 Section("Apps") {

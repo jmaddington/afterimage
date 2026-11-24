@@ -34,7 +34,9 @@ struct GridView: View {
             // Edit > Select All reaches whatever has focus.
             .focusable().focusEffectDisabled().focused($focused)
             .onCommand(#selector(NSResponder.selectAll(_:))) { model.selection = Set(model.shots.map(\.id)) }
-            .onAppear { focused = true }
+            .onAppear { focused = true; model.perRow = perRow(g.size.width) }
+            .onChange(of: g.size.width) { model.perRow = perRow(g.size.width) }
+            .onChange(of: model.keyed) { if let id = model.selection.first { withAnimation(.smooth(duration: 0.15)) { proxy.scrollTo(id) } } }
             .onKeyPress(.leftArrow) { move(-1, proxy) }
             .onKeyPress(.rightArrow) { move(1, proxy) }
             .onKeyPress(.upArrow) { move(-perRow(g.size.width), proxy) }

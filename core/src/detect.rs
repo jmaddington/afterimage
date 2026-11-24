@@ -165,8 +165,27 @@ re!(KNOWN, r"(?x)
 re!(QR_SECRET, r"(?is)otpauth(?:-migration)?://.*|\bWIFI:.*\bP:.*");
 // Query keys whose values are worth hunting for elsewhere on the screen.
 re!(SECRET_KEY, r"(?i)secret|token|pass|pwd|key|code|auth|sig|otp|pin|session|credential|^data$");
-re!(PEM_BEGIN, r"-{2,}\s*BEGIN [A-Z0-9 ]*(?:PRIVATE KEY|SECRET)");
-re!(PEM_END, r"-{2,}\s*END [A-Z0-9 ]*(?:PRIVATE KEY|SECRET)");
+// Dashes are often read as one long one. Certificates are hidden with keys: people keep both in the same files.
+re!(PEM_BEGIN, r"[-—–_=]+\s*BEGIN [A-Z0-9 ]*(PRIVATE KEY|SECRET|CERTIFICATE|PGP [A-Z ]*BLOCK)");
+re!(PEM_END, r"[-—–_=]+\s*END [A-Z0-9 ]*(PRIVATE KEY|SECRET|CERTIFICATE|PGP [A-Z ]*BLOCK)");
+
+/// A line of a base64 block: long, nothing but the base64 alphabet (a stray space or two from OCR aside), and mixed
+/// the way encoded bytes are. A path, a sentence or a hex hash is not.
+fn block_line(t: &str) -> bool {
+    let t = t.trim();
+    if t.split_whitespace().count() > 3 {
+        return false;
+    }
+    let c: Vec<char> = t.chars().filter(|c| !c.is_whitespace()).collect();
+    let n = c.len();
+    let count = |f: fn(&char) -> bool| c.iter().filter(|x| f(x)).count();
+    n >= 40
+        && c.iter().all(|x| x.is_ascii_alphanumeric() || matches!(x, '+' | '/' | '='))
+        && count(|x| x.is_ascii_uppercase()) * 8 >= n
+        && count(|x| x.is_ascii_lowercase()) * 8 >= n
+        && count(|x| x.is_ascii_digit()) >= 1
+        && count(|x| *x == '/') * 8 <= n
+}
 re!(LONG_TOKEN, r"[A-Za-z0-9_+/=\-]{24,}");
 re!(UUID, r"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$");
 re!(NOT_A_VALUE, r"(?i)\b(?:forgot|forgotten|reset|show|hide|sign\s*in|log\s*in|sign\s*up|continue|submit|cancel|save|remember|required|optional|must|characters?|enter|confirm|change|manager|generate|copy|username|email|user\s*name)\b");
@@ -438,12 +457,36 @@ fn scan_latin(text: &str, line: usize, hits: &mut Vec<Hit>) {
     while let Some(c) = ASSIGN.captures_at(text, from) {
         let (sep, v) = (c.get(2).unwrap(), c.get(4).unwrap());
         let quoted = !c[3].is_empty();
+        // AIDEV-NOTE: privacy-critical, narrow on purpose. "pass" is a password's name unless all of this holds: it
+        // AIDEV-NOTE: stands alone after a plural subject on this line, that subject isn't the value of an earlier
+        // AIDEV-NOTE: pair, the separator is a plain colon, and what follows is an unquoted count ("Tests pass: 150").
+        const PASSERS: &[&str] = &["tests", "checks", "builds", "suites", "specs", "jobs", "cases", "assertions", "steps", "runs"];
+        let head = text[..c.get(1).unwrap().start()].rsplit('\n').next().unwrap_or("").trim_end();
+        let subject = head.split_whitespace().next_back().unwrap_or("");
+        let rest = text[v.end()..].split('\n').next().unwrap_or("");
+        let verb = c[1].eq_ignore_ascii_case("pass")
+            && sep.as_str() == ":"
+            && !quoted
+            && !v.as_str().is_empty()
+            && v.as_str().chars().all(|c| c.is_ascii_digit())
+            // The count must end there: "12,hunter22" and "12;x" are not counts. A bare count is short; a longer
+            // one needs a word after it ("1204 Rust"), so a PIN on its own stays hidden.
+            && (rest.is_empty() || rest.starts_with(' ') || rest.starts_with(", "))
+            // And so must everything after it: plain numbers and plain words only ("of 12", "Rust, 57 Swift").
+            && rest.split(|c: char| c.is_whitespace() || c == ',').filter(|t| !t.is_empty()).all(|t| {
+                let t = t.trim_end_matches('.');
+                !t.is_empty() && (t.chars().all(|c| c.is_ascii_digit()) || t.chars().all(char::is_alphabetic))
+            })
+            && (v.as_str().len() <= 3 || v.as_str().len() <= 6 && rest.trim_start().chars().next().is_some_and(char::is_alphabetic))
+            && PASSERS.contains(&subject.to_lowercase().as_str())
+            && !head[..head.len() - subject.len()].trim_end().ends_with([':', '=', '>']);
+        let name = if verb { "verb".to_owned() } else { c[1].to_owned() };
         let judge = |whole: &str| {
             let balanced = |o: char, c: char| whole.matches(o).count() == whole.matches(c).count();
             let closed = !quoted && whole.ends_with([')', ']']) && balanced('(', ')') && balanced('[', ']');
             let trimmed = if quoted { whole } else { whole.trim_end_matches([')', ']', '}', '.']) };
             // A real call gives up its closing bracket and is judged as one; anything else keeps every character.
-            match assigned(&c[1], quoted, trimmed, closed) {
+            match assigned(&name, quoted, trimmed, closed) {
                 None if closed => None,
                 None => None,
                 Some(k) => Some(k),
@@ -543,8 +586,20 @@ fn scan_latin(text: &str, line: usize, hits: &mut Vec<Hit>) {
 /// Detect across a whole screen, using layout to pair standalone labels with their values.
 pub fn scan(lines: &[TextLine]) -> Vec<Hit> {
     let mut hits = Vec::new();
-    let mut in_pem = false;
+    // The kind of block that is open. Only an END of the same kind closes it.
+    let mut in_pem: Option<String> = None;
     let latin: Vec<String> = lines.iter().map(|l| latinised(&l.text, false).0).collect();
+    // Three or more block lines in a row are key material whether or not a header is in view.
+    let mut i = 0;
+    while i < lines.len() {
+        let run = lines[i..].iter().take_while(|l| !l.code && block_line(&l.text)).count();
+        if run >= 3 {
+            for j in i..i + run {
+                push(&mut hits, j, 0..lines[j].text.len(), SecretKind::Key, "key-block");
+            }
+        }
+        i += run.max(1);
+    }
     for (i, l) in lines.iter().enumerate() {
         let t = &latin[i];
         if l.code {
@@ -553,14 +608,19 @@ pub fn scan(lines: &[TextLine]) -> Vec<Hit> {
             }
             continue;
         }
-        if PEM_BEGIN.is_match(t) {
-            in_pem = true;
-        }
-        if in_pem {
+        let begin = PEM_BEGIN.captures_iter(t).last().map(|c| (c.get(0).unwrap().start(), c[1].to_owned()));
+        let end = PEM_END.captures_iter(t).filter(|c| in_pem.as_deref().is_none_or(|k| k == &c[1])).last().map(|c| c.get(0).unwrap().start());
+        if in_pem.is_some() || begin.is_some() {
             push(&mut hits, i, 0..l.text.len(), SecretKind::Key, "private-key");
         }
-        if PEM_END.is_match(t) {
-            in_pem = false;
+        if in_pem.is_some() && end.is_some() {
+            in_pem = None;
+        }
+        // A block opens here unless one is still open, or this line closed it again further along.
+        if let (None, Some((at, kind))) = (&in_pem, begin) {
+            if end.is_none_or(|e| at > e) {
+                in_pem = Some(kind);
+            }
         }
         scan_text(&l.text, i, &mut hits);
 
@@ -1373,6 +1433,52 @@ mod tests {
         assert!(got.contains(&"correct") && got.contains(&"correct horse battery token=Zx81qwerty99") && got.contains(&"Zx81qwerty99"), "{got:?}");
         for (t, secret) in [("mysql -p'half open9", "open9"), ("mysql -pab'cd9 x", "cd9"), ("curl -u dana:pa'ss9 x", "ss9"), ("curl -u \"dana:open quote9", "quote9")] {
             assert!(!masked(t).contains(secret), "{t}: {}", masked(t));
+        }
+    }
+
+    #[test]
+    fn a_verb_is_not_a_password_label() {
+        // Seen live: every "Tests pass: 150" in a terminal was being frosted.
+        for t in ["Tests pass: 150 Rust, 57 Swift", "- Tests pass: 150 Rust", "All checks pass: 12 of 12", "Tests pass: 1204 Rust", "tests pass: 150, 57 skipped", "tests pass: 9"] {
+            assert_eq!(masked(t), t);
+        }
+        // Anything that isn't a plain number or word after the count, and it is no longer read as a count.
+        for t in ["tests pass: 4471 hunter22", "tests pass: 4471, hunter22", "tests pass: 4471 x=1"] {
+            assert!(!masked(t).contains("4471"), "{}", masked(t));
+        }
+        for t in ["pass: hunter22", "db pass: hunter22", "root pass = hunter22", "wifi pass: hunter22", "mysql_pass=hunter22", "PASS=hunter22", "MONGO_PASS=hunter22", "RABBITMQ_PASS=hunter22",
+                  "keyPass=hunter22", "tests_pass=hunter22", "dana pass: hunter22", "user: tests pass: hunter22", "login=all pass=hunter22",
+                  "tests pass: hunter22", "tests pass = 150", "tests pass: \"4471\"", "all pass: 4471", "tests pass: 12345678", "tests pass: 4471", "tests pass: 12/hunter22"] {
+            assert!(!masked(t).contains("hunter22"), "{t}");
+        }
+    }
+
+    #[test]
+    fn certificates_and_headerless_key_blocks_are_hidden() {
+        let b = ["MIIDdzCCAl+gAwIBAgIEAgAAuTANBgkqhkiG9w0BAQUFADBaMQswCQYDVQQGEwJJ", "RTESMBAGA1UEChMJQmFsdGltb3JlMRMwEQYDVQQLEwpDeWJlclRydXN0MSIwIAYD", "VQQDExlCYWx0aW1vcmUgQ3liZXJUcnVzdCBSb290MB4XDTAwMDUxMjE4NDYwMFoX", "DTI1MDUxMjIzNTkwMFowWjELMAkGA1UEBhMCSUUxEjAQBgNVBAoTCUJhbHRpbW9y"];
+        let hidden = |l: &[TextLine]| scan(l).iter().map(|h| h.line).collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>();
+        // A certificate, header and all.
+        let cert = vec![line("-----BEGIN CERTIFICATE-----", 0.1, 0.1), line(b[0], 0.1, 0.2), line("-----END CERTIFICATE-----", 0.1, 0.3), line("ok then", 0.1, 0.4)];
+        assert_eq!(hidden(&cert), [0, 1, 2]);
+        // The header scrolled off, or the dashes were read as something else: the body alone is enough.
+        let body = vec![line("cat server.pem", 0.1, 0.1), line(b[0], 0.1, 0.2), line(b[1], 0.1, 0.3), line(b[2], 0.1, 0.4), line(b[3], 0.1, 0.5), line("done", 0.1, 0.6)];
+        assert_eq!(hidden(&body), [1, 2, 3, 4]);
+        assert_eq!(scan(&body)[0].why, "key-block");
+        // Read with a stray space in the middle, as OCR does.
+        let spaced = vec![line(&format!("{} {}", &b[0][..30], &b[0][30..]), 0.1, 0.2), line(b[1], 0.1, 0.3), line(b[2], 0.1, 0.4)];
+        assert_eq!(hidden(&spaced), [0, 1, 2]);
+        let dashes = vec![line("—BEGIN OPENSSH PRIVATE KEY—", 0.1, 0.1), line("b3BlbnNzaC1rZXk", 0.1, 0.2)];
+        assert_eq!(hidden(&dashes), [0, 1]);
+        // A certificate's END inside a private key doesn't close the key, and a block reopened on the line that closed
+        // one stays open.
+        let nested = vec![line("-----BEGIN RSA PRIVATE KEY-----", 0.1, 0.1), line("-----END CERTIFICATE-----", 0.1, 0.2), line("still the key", 0.1, 0.3), line("-----END RSA PRIVATE KEY-----", 0.1, 0.4), line("free", 0.1, 0.5)];
+        assert_eq!(hidden(&nested), [0, 1, 2, 3]);
+        let chained = vec![line("-----BEGIN CERTIFICATE-----", 0.1, 0.1), line("-----END CERTIFICATE----- -----BEGIN PRIVATE KEY-----", 0.1, 0.2), line("the key body", 0.1, 0.3)];
+        assert_eq!(hidden(&chained), [0, 1, 2]);
+        // Paths and sentences are not a block, however long and however many.
+        for ok in [vec![line("/Users/dana/Library/Application Support/Afterimage/Shots/20416/one.heic", 0.1, 0.1), line("/Users/dana/Library/Application Support/Afterimage/Shots/20416/two.heic", 0.1, 0.2), line("/Users/dana/Library/Application Support/Afterimage/Shots/20416/six.heic", 0.1, 0.3)],
+                   vec![line("thequickbrownfoxjumpsoverthelazydogthequickbrownfox", 0.1, 0.1), line("thequickbrownfoxjumpsoverthelazydogthequickbrownfox", 0.1, 0.2), line("thequickbrownfoxjumpsoverthelazydogthequickbrownfox", 0.1, 0.3)]] {
+            assert!(hidden(&ok).is_empty(), "{:?}", ok[0].text);
         }
     }
 }
