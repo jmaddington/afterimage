@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          sudo xcode-select -s "$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)"
+          echo "DEVELOPER_DIR=$(xcode-select -p)" >> "$GITHUB_ENV"
+          rustup default stable
+          brew install create-dmg
+          swift --version; cargo --version
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+            app/.build
+          key: ${{ runner.os }}-${{ hashFiles('Cargo.lock', 'app/Package.swift') }}
+
+      - name: Engine tests
+        run: cargo test --release -p afterimage-core
+
+      # Live model tests skip themselves without AFTERIMAGE_LIVE.
+      - name: App tests
+        run: |
+          ./scripts/ffi.sh
+          cd app && swift test
+
+      - name: Build app
+        run: BUILD=${{ github.run_number }} ./scripts/build.sh
+
+      - name: Package (unsigned smoke test)
+        run: ./scripts/package.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Afterimage-unsigned-${{ github.run_number }}
+          path: build/dist/*
+          retention-days: 7
