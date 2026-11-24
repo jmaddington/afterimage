@@ -1,5 +1,5 @@
 #!/bin/zsh
-# One-time: copy the Developer ID + notary credentials (same ones Murmur uses) into this repo's Actions secrets.
+# One-time: copy the Developer ID + notary credentials (same ones Murmur uses) into this repo's release environment.
 #   scripts/ci/set-release-secrets.sh ~/path/DeveloperIDApplication.p12 ~/.appstoreconnect/private_keys/AuthKey_XXXX.p8
 # Prompts for the .p12 password and the App Store Connect issuer ID; nothing is echoed or written to disk.
 set -euo pipefail
@@ -41,9 +41,9 @@ if [[ -z "$PW" ]]; then
 fi
 security delete-keychain "$KC" 2>/dev/null || true
 read -r "ISSUER?App Store Connect issuer ID (Users and Access › Integrations): "
-base64 -i "$P12" | gh secret set DEVELOPER_ID_APP_P12 -R "$REPO"
-print -rn -- "$PW" | gh secret set DEVELOPER_ID_APP_PASSWORD -R "$REPO"
-gh secret set ASC_API_KEY_P8 -R "$REPO" < "$P8"
-print -rn -- "$KEY_ID" | gh secret set ASC_API_KEY_ID -R "$REPO"
-print -rn -- "$ISSUER" | gh secret set ASC_API_ISSUER_ID -R "$REPO"
-gh secret list -R "$REPO"
+base64 -i "$P12" | gh secret set DEVELOPER_ID_APP_P12 -R "$REPO" --env release
+print -rn -- "$PW" | gh secret set DEVELOPER_ID_APP_PASSWORD -R "$REPO" --env release
+gh secret set ASC_API_KEY_P8 -R "$REPO" --env release < "$P8"
+print -rn -- "$KEY_ID" | gh secret set ASC_API_KEY_ID -R "$REPO" --env release
+print -rn -- "$ISSUER" | gh secret set ASC_API_ISSUER_ID -R "$REPO" --env release
+gh secret list -R "$REPO" --env release
