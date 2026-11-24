@@ -260,7 +260,7 @@ extension Shot {
         open = nil
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         let from = f.seconds.map { now - Int64($0 * 1000) } ?? Int64.min
-        run { _ = try $0.forget(from: from, to: now + 1) }
+        run { _ = try $0.forget(from: from, to: f.seconds == nil ? .max : now + 1) }
     }
     private func run(_ f: @escaping @Sendable (Engine) throws -> Void) {
         Task {

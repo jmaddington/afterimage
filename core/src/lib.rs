@@ -373,14 +373,21 @@ impl Engine {
 
     /// Delete a span of time, including frames still waiting in memory. Kept shots go too: the person asked.
     pub fn forget(&self, from: i64, to: i64) -> Result<u64, EngineError> {
-        // Forgetting reaches back, never forward: "everything" means everything so far. Otherwise nothing could
-        // be saved again until the app was reopened.
-        let to = to.min(now_ms() + 1);
+        // What's remembered about a forgetting reaches back, never forward: "everything" means everything so far,
+        // or nothing could be saved again until the app was reopened. What is deleted below has no such bound.
         // Order matters: mark first, so a frame mid-flight is refused at insert time.
         let mut f = lock(&self.s.forgotten);
-        // Old ranges only matter while a frame from then could still be in flight.
-        f.retain(|(_, end)| *end > now_ms() - 600_000);
-        f.push((from, to));
+        f.push((from, to.min(now_ms() + 1)));
+        // Never dropped while the app runs, only merged, so the list stays short without guessing what's in flight.
+        f.sort_unstable();
+        let mut merged: Vec<(i64, i64)> = Vec::new();
+        for (a, b) in f.drain(..) {
+            match merged.last_mut() {
+                Some(last) if a <= last.1 => last.1 = last.1.max(b),
+                _ => merged.push((a, b)),
+            }
+        }
+        *f = merged;
         drop(f);
         lock(&self.s.queue).frames.retain(|f| !(from..to).contains(&f.moment.taken_at));
         let store = lock(&self.s.store);
@@ -1308,6 +1315,14 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
         e.ingest(frame(now_ms()));
         wait(|| e.stats().unwrap().count == 1);
+        // Asked again, a picture stamped ahead of the clock goes too, and the list of forgettings stays short.
+        e.ingest(frame(now_ms() + 60_000));
+        wait(|| e.stats().unwrap().count == 2);
+        for _ in 0..50 {
+            e.forget(i64::MIN, i64::MAX).unwrap();
+        }
+        assert_eq!(e.stats().unwrap().count, 0);
+        assert_eq!(lock(&e.s.forgotten).len(), 1);
         e.shutdown();
     }
 }
