@@ -150,13 +150,25 @@ impl Rule {
         let host = host.trim_matches('.');
         let host = host.strip_prefix("www.").unwrap_or(host);
         let host = if host.contains('*') {
-            let sane = host.chars().all(|c| c.is_alphanumeric() || ".-*".contains(c)) && host.chars().any(char::is_alphanumeric);
-            (sane && !host.contains("..")).then(|| host.to_owned())?
+            // Page hosts arrive in punycode, so plain labels convert; a label mixing `*` with non-ASCII can't and is refused.
+            let labels: Option<Vec<String>> = host
+                .split('.')
+                .map(|l| match l {
+                    "" => None,
+                    l if l.is_ascii() => l.chars().all(|c| c.is_ascii_alphanumeric() || "-_*".contains(c)).then(|| l.to_owned()),
+                    l if l.contains('*') => None,
+                    l => url::Host::parse(l).ok().map(|h| h.to_string()),
+                })
+                .collect();
+            let h = labels?.join(".");
+            h.chars().any(char::is_alphanumeric).then_some(h)?
         } else {
             (!host.contains("..")).then(|| url::Host::parse(host).ok().map(|h| h.to_string()))??
         };
         let path = url::Url::parse(&format!("http://x/{path}")).ok()?.path().to_lowercase();
-        let path = path.trim_end_matches('*').trim_matches('/').to_owned();
+        // Only a whole trailing segment is redundant; "acc*" must keep its star.
+        let path = path.trim_matches('/');
+        let path = if path == "*" { "" } else { path.strip_suffix("/*").unwrap_or(path) }.trim_matches('/').to_owned();
         Some(Rule { host, port, path })
     }
 
@@ -190,37 +202,59 @@ impl std::fmt::Display for Rule {
 
 static MANAGER_RULES: std::sync::LazyLock<Vec<Rule>> = std::sync::LazyLock::new(|| MANAGER_SITES.iter().filter_map(|s| Rule::parse(s)).collect());
 
-/// The page behind view-source:, blob:, reader mode and similar wrappers.
-fn unwrap(mut u: url::Url) -> url::Url {
-    for _ in 0..4 {
-        let inner = match u.scheme() {
-            "view-source" | "blob" | "feed" => url::Url::parse(u.as_str().split_once(':').map_or("", |x| x.1)).ok(),
-            "http" | "https" | "file" => None,
-            _ => u.query_pairs().find(|(k, _)| k == "url").and_then(|(_, v)| url::Url::parse(&v).ok()),
-        };
-        match inner {
-            Some(i) => u = i,
-            None => break,
+const WRAPPERS: &[&str] = &["view-source", "blob", "feed", "chrome-distiller", "safari-reader", "read"];
+
+/// This address and every address it carries inside. A wrapper can add suspicion, never remove it.
+fn layers(u: &url::Url) -> Vec<url::Url> {
+    let mut out = vec![u.clone()];
+    let mut i = 0;
+    while i < out.len() && out.len() < 12 {
+        let u = out[i].clone();
+        i += 1;
+        // Ordinary pages may mention any address; only browser-made schemes display one.
+        if matches!(u.scheme(), "http" | "https" | "file") {
+            continue;
+        }
+        let rest = u.as_str().split_once(':').map_or("", |x| x.1);
+        let mut found: Vec<url::Url> = url::Url::parse(rest).into_iter().collect();
+        found.extend(u.query_pairs().filter_map(|(_, v)| url::Url::parse(&v).ok()));
+        for mark in ["https://", "http://"] {
+            found.extend(rest.match_indices(mark).filter_map(|(at, _)| url::Url::parse(&rest[at..]).ok()));
+        }
+        for f in found {
+            if f.has_host() && !out.contains(&f) {
+                out.push(f);
+            }
         }
     }
-    u
+    out
 }
 
-/// Could this address be showing a site we can't identify?
-fn opaque(u: &url::Url) -> bool {
+/// Could this address be showing a site we can't identify? Anything unfamiliar counts.
+fn opaque(u: &url::Url, carries_page: bool) -> bool {
     match u.scheme() {
-        "file" | "chrome" | "edge" | "brave" | "vivaldi" | "opera" | "arc" | "comet" | "favorites" | "topsites" | "bookmarks" | "history" => false,
-        "about" => matches!(u.path(), "blank" | "srcdoc" | "reader"),
-        _ => host_of(u).is_empty(),
+        "http" | "https" => host_of(u).is_empty(),
+        "file" | "chrome" | "edge" | "brave" | "vivaldi" | "opera" | "arc" | "comet" | "chrome-extension" | "favorites" | "topsites" | "bookmarks" | "history" => false,
+        "about" if u.path() == "reader" => !carries_page,
+        "about" => matches!(u.path(), "blank" | "srcdoc"),
+        "safari-reader" if u.has_host() => false,
+        s if WRAPPERS.contains(&s) => !carries_page,
+        _ => true,
     }
+}
+
+fn squash(s: &str) -> String {
+    s.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase()
 }
 
 fn manager_url(u: &url::Url, title: &str) -> bool {
+    if MANAGER_RULES.iter().any(|r| r.matches(u)) {
+        return true;
+    }
     match u.scheme() {
-        "http" | "https" => MANAGER_RULES.iter().any(|r| r.matches(u)),
-        "file" => false,
+        "http" | "https" | "file" | "safari-reader" => false,
         "chrome-extension" => {
-            let t = format!("{u} {title}").to_lowercase();
+            let t = squash(&format!("{u} {title}"));
             MANAGER_EXTENSIONS.contains(&host_of(u).as_str()) || MANAGER_NAMES.iter().any(|n| t.contains(n))
         }
         // Safari and Firefox give every install a random id, so there is nothing to recognise: assume the worst.
@@ -292,7 +326,8 @@ pub fn hide_browser(ex: &Exclusions, bundle_id: &str, windows: Option<Vec<Browse
             if is_private(f, w) {
                 found = found.or(Some(HideReason::PrivateWindow));
             }
-            unreadable |= w.title.is_none() && w.control_labels.is_empty() && w.field_descriptions.is_empty();
+            // Markers live in the window's controls; a title alone doesn't prove they were read.
+            unreadable |= w.control_labels.iter().chain(&w.field_descriptions).all(|l| l.trim().is_empty());
         }
         unreadable |= w.urls.is_empty();
         for raw in &w.urls {
@@ -300,14 +335,14 @@ pub fn hide_browser(ex: &Exclusions, bundle_id: &str, windows: Option<Vec<Browse
                 unreadable = true;
                 continue;
             };
-            let u = unwrap(u);
-            if ex.password_managers && manager_url(&u, w.title.as_deref().unwrap_or("")) {
+            let all = layers(&u);
+            if ex.password_managers && all.iter().any(|u| manager_url(u, w.title.as_deref().unwrap_or(""))) {
                 return Some(HideReason::PasswordManager);
             }
-            if rules.iter().any(|r| r.matches(&u)) {
+            if all.iter().any(|u| rules.iter().any(|r| r.matches(u))) {
                 found = Some(HideReason::Site);
             }
-            unreadable |= opaque(&u);
+            unreadable |= opaque(&u, all.len() > 1);
         }
     }
     found.or((unreadable && ex.unreadable_browsers).then_some(HideReason::Unreadable))
@@ -330,7 +365,7 @@ mod tests {
         Exclusions { sites: s.iter().map(|x| x.to_string()).collect(), ..ex() }
     }
     fn win(url: &str) -> BrowserWindow {
-        BrowserWindow { title: Some("Page".into()), urls: vec![url.into()], ..Default::default() }
+        BrowserWindow { title: Some("Page".into()), urls: vec![url.into()], control_labels: vec!["Reload".into()], ..Default::default() }
     }
     const CHROME: &str = "com.google.Chrome";
     const SAFARI: &str = "com.apple.Safari";
@@ -423,7 +458,8 @@ mod tests {
         assert_eq!(t(CHROME, "Seite - Google Chrome (Inkognito)"), Some(HideReason::PrivateWindow));
         assert_eq!(t(SAFARI, "News, Private Browsing"), Some(HideReason::PrivateWindow));
         assert_eq!(t("org.mozilla.firefox", "News — Mozilla Firefox Private Browsing"), Some(HideReason::PrivateWindow));
-        assert_eq!(t(CHROME, "How incognito mode works - Google Chrome"), None);
+        assert_eq!(t(CHROME, "How incognito mode works - Google Chrome"), Some(HideReason::Unreadable));
+        assert_eq!(hide_browser(&ex(), CHROME, Some(vec![BrowserWindow { title: Some("How incognito mode works - Google Chrome".into()), ..win("https://a.com") }])), None);
         let f = BrowserWindow { title: Some("x".into()), urls: vec!["https://a.com".into()], field_descriptions: vec!["smart search field in a private window".into()], ..Default::default() };
         assert_eq!(hide_browser(&ex(), SAFARI, Some(vec![f])), Some(HideReason::PrivateWindow));
         let c = BrowserWindow { title: Some("x".into()), urls: vec!["https://a.com".into()], control_labels: vec!["Incognito".into()], ..Default::default() };
@@ -526,5 +562,62 @@ mod tests {
                   "opera://settings/passwords", "arc://password-manager", "comet://password-manager/", "chrome://settings/passwords", "vivaldi:settings/passwords", "about:preferences#privacy-passwords"] {
             assert_eq!(hid(&ex(), u), Some(HideReason::PasswordManager), "{u}");
         }
+    }
+
+    // ---- security review 2026-11-23, second round ----
+    #[test]
+    fn a_wrapper_cannot_disguise_what_it_wraps() {
+        let e = sites(&["chase.com"]);
+        // The outer page is the excluded one; ?url= must not swap it for an innocent one.
+        assert_eq!(hid(&ex(), "chrome://password-manager/x?url=https%3A%2F%2Fa.com"), Some(HideReason::PasswordManager));
+        assert_eq!(hid(&ex(), "chrome-extension://nngceckbapebfimnlniiiahkandclblb/p?url=https%3A%2F%2Fa.com"), Some(HideReason::PasswordManager));
+        assert_eq!(hid(&ex(), "moz-extension://u-u/p?url=https%3A%2F%2Fa.com"), Some(HideReason::PasswordManager));
+        assert_eq!(hid(&e, "safari-reader://chase.com/?url=https%3A%2F%2Fa.com"), Some(HideReason::Site));
+        assert_eq!(hid(&ex(), "about:blank?url=https%3A%2F%2Fa.com"), Some(HideReason::Unreadable));
+        assert_eq!(hid(&e, "view-source:view-source:https://chase.com/"), Some(HideReason::Site));
+    }
+
+    #[test]
+    fn pages_inside_extensions_are_checked() {
+        let e = sites(&["chase.com"]);
+        for u in ["chrome-extension://cjpalhdlnbpafiamejdnhcphjbkeiagm/view.html#https://chase.com/x", "chrome-extension://cjpalhdlnbpafiamejdnhcphjbkeiagm/https://www.chase.com/x",
+                  "chrome-extension://cjpalhdlnbpafiamejdnhcphjbkeiagm/v?page=https%3A%2F%2Fchase.com%2F"] {
+            assert_eq!(hid(&e, u), Some(HideReason::Site), "{u}");
+        }
+    }
+
+    #[test]
+    fn unfamiliar_schemes_are_unreadable() {
+        for u in ["chrome-distiller://abc/", "devtools://devtools/bundled/x.html", "isolated-app://abc/", "chrome-untrusted://x/", "safari-resource:/x"] {
+            assert_eq!(hid(&ex(), u), Some(HideReason::Unreadable), "{u}");
+        }
+    }
+
+    #[test]
+    fn vaults_in_reader_schemes() {
+        assert_eq!(hid(&ex(), "safari-reader://vault.bitwarden.com/x"), Some(HideReason::PasswordManager));
+    }
+
+    #[test]
+    fn rules_are_never_narrowed() {
+        assert_eq!(hid(&sites(&["example.com/acc*"]), "https://example.com/accounts/1"), Some(HideReason::Site));
+        assert_eq!(hid(&sites(&["*.bücher.de"]), "https://x.xn--bcher-kva.de/"), Some(HideReason::Site));
+        assert_eq!(normalize_site("*bü*.de"), None);
+    }
+
+    #[test]
+    fn extension_names_ignore_spacing() {
+        for t in ["Proton Pass", "NordPass", "Nord Pass", "Robo-Form", "Kee Pass XC", "1 Password"] {
+            let w = BrowserWindow { title: Some(t.into()), ..win("chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/p") };
+            assert_eq!(hide_browser(&ex(), CHROME, Some(vec![w])), Some(HideReason::PasswordManager), "{t}");
+        }
+    }
+
+    #[test]
+    fn a_title_alone_does_not_prove_a_window_is_ordinary() {
+        let w = BrowserWindow { control_labels: vec![], ..win("https://a.com") };
+        assert_eq!(hide_browser(&ex(), CHROME, Some(vec![w])), Some(HideReason::Unreadable));
+        let blank = BrowserWindow { title: Some("  ".into()), control_labels: vec![" ".into()], ..win("https://a.com") };
+        assert_eq!(hide_browser(&ex(), CHROME, Some(vec![blank])), Some(HideReason::Unreadable));
     }
 }

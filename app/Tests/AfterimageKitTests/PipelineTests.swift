@@ -21,7 +21,9 @@ func saveAndReread(_ name: String, config: Config = rulesOnly()) async throws ->
     let lines = try Recognizer.lines(in: image)
     let moment = Moment(takenAt: 1_700_000_000_000, trigger: "manual", display: "Test", appName: "Fixture", bundleId: "test", windowTitle: name, url: "", userName: "u", fullName: "U", host: "h", sessions: [], runningApps: [])
     engine.ingest(frame: Frame(rgba: bmp.data, width: UInt32(bmp.width), height: UInt32(bmp.height), stride: UInt32(bmp.stride), lines: lines, moment: moment, displayKey: "t"))
-    for _ in 0..<200 where try engine.stats().count == 0 { try await Task.sleep(for: .milliseconds(50)) }
+    // A cold model load can take half a minute on a busy Mac.
+    for _ in 0..<2400 where try engine.stats().count == 0 && engine.status().discarded == 0 { try await Task.sleep(for: .milliseconds(50)) }
+    #expect(engine.status().discarded == 0, "\(engine.status().discardReason)")
     let shot = try #require(try engine.list(filter: Filter(text: "", bundleId: nil, from: nil, to: nil, onlyKept: false, onlyHidden: false), limit: 1, offset: 0).first)
     let saved = try #require(Pixels.load(shot.path))
     #expect(Pixels.load(shot.thumbPath) != nil)
