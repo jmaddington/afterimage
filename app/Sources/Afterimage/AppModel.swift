@@ -104,9 +104,11 @@ extension Shot {
         }
         reload()
         Task.detached { [engine] in _ = engine.listenForPages() }
-        // Any app registered to open web pages is treated as a browser, known to us or not.
-        if let page = URL(string: "https://example.com") {
-            registerBrowsers(bundleIds: NSWorkspace.shared.urlsForApplications(toOpen: page).compactMap { Bundle(url: $0)?.bundleIdentifier }.filter { $0 != Bundle.main.bundleIdentifier })
+        // Any app registered to open web pages is treated as a browser, known to us or not. Checked again whenever an
+        // app opens: it may have been installed since.
+        registerWebApps()
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.registerWebApps() }
         }
         if settings.onboarded { recorder.start() }
         #if DEBUG
@@ -118,6 +120,19 @@ extension Shot {
                 try? await Task.sleep(for: .seconds(8))
             }
         }
+    }
+
+    private func registerWebApps() {
+        guard let page = URL(string: "https://example.com") else { return }
+        registerBrowsers(bundleIds: NSWorkspace.shared.urlsForApplications(toOpen: page).compactMap { Bundle(url: $0)?.bundleIdentifier }.filter { $0 != Bundle.main.bundleIdentifier })
+    }
+
+    /// Arrow keys in the grid: sideways by one, up and down by a row.
+    func moveSelection(by n: Int) {
+        guard !shots.isEmpty else { return }
+        let at = shots.firstIndex { selection.contains($0.id) }
+        let to = at.map { min(max($0 + n, 0), shots.count - 1) } ?? 0
+        selection = [shots[to].id]
     }
 
     func finishOnboarding() {

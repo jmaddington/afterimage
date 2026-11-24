@@ -11,6 +11,8 @@ struct GridView: View {
         if model.loaded && model.shots.isEmpty {
             empty
         } else {
+            GeometryReader { g in
+            ScrollViewReader { proxy in
             ScrollView {
                 LazyVGrid(columns: columns, alignment: .leading, spacing: 22, pinnedViews: []) {
                     if model.isSearching {
@@ -33,11 +35,33 @@ struct GridView: View {
             .focusable().focusEffectDisabled().focused($focused)
             .onCommand(#selector(NSResponder.selectAll(_:))) { model.selection = Set(model.shots.map(\.id)) }
             .onAppear { focused = true }
+            .onKeyPress(.leftArrow) { move(-1, proxy) }
+            .onKeyPress(.rightArrow) { move(1, proxy) }
+            .onKeyPress(.upArrow) { move(-perRow(g.size.width), proxy) }
+            .onKeyPress(.downArrow) { move(perRow(g.size.width), proxy) }
+            .onKeyPress(.return) { open() }
+            .onKeyPress(.space) { open() }
+            }
+            }
         }
+    }
+
+    /// How many pictures fit across, by the same arithmetic the grid uses.
+    private func perRow(_ width: CGFloat) -> Int { max(1, Int((width - 48 + 18) / (230 + 18))) }
+    private func move(_ n: Int, _ proxy: ScrollViewProxy) -> KeyPress.Result {
+        model.moveSelection(by: n)
+        if let id = model.selection.first { withAnimation(.smooth(duration: 0.15)) { proxy.scrollTo(id) } }
+        return .handled
+    }
+    private func open() -> KeyPress.Result {
+        guard model.selection.count == 1, let id = model.selection.first else { return .ignored }
+        model.open = id
+        return .handled
     }
 
     private func cell(_ s: Shot) -> some View {
         ShotCell(shot: s, selected: model.selection.contains(s.id), searching: model.isSearching)
+            .id(s.id)
             .onTapGesture(count: 2) { model.selection = [s.id]; model.open = s.id }
             .simultaneousGesture(TapGesture().onEnded { select(s) })
             .contextMenu { ShotMenu(shot: s) }

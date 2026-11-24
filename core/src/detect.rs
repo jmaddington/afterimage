@@ -109,9 +109,6 @@ re!(ASSIGN, r#"([A-Za-z0-9_.\-\[\]'"]+)\s*(:=|=>|=|:)\s*(["']?)([^\s"',;]+)"#);
 // Where one pair of a query string ends and the next begins.
 re!(NEXT_PAIR, r"&[A-Za-z0-9_.\-\[\]%]+=");
 re!(NOT_A_VALUE_WHOLE, r"(?i)^(?:forgot|forgotten|reset|show|hide|sign\s*in|log\s*in|sign\s*up|continue|submit|cancel|save|remember|required|optional|must|characters?|enter|confirm|change|manager|generate|copy|username|email|user\s*name)\W*$");
-re!(TAIL_WORDS, r"^(?:[ \t]+[A-Za-z0-9\-]+){1,6}[ \t]*$");
-re!(MYSQL_P, r"(?i)\bmysql(?:dump|admin)?\b[^\n]*\s-p([^\s]+)");
-re!(CURL_U, r#"(?i)\b(?:curl|wget|http)\b[^\n]*\s(?:-u|--user)[=\s]+["']?[^\s:"']+:([^\s"']+)"#);
 re!(CODE_SHAPED, r"^[A-Z0-9]{4,}(?:-[A-Z0-9]{2,})+$|^[A-Z0-9]{8,}$");
 re!(PATH_TOKEN, r"^[A-Za-z0-9_\-]{20,}$");
 re!(SECRET_NEAR, r"(?i)pass|\bpin\b|code|secret|recovery|\bkey|token|ssn|social|combination");
@@ -123,7 +120,11 @@ re!(DOTTED, r"^(?:self|this|args|settings|os|config|cfg|env|opts|options|params|
 re!(CODE_START, r"^[A-Za-z_][\w.]*[(\[]");
 re!(RECOVERY, r"(?i)\b(?:recovery|backup)\s+(?:codes?|keys?|phrases?)\b[ \t]*([:=])?[ \t]*");
 // A row that starts by naming its own field is that field, not the value of the label above it.
-re!(FIELD_START, r"(?i)^\s*(?:card|account|routing|name|member|e-?mail|user(?:name)?|phone|address|notes?|date|expir\w*|cvv|cvc|zip|city|state|country|first|last|company)\b");
+re!(FIELD_START, r"(?i)^\s*(?:card|account|routing|name|member|e-?mail|user(?:name)?|phone|address|notes?|date|expir\w*|cvv|cvc|zip|city|state|country|first|last|company)(?:\s+(?:number|no\.?|name|code|date|address))?(?:\s*:\s*|\s+|$)");
+re!(WIFI, r#"(?i)\bwi-?fi\b(?:\s+(?:password|passphrase|key|code))?\s*(?:\bis\b|:)\s*["']?([^\s"']+)"#);
+re!(COMMAND, r"(?i)\b(mysql(?:dump|admin)?|curl|wget|http)\b");
+re!(MYSQL_FLAG, r#"\s-p(?:'([^']+)'|"([^"]+)"|([^\s'"]+))"#);
+re!(CURL_FLAG, r#"\s(?:-u|--user|-U|--proxy-user)(?:=|\s+)(?:'[^':]*:([^']+)'|"[^":]*:([^"]+)"|[^\s:'"]+:([^\s'"]+))"#);
 re!(PHONE_334, r"^\d{3}[\s.\-]\d{3}[\s.\-]\d{4}$");
 re!(FIN_QUAL, r"(?i)\b(?:number|num|no\.?|nbr|code|iban|routing|aba|swift|bic|sort\s*code)\b|#");
 // Long numbers that are plainly something else.
@@ -452,10 +453,15 @@ fn scan_latin(text: &str, line: usize, hits: &mut Vec<Hit>) {
         match seg.and_then(judge).or_else(|| judge(v.as_str())) {
             Some(kind) => {
                 let mut end = v.end();
-                // "password: correct horse battery staple": a few plain words after it are more of it.
+                // "password: correct horse battery staple": a passphrase has spaces. Quoted, it runs to the closing
+                // quote; unquoted, to the end of the line (or, if that is very long, not at all: it's prose).
                 let rest = text[end..].split('\n').next().unwrap_or("");
-                if kind == SecretKind::Password && !quoted && TAIL_WORDS.is_match(rest) {
-                    end += rest.trim_end().len();
+                if kind == SecretKind::Password {
+                    if quoted {
+                        end += rest.find(&c[3]).unwrap_or(rest.trim_end().len());
+                    } else if rest.split_whitespace().count() <= 24 {
+                        end += rest.trim_end().len();
+                    }
                 }
                 push(hits, line, v.start()..end, kind, "assignment");
                 from = end;
@@ -472,9 +478,21 @@ fn scan_latin(text: &str, line: usize, hits: &mut Vec<Hit>) {
             push(hits, line, l.end()..l.end() + tail.len(), Key, "label");
         }
     }
-    for re in [&*MYSQL_P, &*CURL_U] {
-        for c in re.captures_iter(text) {
-            push(hits, line, c.get(1).unwrap().range(), Password, "flag");
+    for cmd in COMMAND.captures_iter(text) {
+        let from = cmd.get(0).unwrap().end();
+        let tail_end = text[from..].find('\n').map_or(text.len(), |i| from + i);
+        let flags = if cmd[1].to_lowercase().starts_with("mysql") { &*MYSQL_FLAG } else { &*CURL_FLAG };
+        for f in flags.captures_iter(&text[from..tail_end]) {
+            if let Some(v) = (1..=3).find_map(|i| f.get(i)) {
+                push(hits, line, from + v.start()..from + v.end(), Password, "flag");
+            }
+        }
+    }
+    for c in WIFI.captures_iter(text) {
+        let v = c.get(1).unwrap();
+        // "the wifi is BlueHeron" names a network; a password has a digit in it.
+        if v.as_str().chars().any(|c| c.is_ascii_digit()) && v.as_str().chars().count() >= 6 {
+            push(hits, line, v.range(), Password, "phrase");
         }
     }
     for c in LABELLED.captures_iter(text) {
@@ -541,8 +559,20 @@ pub fn scan(lines: &[TextLine]) -> Vec<Hit> {
         if PASS_LABEL.is_match(t) {
             for j in neighbours(lines, i) {
                 let v = &latin[j];
-                if (plausible_value(v) || plausible_value(&lines[j].text)) && !PASS_LABEL.is_match(v) && !FIELD_START.is_match(v) {
-                    push(&mut hits, j, 0..lines[j].text.len(), SecretKind::Password, "label");
+                if (plausible_value(v) || plausible_value(&lines[j].text)) && !PASS_LABEL.is_match(v) {
+                    // A row that names its own field keeps its label; what follows goes, unless a rule already has it.
+                    let start = match FIELD_START.find(v) {
+                        Some(f) => {
+                            let mut own = Vec::new();
+                            scan_text(&lines[j].text, j, &mut own);
+                            if !own.is_empty() || f.end() >= v.len() {
+                                continue;
+                            }
+                            f.end()
+                        }
+                        None => 0,
+                    };
+                    push(&mut hits, j, start..lines[j].text.len(), SecretKind::Password, "label");
                 }
             }
         }
@@ -1245,5 +1275,30 @@ mod tests {
         assert!(h.iter().any(|x| x.line == 1 && x.why == "card"));
         let l = vec![line("Password", 0.1, 0.10), line("blue-heron-7", 0.1, 0.14)];
         assert!(scan(&l).iter().any(|x| x.line == 1));
+    }
+
+    #[test]
+    fn release_round() {
+        // A row is "another field" only when it plainly starts with a label; then what follows the label still goes
+        // unless a rule of its own already covers it.
+        let under = |v: &str| { let l = vec![line("Password", 0.1, 0.10), line(v, 0.1, 0.14)]; let h = scan(&l); mask(&l[1].text, &h.iter().filter(|h| h.line == 1).map(|h| h.range.clone()).collect::<Vec<_>>()) };
+        assert_eq!(under("name-of-the-rose9"), "[hidden]");
+        assert_eq!(under("card.shark!22"), "[hidden]");
+        assert_eq!(under("notes4me"), "[hidden]");
+        assert_eq!(under("Member name dana"), "Member name [hidden]");
+        assert_eq!(under("Card number 4111 1111 1111 1111"), "Card number [hidden]");
+        // Wi-Fi passwords said in passing.
+        for (t, secret) in [("the gate code is 4471 and wifi is marmalade-tuba-41", "marmalade"), ("Wi-Fi password is heron77blue", "heron77"), ("wifi: tuba41marm", "tuba41")] {
+            assert!(!masked(t).contains(secret), "{t}: {}", masked(t));
+        }
+        assert_eq!(masked("the wifi is BlueHeron today"), "the wifi is BlueHeron today");
+        // Flags are case-sensitive, and there can be more than one.
+        assert_eq!(masked("mysql -P3306 -uroot -pTr0ub4dor9x shop"), "mysql -P3306 -uroot -p[hidden] shop");
+        let two = masked("curl -u dana:first9pass -U proxy:second9pass https://x.com");
+        assert!(!two.contains("first9") && !two.contains("second9") && two.contains("dana"), "{two}");
+        assert!(!masked("curl -u 'dana:two words9' https://x.com").contains("words9"));
+        // A quoted password runs to its closing quote; an unquoted one to the end of the line.
+        assert_eq!(masked("password = \"correct horse battery\" # note"), "password = \"[hidden]\" # note");
+        assert_eq!(masked("password: correct, horse; battery staple!"), "password: [hidden]");
     }
 }

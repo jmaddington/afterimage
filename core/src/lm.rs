@@ -249,7 +249,11 @@ pub fn locate(lines: &[TextLine], line: usize, value: &str, kind: SecretKind) ->
         out = crate::detect::find_secret(lines, value).into_iter().map(|(line, range)| Hit { line, range, kind, why: "model" }).collect();
         if out.is_empty() {
             // It saw something here that we can't find. Hide the line it named and the ones either side.
-            return (line.saturating_sub(1)..=line + 1).filter_map(|i| lines.get(i).filter(|_| line < lines.len()).map(|l| Hit { line: i, range: 0..l.text.len(), kind, why: "model" })).collect();
+            return around(lines, line, kind);
+        }
+        // Found, but nowhere near where it pointed: it may have meant something else there as well.
+        if !out.iter().any(|h| h.line.abs_diff(line) <= 1) {
+            out.extend(around(lines, line, kind));
         }
         return out;
     }
@@ -257,6 +261,11 @@ pub fn locate(lines: &[TextLine], line: usize, value: &str, kind: SecretKind) ->
         out.push(Hit { line, range: 0..l.text.len(), kind, why: "model" });
     }
     out
+}
+
+/// The line it named and the ones either side, whole.
+fn around(lines: &[TextLine], line: usize, kind: SecretKind) -> Vec<Hit> {
+    (line.saturating_sub(1)..=line + 1).filter_map(|i| lines.get(i).filter(|_| line < lines.len()).map(|l| Hit { line: i, range: 0..l.text.len(), kind, why: "model" })).collect()
 }
 
 /// Names of machines LM Link could route a request to, if any.
@@ -299,6 +308,9 @@ mod tests {
         // Tidied spacing, wrong line: found where it really is.
         let h = locate(&l, 0, "marmalade tuba 41", SecretKind::Password);
         assert!(h.iter().any(|h| h.line == 1 && h.range == (0..18)), "{h:?}");
+        // Found far from where it pointed: there as well.
+        let h = locate(&l, 4, "marmalade tuba 41", SecretKind::Password);
+        assert!(h.iter().any(|h| h.line == 1) && h.iter().any(|h| h.line == 4 && h.range == (0..1)), "{h:?}");
         // Nowhere to be found: the line it named and both neighbours go.
         let mut lines: Vec<usize> = locate(&l, 3, "nothing like it", SecretKind::Other).iter().map(|h| h.line).collect();
         lines.sort_unstable();

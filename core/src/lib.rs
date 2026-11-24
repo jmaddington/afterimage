@@ -609,7 +609,7 @@ impl Shared {
                 chars += text[end].1.len();
                 end += 1;
             }
-            hits.extend(self.ask(&l, c, lines, &text[at..end], &mut unsure)?);
+            self.ask(&l, c, lines, &text[at..end], hits, &mut unsure)?;
             *lock(&self.last_lm_use) = Instant::now();
             if end == text.len() {
                 break;
@@ -627,15 +627,19 @@ impl Shared {
     }
 
     /// One chunk; an unusable answer is retried on halves before giving up.
-    fn ask(&self, l: &lm::Lm, c: &Config, lines: &[TextLine], chunk: &[(usize, String)], unsure: &mut HashSet<usize>) -> Result<Vec<Hit>, lm::LmError> {
+    fn ask(&self, l: &lm::Lm, c: &Config, lines: &[TextLine], chunk: &[(usize, String)], hits: &mut Vec<Hit>, unsure: &mut HashSet<usize>) -> Result<(), lm::LmError> {
         let view: Vec<(usize, &str)> = chunk.iter().map(|(i, t)| (*i, t.as_str())).collect();
         match l.find_secrets(&c.model, &view) {
             Ok(f) => {
-                let mut hits = Vec::new();
+                // AIDEV-NOTE: findings are written straight into the caller's list, so an error later (here, in the
+                // AIDEV-NOTE: other half, in the next chunk) never throws away what was already found.
+                let mut wild = false;
                 for (i, v, k) in f {
-                    // A line that doesn't exist: it isn't talking about this screen.
+                    // A line that doesn't exist: it isn't talking about this screen. Its value is still looked for.
                     if i >= lines.len() {
-                        return Err(lm::LmError::BadAnswer("line"));
+                        wild = true;
+                        hits.extend(detect::find_secret(lines, &v).into_iter().map(|(line, range)| Hit { line, range, kind: k, why: "model" }));
+                        continue;
                     }
                     // It quoted text we had already masked: there's more on that line than we knew. Hide all of it.
                     let v = if v.contains("[hidden]") { String::new() } else { v };
@@ -651,13 +655,12 @@ impl Shared {
                     }
                     hits.extend(found);
                 }
-                Ok(hits)
+                if wild { Err(lm::LmError::BadAnswer("line")) } else { Ok(()) }
             }
             Err(lm::LmError::BadAnswer(_)) if chunk.len() >= 8 => {
                 let m = chunk.len() / 2;
-                let mut a = self.ask(l, c, lines, &chunk[..m + 2], unsure)?;
-                a.extend(self.ask(l, c, lines, &chunk[m.saturating_sub(2)..], unsure)?);
-                Ok(a)
+                self.ask(l, c, lines, &chunk[..m + 2], hits, unsure)?;
+                self.ask(l, c, lines, &chunk[m.saturating_sub(2)..], hits, unsure)
             }
             Err(e) => Err(e),
         }
@@ -778,21 +781,33 @@ fn covered(lines: &[TextLine], covers: &[pages::Cover]) -> Vec<Hit> {
         let h = (r.y + r.h).min(c.y + c.h) - r.y.max(c.y);
         if w > 0.0 && h > 0.0 { w * h } else { 0.0 }
     };
-    // A tenth of the smaller one: enough to catch a word half out of its box, not a label that brushes its edge.
-    let touches = |r: &Rect, c: &Rect| overlap(r, c) > 0.10 * (r.w * r.h).min(c.w * c.h);
+    // A value half out of its box still counts. A label has to be well inside one: seen live, "Password" brushes
+    // the edge of its own field.
+    let inside = |r: &Rect, c: &Rect, share: f64| overlap(r, c) > share * (r.w * r.h).min(c.w * c.h);
+    let label = |t: &str| {
+        let t = t.trim_end_matches([':', '*']).to_lowercase();
+        ["password", "passcode", "card", "number", "account", "pin", "code", "key", "secret", "token", "cvv", "routing", "ssn", "name", "email", "username"].contains(&t.as_str())
+    };
     let mut hits = Vec::new();
     for c in covers {
         let why = if c.empty { HINT } else { "extension" };
-        for (i, l) in lines.iter().enumerate().filter(|(_, l)| !l.code && touches(&l.rect, &c.rect)) {
+        for (i, l) in lines.iter().enumerate().filter(|(_, l)| !l.code && overlap(&l.rect, &c.rect) > 0.0) {
             let placed: u32 = l.tokens.iter().map(|t| t.len).sum();
             let words = l.text.chars().filter(|c| !c.is_whitespace()).count() as u32;
-            let inside: Vec<&Token> = l.tokens.iter().filter(|t| touches(&t.rect, &c.rect)).collect();
-            if placed < words || inside.is_empty() {
-                hits.push(Hit { line: i, range: 0..l.text.len(), kind: c.kind, why });
-                continue;
-            }
             let byte = |scalar: u32| l.text.char_indices().nth(scalar as usize).map_or(l.text.len(), |x| x.0);
-            hits.extend(inside.into_iter().map(|t| Hit { line: i, range: byte(t.start)..byte(t.start + t.len), kind: c.kind, why }));
+            let text = |t: &Token| &l.text[byte(t.start)..byte(t.start + t.len)];
+            let within: Vec<&Token> = l.tokens.iter().filter(|t| inside(&t.rect, &c.rect, if label(text(t)) { 0.10 } else { 0.03 })).collect();
+            if placed < words {
+                hits.push(Hit { line: i, range: 0..l.text.len(), kind: c.kind, why });
+            } else if within.is_empty() {
+                // The line crosses the box yet none of its words is in it: the word boxes are wrong. A mere brush
+                // of the edge is not a crossing.
+                if inside(&l.rect, &c.rect, 0.03) {
+                    hits.push(Hit { line: i, range: 0..l.text.len(), kind: c.kind, why });
+                }
+            } else {
+                hits.extend(within.into_iter().map(|t| Hit { line: i, range: byte(t.start)..byte(t.start + t.len), kind: c.kind, why }));
+            }
         }
     }
     hits
@@ -1272,6 +1287,10 @@ mod tests {
         assert_eq!(hidden(&l("Name quartz-otter end", vec![tok(0, 4, 0.10, 0.10), tok(5, 12, 0.55, 0.30), tok(18, 3, 0.88, 0.02)])), "Name [hidden] end");
         // A label that merely brushes the box (seen live: "Password" beside its field) stays.
         assert_eq!(hidden(&l("Password quartz", vec![tok(0, 8, 0.20, 0.105), tok(9, 6, 0.32, 0.10)])), "Password [hidden]");
+        // A long label and a short value read as one line: the line barely overlaps the box, the value is still found.
+        let mut long = l("Please enter your account password now q9", vec![tok(0, 6, 0.0, 0.04), tok(7, 5, 0.04, 0.04), tok(13, 4, 0.08, 0.04), tok(18, 7, 0.12, 0.05), tok(26, 8, 0.17, 0.06), tok(35, 3, 0.23, 0.03), tok(39, 2, 0.305, 0.02)]);
+        long[0].rect = Rect { x: 0.0, y: 0.3, w: 0.325, h: 0.05 };
+        assert_eq!(hidden(&long), "Please enter your account password now [hidden]");
         // A word whose box is missing could be anywhere on the line.
         assert_eq!(hidden(&l("Name quartz", vec![tok(0, 4, 0.10, 0.10)])), "[hidden]");
         // The line crosses the place but no word's box does: the boxes are wrong.
@@ -1405,6 +1424,16 @@ mod tests {
         let e = Engine::new(d.path().to_string_lossy().into(), c, Arc::new(FakeHost(Default::default()))).unwrap();
         e.ingest(frame(1000));
         wait(|| e.status().discarded == 1);
+        e.shutdown();
+        // In rules-only mode the same wild answer still gives up what it did find.
+        let d = tempfile::tempdir().unwrap();
+        let both = r#"{"findings":[{"line":0,"value":"hello","kind":"password"},{"line":40,"value":"zzz","kind":"password"}]}"#;
+        let c = Config { lm_url: fake_lm(both, 200), ..config(false) };
+        let e = Engine::new(d.path().to_string_lossy().into(), c, Arc::new(FakeHost(Default::default()))).unwrap();
+        e.ingest(frame(1000));
+        wait(|| e.stats().unwrap().count == 1);
+        let s = e.list(Filter::default(), 1, 0).unwrap().remove(0);
+        assert!(!format!("{:?}", e.lines(s.id).unwrap()).contains("hello") && !s.ai_checked);
         e.shutdown();
     }
 }

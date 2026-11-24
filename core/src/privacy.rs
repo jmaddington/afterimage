@@ -92,6 +92,8 @@ pub fn register_browsers(bundle_ids: Vec<String>) {
 /// Registered apps that have actually shown a web page. Terminals and the like register for links and never do.
 static SHOWN_PAGES: std::sync::LazyLock<std::sync::RwLock<std::collections::HashSet<String>>> = std::sync::LazyLock::new(Default::default);
 
+static PAGELESS_LOOKS: std::sync::LazyLock<std::sync::RwLock<std::collections::HashMap<String, u8>>> = std::sync::LazyLock::new(Default::default);
+
 fn only_registered(bundle: &str) -> bool {
     family_of(bundle, false).is_none() && family_of(bundle, true).is_some()
 }
@@ -433,8 +435,13 @@ pub fn hide_browser(ex: &Exclusions, bundle_id: &str, windows: &[BrowserWindow],
             SHOWN_PAGES.write().unwrap_or_else(|e| e.into_inner()).insert(b.clone());
         }
         // Not a browser only on evidence: a full look at its windows that found no page in any of them.
-        let pageless = complete && !windows.is_empty() && windows.iter().all(|w| w.urls.is_empty());
-        if pageless && !SHOWN_PAGES.read().unwrap_or_else(|e| e.into_inner()).contains(&b) {
+        // And looked at properly: each window's own controls were read, three times running, with never a page.
+        let read = |w: &BrowserWindow| w.urls.is_empty() && w.control_labels.iter().chain(&w.field_descriptions).any(|l| !l.trim().is_empty());
+        let pageless = complete && !windows.is_empty() && windows.iter().all(read);
+        let mut looks = PAGELESS_LOOKS.write().unwrap_or_else(|e| e.into_inner());
+        let n = looks.entry(b.clone()).or_insert(0);
+        *n = if pageless { n.saturating_add(1) } else { 0 };
+        if *n >= 3 && !SHOWN_PAGES.read().unwrap_or_else(|e| e.into_inner()).contains(&b) {
             return None;
         }
     }
@@ -883,6 +890,15 @@ mod tests {
         let e = sites(&["chase.com"]);
         // A terminal also says it opens links. With no page in it, it's an ordinary app, readable or not.
         let plain = BrowserWindow { urls: vec![], ..win("x") };
+        // Not on the first look: its tree may not have filled in yet.
+        assert_eq!(hide_browser(&e, "com.example.terminal", &[plain.clone()], true), Some(HideReason::Unreadable));
+        assert_eq!(hide_browser(&e, "com.example.terminal", &[plain.clone()], true), Some(HideReason::Unreadable));
+        assert_eq!(hide_browser(&e, "com.example.terminal", &[plain.clone()], true), None);
+        let bare = BrowserWindow { urls: vec![], control_labels: vec![], ..win("x") };
+        assert_eq!(hide_browser(&e, "com.example.terminal", &[bare], true), Some(HideReason::Unreadable));
+        for _ in 0..3 {
+            hide_browser(&e, "com.example.terminal", &[plain.clone()], true);
+        }
         assert_eq!(hide_browser(&e, "com.example.terminal", &[plain.clone()], true), None);
         // Only a full look that finds no page says so; a failed look says nothing.
         assert_eq!(hide_browser(&e, "com.example.terminal", &[plain.clone()], false), Some(HideReason::Unreadable));
