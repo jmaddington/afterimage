@@ -118,6 +118,25 @@ import Testing
     }
 }
 
+@Suite struct FrontTrackerTests {
+    func w(_ id: CGWindowID, _ title: String) -> OnScreenWindow { OnScreenWindow(id: id, pid: 5, title: title, layer: 0, bounds: CGRect(x: 0, y: 0, width: 900, height: 700), alpha: 1) }
+    @Test func noticesWindowsAndTitles() {
+        var f = FrontTracker()
+        #expect(f.see(pid: 5, window: w(1, "a")) == nil)          // the app switch itself is announced elsewhere
+        #expect(f.see(pid: 5, window: w(1, "a")) == nil)
+        #expect(f.see(pid: 5, window: w(1, "b")) == .tab)
+        #expect(f.see(pid: 5, window: w(2, "b")) == .window)
+        #expect(f.see(pid: 6, window: w(3, "c")) == nil)
+    }
+    @Test func aSlowAppsFirstWindowIsNoticed() {
+        var f = FrontTracker()
+        _ = f.see(pid: 5, window: w(1, "a"))
+        #expect(f.see(pid: 6, window: nil) == nil)
+        #expect(f.see(pid: 6, window: w(2, "page")) == .window)
+        #expect(f.see(pid: 6, window: nil) == nil)                // closed its last window
+    }
+}
+
 @MainActor @Suite struct SettingsTests {
     @Test func startingTurnsRecordingOn() throws {
         let name = "afterimage.tests.\(UUID())"

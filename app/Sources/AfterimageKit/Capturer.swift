@@ -156,6 +156,7 @@ public actor Capturer {
                 h.pids.insert(pid)
                 h.reasons[pid] = r
             } else if isBrowser(bundleId: bundle), drawing.contains(pid) {
+                if needsWaking(bundleId: bundle) { Accessibility.wake(pid: pid) }
                 let reading = Accessibility.read(pid: pid, visible: visible)
                 if let r = hideBrowser(ex: ex, bundleId: bundle, windows: reading.windows, complete: reading.complete) {
                     h.pids.insert(pid)

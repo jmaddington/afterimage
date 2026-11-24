@@ -18,7 +18,7 @@ import Observation
     private var policy = TriggerPolicy()
     private var timer: Timer?
     private var observers: [(NotificationCenter, NSObjectProtocol)] = []
-    private var front: (pid: pid_t, window: CGWindowID, title: String)?
+    private var tracker = FrontTracker()
     private var pausedUntil: Date?
     private var asleep = false
     private var resumeAfter = Date.distantPast
@@ -165,16 +165,11 @@ import Observation
         }
     }
 
-    /// No public "tab changed" event exists; the front window's id and title are the tell.
     private func pollWindow() {
         guard Date().timeIntervalSince(lastWindowPoll) >= 1 else { return }
         lastWindowPoll = Date()
-        guard let app = NSWorkspace.shared.frontmostApplication,
-              let w = OnScreenWindow.front(of: app.processIdentifier, in: OnScreenWindow.all()) else { return }
-        let title = TriggerPolicy.stableTitle(w.title)
-        if let f = front, f.pid == app.processIdentifier {
-            if f.window != w.id { policy.event(.window, at: now) } else if f.title != title { policy.event(.tab, at: now) }
-        }
-        front = (app.processIdentifier, w.id, title)
+        guard let app = NSWorkspace.shared.frontmostApplication else { return }
+        let w = OnScreenWindow.front(of: app.processIdentifier, in: OnScreenWindow.all())
+        if let t = tracker.see(pid: app.processIdentifier, window: w) { policy.event(t, at: now) }
     }
 }

@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 
 /// Why a picture was taken, most telling first.
@@ -65,5 +66,18 @@ public struct TriggerPolicy: Sendable {
     public static func stableTitle(_ s: String) -> String {
         s.unicodeScalars.filter { CharacterSet.letters.contains($0) || $0 == " " }
             .map(String.init).joined().split(separator: " ").joined(separator: " ")
+    }
+}
+
+/// No public "tab changed" event exists; the front window's id and title are the tell.
+public struct FrontTracker: Sendable {
+    private var front: (pid: pid_t, window: CGWindowID?, title: String)?
+    public init() {}
+    public mutating func see(pid: pid_t, window: OnScreenWindow?) -> Trigger? {
+        let title = TriggerPolicy.stableTitle(window?.title ?? "")
+        defer { front = (pid, window?.id, title) }
+        // An app may come forward before it has anything to show; its first window counts.
+        guard let f = front, f.pid == pid, let window else { return nil }
+        return f.window != window.id ? .window : f.title != title ? .tab : nil
     }
 }

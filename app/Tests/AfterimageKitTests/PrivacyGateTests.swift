@@ -82,19 +82,6 @@ final class FakeElement: ScreenElement {
         let page = FakeElement("AXWebArea", ["AXURL": "https://a.com"], children: [inner])
         #expect(read(app([window([page])])).windows[0].controlLabels.isEmpty && inner.reads == 0)
     }
-    /// Firefox draws its own toolbar as a web page; the pages people see are nested inside it.
-    @Test func firefoxFurnitureIsEnteredButItsPagesAreNot() {
-        let inner = FakeElement("AXButton", ["AXTitle": "page text"])
-        let page = FakeElement("AXWebArea", ["AXURL": "https://a.com"], children: [inner])
-        let chrome = FakeElement("AXWebArea", ["AXURL": URL(string: "chrome://browser/content/browser.xhtml")!], children: [FakeElement("AXButton", ["AXTitle": "Private browsing"]), page])
-        let r = read(app([window([chrome])]))
-        #expect(r.complete && r.windows[0].urls == ["https://a.com"] && r.windows[0].controlLabels == ["Private browsing"] && inner.reads == 0)
-        let lookalike = FakeElement("AXWebArea", ["AXURL": "chrome://browser/content/other.xhtml"], children: [page])
-        #expect(read(app([window([lookalike])])).windows[0].urls == ["chrome://browser/content/other.xhtml"])
-        let broken = FakeElement("AXWebArea", ["AXURL": "chrome://browser/content/browser.xhtml"])
-        broken.broken = ["AXChildren"]
-        #expect(!read(app([window([broken])])).complete)
-    }
     @Test func tooManyElementsOrTooLongIsUnreadable() {
         let w = window((0..<1000).map { _ in FakeElement("AXGroup") })
         #expect(!read(app([w])).complete)

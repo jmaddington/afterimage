@@ -32,6 +32,15 @@ public enum Accessibility {
         return read(app: app, drawn: drawn, deadline: Date().addingTimeInterval(budget))
     }
 
+    /// Ask an app to describe its pages. It may take a moment, so the first reading still comes up short.
+    public static func wake(pid: pid_t) {
+        guard isTrusted else { return }
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.25)
+        // Firefox answers "not implemented" but obeys.
+        _ = AXUIElementSetAttributeValue(app, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+    }
+
     static func read<E: ScreenElement>(app: E, drawn: [CGRect], deadline: Date) -> Reading {
         var r = Reading()
         func attempt<T>(_ f: () throws -> T) -> T? {
@@ -87,8 +96,6 @@ public enum Accessibility {
         case "AXWebArea":
             let u = try e.read(kAXURLAttribute)
             let s = (u as? URL)?.absoluteString ?? (u as? String) ?? "unknown:"
-            // Firefox's own window, drawn as a page; no website can have this address. Real pages are nested inside.
-            if s == "chrome://browser/content/browser.xhtml" { break }
             if !b.urls.contains(s) { b.urls.append(s) }
             return []
         case "AXButton", "AXPopUpButton", "AXMenuButton", "AXStaticText", "AXImage":

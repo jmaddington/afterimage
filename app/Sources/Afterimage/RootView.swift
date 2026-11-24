@@ -199,6 +199,7 @@ struct Sidebar: View {
                 }
             }
         }
+        .onCommand(#selector(NSResponder.selectAll(_:))) { model.selection = Set(model.shots.map(\.id)) }
         .safeAreaInset(edge: .bottom) {
             HStack {
                 Text(Words.bytes(model.stats.bytes)).monospacedDigit()
