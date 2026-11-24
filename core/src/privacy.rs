@@ -8,6 +8,9 @@ pub struct Exclusions {
     pub private_windows: bool,
     /// Leave a browser out when its page address can't be read.
     pub unreadable_browsers: bool,
+    /// Leave Tor Browser out altogether; nothing in its windows says they're private.
+    #[uniffi(default = true)]
+    pub tor: bool,
 }
 
 /// What accessibility could read from one on-screen browser window.
@@ -102,7 +105,7 @@ pub fn is_browser(bundle_id: &str) -> bool {
 /// Firefox describes its pages to accessibility only once asked to.
 #[uniffi::export]
 pub fn needs_waking(bundle_id: &str) -> bool {
-    family(bundle_id) == Some(Family::Firefox) && !is_tor(bundle_id)
+    family(bundle_id) == Some(Family::Firefox)
 }
 
 fn is_tor(bundle_id: &str) -> bool {
@@ -390,9 +393,8 @@ fn is_private(f: Family, w: &BrowserWindow) -> bool {
 pub fn hide_browser(ex: &Exclusions, bundle_id: &str, windows: &[BrowserWindow], complete: bool) -> Option<HideReason> {
     let f = family(bundle_id)?;
     let rules: Vec<Rule> = ex.sites.iter().filter_map(|s| Rule::parse(s)).collect();
-    // Nothing in a Tor window says it is private; all of it is.
-    if ex.private_windows && is_tor(bundle_id) {
-        return Some(HideReason::PrivateWindow);
+    if ex.tor && is_tor(bundle_id) {
+        return Some(HideReason::App);
     }
     let mut unreadable = !complete;
     let mut evasive = false;
@@ -438,7 +440,7 @@ mod tests {
     use super::*;
 
     fn ex() -> Exclusions {
-        Exclusions { apps: vec!["com.acme.Ledger".into()], sites: vec![], password_managers: true, private_windows: true, unreadable_browsers: true }
+        Exclusions { apps: vec!["com.acme.Ledger".into()], sites: vec![], password_managers: true, private_windows: true, unreadable_browsers: true, tor: true }
     }
     fn sites(s: &[&str]) -> Exclusions {
         Exclusions { sites: s.iter().map(|x| x.to_string()).collect(), ..ex() }
@@ -783,7 +785,7 @@ mod tests {
 
     #[test]
     fn system_prompts_are_always_hidden() {
-        let off = Exclusions { password_managers: false, private_windows: false, unreadable_browsers: false, apps: vec![], sites: vec![] };
+        let off = Exclusions { password_managers: false, private_windows: false, unreadable_browsers: false, tor: false, apps: vec![], sites: vec![] };
         for b in ["com.apple.LocalAuthentication.UIAgent", "com.apple.SecurityAgent", "com.apple.UserNotificationCenter", "com.apple.LocalAuthenticationRemoteService"] {
             assert_eq!(hide_app(&off, b), Some(HideReason::SystemPrompt), "{b}");
         }
@@ -791,17 +793,23 @@ mod tests {
     }
 
     #[test]
-    fn tor_is_always_private() {
-        assert_eq!(hide_browser(&ex(), "org.torproject.torbrowser", &[win("https://a.com")], true), Some(HideReason::PrivateWindow));
-        let off = Exclusions { private_windows: false, ..ex() };
-        assert_eq!(hide_browser(&off, "org.torproject.torbrowser", &[win("https://a.com")], true), None);
+    fn tor_is_a_setting_of_its_own() {
+        let tor = |tor, private_windows| hide_browser(&Exclusions { tor, private_windows, ..ex() }, "org.torproject.torbrowser", &[win("https://a.com")], true);
+        assert_eq!(tor(true, true), Some(HideReason::App));
+        assert_eq!(tor(true, false), Some(HideReason::App));
+        assert_eq!(tor(false, true), None);
+        assert_eq!(tor(false, false), None);
+        // Allowed, but every other rule still applies.
+        let e = Exclusions { tor: false, ..sites(&["chase.com"]) };
+        assert_eq!(hide_browser(&e, "org.torproject.torbrowser", &[win("https://chase.com")], true), Some(HideReason::Site));
+        assert_eq!(hide_browser(&e, "org.torproject.torbrowser", &[], false), Some(HideReason::Unreadable));
         assert_eq!(hide_browser(&ex(), "org.mozilla.firefox", &[win("https://a.com")], true), None);
     }
 
     #[test]
     fn only_firefox_needs_waking() {
-        assert!(needs_waking("org.mozilla.Firefox") && needs_waking("app.zen-browser.zen"));
-        for b in [CHROME, SAFARI, "company.thebrowser.Browser", "org.torproject.torbrowser", "com.apple.finder"] {
+        assert!(needs_waking("org.mozilla.Firefox") && needs_waking("app.zen-browser.zen") && needs_waking("org.torproject.torbrowser"));
+        for b in [CHROME, SAFARI, "company.thebrowser.Browser", "com.apple.finder"] {
             assert!(!needs_waking(b), "{b}");
         }
     }

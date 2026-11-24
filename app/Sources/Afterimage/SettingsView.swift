@@ -68,6 +68,7 @@ private struct PrivacySettings: View {
             Section {
                 Toggle("Password managers", isOn: $settings.hidePasswordManagers)
                 Toggle("Private browsing", isOn: $settings.hidePrivateWindows)
+                Toggle("Tor Browser", isOn: $settings.hideTor)
                 Toggle("Anything while a password is being typed", isOn: $settings.skipSecureInput)
                 Toggle("Browsers whose address can’t be read", isOn: $settings.hideUnreadable)
             } header: { Text("Never capture") } footer: {

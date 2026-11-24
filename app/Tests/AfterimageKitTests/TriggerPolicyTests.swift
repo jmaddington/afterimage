@@ -138,6 +138,15 @@ import Testing
 }
 
 @MainActor @Suite struct SettingsTests {
+    @Test func torIsLeftOutUntilAllowed() throws {
+        let name = "afterimage.tests.\(UUID())"
+        let d = try #require(UserDefaults(suiteName: name))
+        defer { d.removePersistentDomain(forName: name) }
+        let s = AppSettings(d)
+        #expect(s.exclusions.tor)
+        s.hideTor = false
+        #expect(!s.exclusions.tor && !AppSettings(d).exclusions.tor && s.exclusions.privateWindows)
+    }
     @Test func startingTurnsRecordingOn() throws {
         let name = "afterimage.tests.\(UUID())"
         let d = try #require(UserDefaults(suiteName: name))

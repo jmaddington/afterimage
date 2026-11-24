@@ -16,6 +16,7 @@ import Observation
     public var skipSecureInput: Bool { didSet { save("skipSecureInput", skipSecureInput) } }
     public var hidePasswordManagers: Bool { didSet { save("hidePasswordManagers", hidePasswordManagers) } }
     public var hidePrivateWindows: Bool { didSet { save("hidePrivateWindows", hidePrivateWindows) } }
+    public var hideTor: Bool { didSet { save("hideTor", hideTor) } }
     public var hideUnreadable: Bool { didSet { save("hideUnreadable", hideUnreadable) } }
     public var excludedApps: [String] { didSet { save("excludedApps", excludedApps) } }
     public var excludedSites: [String] { didSet { save("excludedSites", excludedSites) } }
@@ -40,6 +41,7 @@ import Observation
         skipSecureInput = get("skipSecureInput", true)
         hidePasswordManagers = get("hidePasswordManagers", true)
         hidePrivateWindows = get("hidePrivateWindows", true)
+        hideTor = get("hideTor", true)
         hideUnreadable = get("hideUnreadable", true)
         excludedApps = get("excludedApps", [])
         excludedSites = get("excludedSites", [])
@@ -66,7 +68,7 @@ import Observation
     }
 
     public var exclusions: Exclusions {
-        Exclusions(apps: excludedApps, sites: excludedSites, passwordManagers: hidePasswordManagers, privateWindows: hidePrivateWindows, unreadableBrowsers: hideUnreadable)
+        Exclusions(apps: excludedApps, sites: excludedSites, passwordManagers: hidePasswordManagers, privateWindows: hidePrivateWindows, unreadableBrowsers: hideUnreadable, tor: hideTor)
     }
     public var triggers: Set<Trigger> {
         var t: Set<Trigger> = [.manual]
