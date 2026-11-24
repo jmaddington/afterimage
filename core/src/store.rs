@@ -104,6 +104,9 @@ pub struct Stats {
     pub kept: u64,
     pub hidden: u64,
     pub pending: u64,
+    /// Pictures whose search-by-meaning data was made by a different model and is being remade.
+    #[uniffi(default = 0)]
+    pub reindexing: u64,
     pub oldest: Option<i64>,
 }
 
@@ -117,6 +120,14 @@ pub struct NewShot {
     pub regions: Vec<Region>,
     pub lines: Vec<IndexedLine>,
     pub ai_checked: bool,
+}
+
+/// A question as a vector, with the model that made it and how to read its scores.
+pub struct Near<'a> {
+    pub vector: &'a [f32],
+    pub model: &'a str,
+    pub floor: f32,
+    pub band: f32,
 }
 
 pub struct Store {
@@ -207,6 +218,11 @@ impl Store {
              INSERT INTO fts(fts, rank) VALUES('secure-delete', 1);
              PRAGMA user_version=1;",
         )?;
+        // Added after the first release: which model made each picture's vector.
+        let has: bool = db.query_row("SELECT COUNT(*) FROM pragma_table_info('shots') WHERE name='embed_model'", [], |r| r.get::<_, i64>(0))? > 0;
+        if !has {
+            db.execute_batch("ALTER TABLE shots ADD COLUMN embed_model TEXT;")?;
+        }
         let _ = std::fs::set_permissions(root.join("index.sqlite"), std::fs::Permissions::from_mode(0o600));
         Ok(Self { db, root: root.to_owned() })
     }
@@ -241,16 +257,39 @@ impl Store {
         self.db.execute("UPDATE shots SET attempts=attempts+1 WHERE id=?", [id]).map(|_| ())
     }
 
-    pub fn finish_index(&mut self, id: i64, description: &str, tags: &[String], emb: Option<&[f32]>) -> Res<bool> {
-        let blob = emb.map(|e| e.iter().map(|x| (x * 127.0).round().clamp(-127.0, 127.0) as i8 as u8).collect::<Vec<u8>>());
+    fn blob(emb: Option<&[f32]>) -> Option<Vec<u8>> {
+        emb.map(|e| e.iter().map(|x| (x * 127.0).round().clamp(-127.0, 127.0) as i8 as u8).collect())
+    }
+
+    /// `model`: the embedding model that made `emb`, or that was tried.
+    pub fn finish_index(&mut self, id: i64, description: &str, tags: &[String], emb: Option<&[f32]>, model: &str) -> Res<bool> {
         let tx = self.db.transaction()?;
-        let n = tx.execute("UPDATE shots SET description=?,tags=?,embedding=?,indexed=1 WHERE id=?",
-            params![description, serde_json::to_string(tags).unwrap_or_default(), blob, id])?;
+        let n = tx.execute("UPDATE shots SET description=?,tags=?,embedding=?,embed_model=?,indexed=1 WHERE id=?",
+            params![description, serde_json::to_string(tags).unwrap_or_default(), Self::blob(emb), model, id])?;
         if n == 1 {
             tx.execute("UPDATE fts SET description=? WHERE rowid=?", params![format!("{description} {}", tags.join(" ")), id])?;
         }
         tx.commit()?;
         Ok(n == 1)
+    }
+
+    const STALE: &'static str = "indexed=1 AND COALESCE(embed_model, ?1) != ?2";
+
+    /// A described picture whose vector another model made: (shot, text body).
+    pub fn next_stale(&self, model: &str) -> Res<Option<(Shot, String)>> {
+        self.db
+            .query_row(&format!("SELECT {COLS}, s.lines FROM shots s WHERE {} ORDER BY id DESC LIMIT 1", Self::STALE), [crate::lm::FIRST_EMBED_MODEL, model], |r| {
+                let lines: Vec<IndexedLine> = serde_json::from_str(&r.get::<_, String>(13)?).unwrap_or_default();
+                Ok((row_to_shot(&self.root, r)?, lines.into_iter().map(|l| l.text).collect::<Vec<_>>().join("\n")))
+            })
+            .optional()
+    }
+    pub fn stale_count(&self, model: &str) -> Res<u64> {
+        self.db.query_row(&format!("SELECT COUNT(*) FROM shots WHERE {}", Self::STALE), [crate::lm::FIRST_EMBED_MODEL, model], |r| r.get::<_, i64>(0)).map(|n| n as u64)
+    }
+    /// None records that this model was tried and had nothing to give, so the picture isn't tried forever.
+    pub fn set_embedding(&self, id: i64, emb: Option<&[f32]>, model: &str) -> Res<()> {
+        self.db.execute("UPDATE shots SET embedding=?,embed_model=? WHERE id=?", params![Self::blob(emb), model, id]).map(|_| ())
     }
 
     fn clauses(f: &Filter) -> (String, Vec<Value>) {
@@ -286,7 +325,7 @@ impl Store {
     }
 
     /// Keyword hits, best first, optionally fused with nearest neighbours of `emb` (reciprocal rank fusion).
-    pub fn search(&self, f: &Filter, emb: Option<&[f32]>, limit: u32) -> Res<Vec<Shot>> {
+    pub fn search(&self, f: &Filter, near: Option<&Near>, limit: u32) -> Res<Vec<Shot>> {
         let (w, a) = Self::clauses(f);
         let mut score: std::collections::HashMap<i64, f64> = Default::default();
         if let Some(q) = fts_query(&f.text) {
@@ -299,20 +338,25 @@ impl Store {
                 *score.entry(*id).or_default() += 1.4 / (30.0 + i as f64);
             }
         }
-        if let Some(e) = emb {
-            let mut st = self.db.prepare(&format!("SELECT s.id, s.embedding FROM shots s WHERE s.embedding IS NOT NULL AND {w}"))?;
-            let mut near: Vec<(f32, i64)> = st
-                .query_map(params_from_iter(a.iter().cloned()), |r| {
+        if let Some(n) = near {
+            let e = n.vector;
+            // Only vectors the same model made can be compared with the question.
+            let mut args = a.clone();
+            args.push(Value::Text(crate::lm::FIRST_EMBED_MODEL.into()));
+            args.push(Value::Text(n.model.into()));
+            let mut st = self.db.prepare(&format!("SELECT s.id, s.embedding FROM shots s WHERE s.embedding IS NOT NULL AND {w} AND COALESCE(s.embed_model, ?) = ?"))?;
+            let mut found: Vec<(f32, i64)> = st
+                .query_map(params_from_iter(args), |r| {
                     let b = r.get_ref(1)?.as_blob().unwrap_or(&[]);
                     let d: f32 = if b.len() == e.len() { b.iter().zip(e).map(|(x, y)| *x as i8 as f32 * y).sum::<f32>() / 127.0 } else { -1.0 };
                     Ok((d, r.get::<_, i64>(0)?))
                 })?
                 .collect::<Res<_>>()?;
-            near.sort_by(|x, y| y.0.total_cmp(&x.0));
-            let best = near.first().map_or(0.0, |n| n.0);
-            // Cosine floor: nomic scores unrelated text near 0.5, so only a tight band under the best is meaningful.
-            for (i, (d, id)) in near.iter().take(40).enumerate() {
-                if *d >= 0.58 && *d >= best - 0.09 {
+            found.sort_by(|x, y| y.0.total_cmp(&x.0));
+            let best = found.first().map_or(0.0, |n| n.0);
+            // Unrelated text still scores something; only a tight band under the best, above the model's floor, means anything.
+            for (i, (d, id)) in found.iter().take(40).enumerate() {
+                if *d >= n.floor && *d >= best - n.band && *d > 0.0 {
                     *score.entry(*id).or_default() += 1.0 / (30.0 + i as f64);
                 }
             }
@@ -340,7 +384,7 @@ impl Store {
             [],
             |r| {
                 let g = |i: usize| -> Res<u64> { Ok(r.get::<_, i64>(i)? as u64) };
-                Ok(Stats { count: g(0)?, bytes: g(1)?, kept: g(2)?, hidden: g(3)?, pending: g(4)?, oldest: r.get(5)? })
+                Ok(Stats { count: g(0)?, bytes: g(1)?, kept: g(2)?, hidden: g(3)?, pending: g(4)?, reindexing: 0, oldest: r.get(5)? })
             },
         )
     }
@@ -517,11 +561,11 @@ mod tests {
         s.insert(&shot(d.path(), 2, "other words", 5)).unwrap();
         let q = |s: &Store, t: &str| s.search(&Filter { text: t.into(), ..Default::default() }, None, 10).unwrap().len();
         assert_eq!((q(&s, "zebraq"), q(&s, "\"invoice zebraquartz\""), q(&s, "plan -zebraquartz")), (1, 0, 1));
-        assert!(s.finish_index(id, "A purplewalrus bill", &["bills".into()], Some(&[1.0, 0.0])).unwrap());
+        assert!(s.finish_index(id, "A purplewalrus bill", &["bills".into()], Some(&[1.0, 0.0]), "m").unwrap());
         assert_eq!((q(&s, "purplewalrus"), q(&s, "zebraquartz"), q(&s, "safari")), (1, 1, 2));
         assert_eq!(s.delete(&[id]).unwrap(), (1, 0));
         assert_eq!(q(&s, "zebraquartz"), 0);
-        assert!(!s.finish_index(id, "ghostcaption", &[], None).unwrap());
+        assert!(!s.finish_index(id, "ghostcaption", &[], None, "m").unwrap());
         assert!(!d.path().join("Shots/1.heic").exists());
         drop(s);
         for f in ["index.sqlite", "index.sqlite-wal"] {
@@ -562,9 +606,19 @@ mod tests {
         let mut s = Store::open(d.path()).unwrap();
         let a = s.insert(&shot(d.path(), 1, "x", 1)).unwrap();
         let b = s.insert(&shot(d.path(), 2, "y", 1)).unwrap();
-        s.finish_index(a, "", &[], Some(&[1.0, 0.0])).unwrap();
-        s.finish_index(b, "", &[], Some(&[0.0, 1.0])).unwrap();
-        let r = s.search(&Filter { text: "nomatch".into(), ..Default::default() }, Some(&[1.0, 0.0]), 10).unwrap();
+        s.finish_index(a, "", &[], Some(&[1.0, 0.0]), "m").unwrap();
+        s.finish_index(b, "", &[], Some(&[0.0, 1.0]), "m").unwrap();
+        let near = |model: &'static str| Near { vector: &[1.0, 0.0], model, floor: 0.58, band: 0.09 };
+        let r = s.search(&Filter { text: "nomatch".into(), ..Default::default() }, Some(&near("m")), 10).unwrap();
+        // A question put by another model finds nothing: its numbers mean something else.
+        assert!(s.search(&Filter { text: "nomatch".into(), ..Default::default() }, Some(&near("other")), 10).unwrap().is_empty());
+        // Until the pictures are remade for it, one at a time.
+        assert_eq!(s.stale_count("other").unwrap(), 2);
+        let (stale, _) = s.next_stale("other").unwrap().unwrap();
+        s.set_embedding(stale.id, Some(&[1.0, 0.0]), "other").unwrap();
+        s.set_embedding(s.next_stale("other").unwrap().unwrap().0.id, None, "other").unwrap();
+        assert_eq!((s.stale_count("other").unwrap(), s.stale_count("m").unwrap()), (0, 2));
+        assert_eq!(s.search(&Filter { text: "nomatch".into(), ..Default::default() }, Some(&near("other")), 10).unwrap().len(), 1);
         assert_eq!(r.iter().map(|x| x.id).collect::<Vec<_>>(), [a]);
         std::fs::write(d.path().join("Shots/stray.heic"), "x").unwrap();
         assert_eq!(s.sweep_orphans().unwrap(), 1);

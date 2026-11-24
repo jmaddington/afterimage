@@ -19,6 +19,9 @@ struct MenuBarContent: View {
         Button("Open Library") { show() }
         SettingsLink { Text("Settings…") }
         Divider()
+        Text(Words.version)
+        Button("See Releases…") { NSWorkspace.shared.open(Words.releases) }
+        Divider()
         Button("Quit Afterimage") { NSApp.terminate(nil) }
             .onChange(of: model.confirmForget?.id) { if model.confirmForget != nil { show() } }
     }

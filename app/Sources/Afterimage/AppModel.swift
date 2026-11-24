@@ -54,7 +54,7 @@ extension Shot {
     var shots: [Shot] = []
     var groups: [DayGroup] = []
     var apps: [AppCount] = []
-    var stats = Stats(count: 0, bytes: 0, kept: 0, hidden: 0, pending: 0, oldest: nil)
+    var stats = Stats(count: 0, bytes: 0, kept: 0, hidden: 0, pending: 0, reindexing: 0, oldest: nil)
     var status: Status?
     var loaded = false
 

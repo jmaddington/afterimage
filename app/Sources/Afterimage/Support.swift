@@ -90,6 +90,13 @@ enum Words {
         let parts = w.split(separator: ",").map { names[String($0)] ?? String($0) }
         return parts.isEmpty ? "" : "Found by " + parts.formatted(.list(type: .and))
     }
+    /// "Afterimage 0.1.2 (41)": the version and the build that made it.
+    static var version: String {
+        let i = Bundle.main.infoDictionary
+        return "Afterimage \(i?["CFBundleShortVersionString"] as? String ?? "?") (\(i?["CFBundleVersion"] as? String ?? "?"))"
+    }
+    /// Opened in the browser. The app itself never goes looking for updates.
+    static let releases = URL(string: "https://github.com/jmaddington/afterimage/releases")!
     static func bytes(_ n: UInt64) -> String { Int64(n).formatted(.byteCount(style: .file)) }
     static func count(_ n: Int, _ one: String, _ many: String) -> String { n == 1 ? "1 \(one)" : "\(n.formatted()) \(many)" }
 }

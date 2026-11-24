@@ -221,6 +221,32 @@ pub fn number(lines: &[(usize, &str)]) -> String {
     lines.iter().map(|(i, t)| format!("{i}: {}", flat(t))).collect::<Vec<_>>().join("\n")
 }
 
+/// How a given embedding model wants to be spoken to, and how its scores read.
+pub struct EmbedStyle {
+    pub document: &'static str,
+    pub query: &'static str,
+    /// Below this a match means nothing. Zero when we don't know the model: then only closeness to the best counts.
+    pub floor: f32,
+    /// How far below the best match still counts as a match.
+    pub band: f32,
+}
+
+/// The model whose vectors older libraries hold, from before each vector recorded its maker.
+pub const FIRST_EMBED_MODEL: &str = "text-embedding-nomic-embed-text-v1.5";
+
+pub fn embed_style(model: &str) -> EmbedStyle {
+    let m = model.to_lowercase();
+    if m.contains("nomic") {
+        // Scores unrelated text near 0.5.
+        EmbedStyle { document: "search_document: ", query: "search_query: ", floor: 0.58, band: 0.09 }
+    } else if m.contains("qwen") {
+        // Measured on Qwen3 Embedding: right answers near 0.56, unrelated near 0.33. Queries carry the task; documents don't.
+        EmbedStyle { document: "", query: "Instruct: Given what a person remembers seeing on their screen, retrieve the matching screenshot\nQuery: ", floor: 0.42, band: 0.12 }
+    } else {
+        EmbedStyle { document: "", query: "", floor: 0.0, band: 0.08 }
+    }
+}
+
 /// Map a model finding onto the OCR lines. Anything that can't be located exactly hides the whole line.
 pub fn locate(lines: &[TextLine], line: usize, value: &str, kind: SecretKind) -> Vec<Hit> {
     let value = value.trim();
@@ -301,6 +327,15 @@ pub fn start_server() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_embedding_model_is_spoken_to_in_its_own_way() {
+        assert_eq!(embed_style(FIRST_EMBED_MODEL).query, "search_query: ");
+        let q = embed_style("text-embedding-qwen3-embedding-4b");
+        assert!(q.query.starts_with("Instruct: ") && q.query.ends_with("Query: ") && q.document.is_empty() && q.floor < 0.5);
+        let other = embed_style("some-new-model");
+        assert!(other.query.is_empty() && other.floor == 0.0);
+    }
 
     #[test]
     fn a_value_that_is_not_word_for_word_is_still_found_or_its_neighbourhood_hidden() {
