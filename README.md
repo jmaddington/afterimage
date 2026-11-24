@@ -26,7 +26,8 @@ The frost is random noise tinted with averaged colours, not a blur, so it cannot
 - [LM Studio](https://lmstudio.ai) with its local server on (port 1234 by default) and two models downloaded:
   - a model that can see pictures, used to find secrets and describe pictures. The default is
     `gemma-4-26b-a4b-it-qat-mlx`.
-  - an embedding model, used for search by meaning. The default is `text-embedding-nomic-embed-text-v1.5`.
+  - an embedding model, used for search by meaning. The default is `text-embedding-nomic-embed-text-v1.5`; Qwen3
+    Embedding models do better and can be chosen instead. After a change, search data is rebuilt in the background.
 
 Both can be changed in Settings > Intelligence, as can the port. Search by words works without the embedding model.
 
@@ -102,12 +103,11 @@ Developer mode (Settings > Intelligence) keeps a log of every request to LM Stud
 decision to take a picture or not. Secrets are removed before anything is written, entries are kept for a week,
 and turning the mode off deletes the log.
 
-An MCP server for AI agents is in development and has not been released
-([#3](https://github.com/jmaddington/afterimage/pull/3)). As proposed, it is off unless developer mode and its own
-switch are both on, and it:
+With developer mode on, a second switch, "Let an AI agent read the library", starts an MCP server on this Mac.
+Copy Command gives a line to paste into a terminal to connect Claude Code. The server:
 
-- is read-only: an agent can list a timeline, search, and read a saved picture and its text, and cannot change or
-  delete anything;
+- is read-only: an agent can list a timeline of a day, search by words or meaning, and read a saved picture and its
+  text, and cannot change or delete anything;
 - is local: it listens on a loopback address and refuses requests that come from a web page;
 - requires a token on every request, which you can replace to cut off an agent.
 

@@ -375,7 +375,13 @@ impl Engine {
         Ok(lock(&self.s.store).apps()?)
     }
     pub fn stats(&self) -> Result<Stats, EngineError> {
-        Ok(lock(&self.s.store).stats()?)
+        let model = lock(&self.s.config).embed_model.clone();
+        let store = lock(&self.s.store);
+        let mut s = store.stats()?;
+        if !model.is_empty() {
+            s.reindexing = store.stale_count(&model)?;
+        }
+        Ok(s)
     }
     pub fn set_kept(&self, ids: Vec<i64>, kept: bool) -> Result<(), EngineError> {
         lock(&self.s.store).set_kept(&ids, kept)?;
@@ -499,18 +505,20 @@ impl Shared {
     /// Keyword search, plus meaning when `semantic` and the embedding model answers in time.
     fn search(&self, filter: Filter, semantic: bool, limit: u32) -> Result<Vec<Shot>, EngineError> {
         let c = lock(&self.config).clone();
+        let style = lm::embed_style(&c.embed_model);
         let emb = if semantic && !c.embed_model.is_empty() && filter.text.trim().chars().count() >= 3 {
             let (l, tape) = self.taped(&c);
             let e = l.and_then(|l| {
                 self.ensure(&l, &c.embed_model, 2048)?;
-                l.embed(&c.embed_model, &format!("search_query: {}", filter.text), 10)
+                l.embed(&c.embed_model, &format!("{}{}", style.query, filter.text), 10)
             }).ok();
             self.note(devlog::search(take(&tape)));
             e
         } else {
             None
         };
-        Ok(lock(&self.store).search(&filter, emb.as_deref(), limit)?)
+        let near = emb.as_deref().map(|vector| Near { vector, model: &c.embed_model, floor: style.floor, band: style.band });
+        Ok(lock(&self.store).search(&filter, near.as_ref(), limit)?)
     }
 
     /// A client that records its calls when developer mode is on.
@@ -917,7 +925,8 @@ fn index_loop(s: Arc<Shared>) {
                 log::error!("retention failed: {e} [AIMG-RETAIN]");
             }
         }
-        let did = describe_one(&s);
+        // New pictures first; then any whose search data an earlier model made.
+        let did = describe_one(&s).and_then(|did| if did { Ok(true) } else { reembed_one(&s) });
         s.describing.store(false, SeqCst);
         let nap = match did {
             Ok(true) => {
@@ -973,13 +982,42 @@ fn describe_one(s: &Shared) -> Result<bool, String> {
     let d = detect::mask_text(&d);
     // The model's tags are its words about the screen too.
     let tags: Vec<String> = tags.iter().map(|t| detect::mask_text(t)).collect();
-    let emb = if c.embed_model.is_empty() {
-        None
-    } else {
-        let head: String = format!("search_document: {} {} {}\n{}", shot.moment.app_name, shot.moment.window_title, d, body).chars().take(3500).collect();
-        s.ensure(&l, &c.embed_model, 2048).and_then(|_| l.embed(&c.embed_model, &head, 30)).ok()
+    let emb = if c.embed_model.is_empty() { None } else { embed_shot(s, &l, &c, &shot, &d, &body).ok() };
+    lock(&s.store).finish_index(shot.id, &d, &tags, emb.as_deref(), &c.embed_model).map_err(|e| e.to_string())
+}
+
+/// What a picture is, as one piece of text for the embedding model.
+fn embed_shot(s: &Shared, l: &lm::Lm, c: &Config, shot: &Shot, description: &str, body: &str) -> Result<Vec<f32>, lm::LmError> {
+    let style = lm::embed_style(&c.embed_model);
+    let head: String = format!("{}{} {} {}\n{}", style.document, shot.moment.app_name, shot.moment.window_title, description, body).chars().take(3500).collect();
+    s.ensure(l, &c.embed_model, 2048)?;
+    l.embed(&c.embed_model, &head, 30)
+}
+
+/// After a change of embedding model, remake one picture's vector from what is already saved about it.
+fn reembed_one(s: &Shared) -> Result<bool, String> {
+    let c = lock(&s.config).clone();
+    let allowed = match c.describe {
+        DescribeWhen::Never => false,
+        DescribeWhen::PluggedIn => s.on_power.load(SeqCst) && s.calm.load(SeqCst),
+        DescribeWhen::Always => s.calm.load(SeqCst),
     };
-    lock(&s.store).finish_index(shot.id, &d, &tags, emb.as_deref()).map_err(|e| e.to_string())
+    if !allowed || c.embed_model.is_empty() || s.busy.load(SeqCst) || !lock(&s.queue).frames.is_empty() {
+        return Ok(false);
+    }
+    let Some((shot, body)) = lock(&s.store).next_stale(&c.embed_model).map_err(|e| e.to_string())? else { return Ok(false) };
+    let (l, tape) = s.taped(&c);
+    let l = l.map_err(|e| e.to_string())?;
+    let r = embed_shot(s, &l, &c, &shot, &shot.description, &body);
+    s.note(devlog::about(take(&tape), shot.id));
+    *lock(&s.last_lm_use) = Instant::now();
+    match r {
+        Ok(e) => lock(&s.store).set_embedding(shot.id, Some(&e), &c.embed_model).map(|_| true).map_err(|e| e.to_string()),
+        // Not there to ask: try again later, and don't mark anything.
+        Err(e @ (lm::LmError::Offline | lm::LmError::Model(_))) => Err(e.to_string()),
+        // It answered and had nothing usable for this one: move on.
+        Err(e) => lock(&s.store).set_embedding(shot.id, None, &c.embed_model).map(|_| true).map_err(|x| format!("{e}; {x}")),
+    }
 }
 
 #[cfg(test)]
@@ -1214,7 +1252,13 @@ mod tests {
                         buf.extend_from_slice(&chunk[..n]);
                     }
                     let (code, body) = if h.starts_with("get /api/v1/models") {
-                        (200, r#"{"models":[{"key":"m","loaded_instances":[{}],"type":"llm"}]}"#.to_owned())
+                        (200, r#"{"models":[{"key":"m","loaded_instances":[{}],"type":"llm"},{"key":"model-a","loaded_instances":[{}],"type":"embedding"},{"key":"model-b","loaded_instances":[{}],"type":"embedding"}]}"#.to_owned())
+                    } else if h.starts_with("post /v1/embeddings") {
+                        // A different direction for each model, so their vectors can be told apart.
+                        let body = String::from_utf8_lossy(&buf[head..]).into_owned();
+                        (200, if body.contains("model-b") { r#"{"data":[{"embedding":[0.0,1.0]}]}"# } else { r#"{"data":[{"embedding":[1.0,0.0]}]}"# }.to_owned())
+                    } else if h.starts_with("post /api/") {
+                        (200, "{}".to_owned())
                     } else if asked.fetch_add(1, SeqCst) >= good {
                         (if status == 200 { 400 } else { status }, r#"{"error":{"message":"bad prompt: quartz-otter-9 was in it"}}"#.to_owned())
                     } else {
@@ -1590,6 +1634,30 @@ mod tests {
         assert!(a.call("tools/call", serde_json::json!({"name": "delete_everything", "arguments": {}}))["error"]["message"].is_string());
         assert_eq!(a.call("nonsense", serde_json::json!({}))["error"]["code"], -32601);
         assert_eq!(e.stats().unwrap().count, 5);
+        e.shutdown();
+    }
+
+    #[test]
+    fn changing_the_embedding_model_remakes_search_data_in_the_background() {
+        let d = tempfile::tempdir().unwrap();
+        let both = r#"{"findings":[],"description":"a page about otters","tags":["otters"]}"#;
+        let c = Config { lm_url: fake_lm(both, 200), embed_model: "model-a".into(), describe: DescribeWhen::Always, ..config(true) };
+        let e = Engine::new(d.path().to_string_lossy().into(), c.clone(), Arc::new(FakeHost(Default::default()))).unwrap();
+        let mut f = frame(1000);
+        f.lines.truncate(1);
+        f.moment.window_title = "t".into();
+        f.moment.url.clear();
+        e.ingest(f);
+        wait(|| e.stats().unwrap().count == 1 && e.stats().unwrap().pending == 0);
+        let by_meaning = || e.search(Filter { text: "zzz nothing in words".into(), ..Default::default() }, true, 5).unwrap().len();
+        assert_eq!((by_meaning(), e.stats().unwrap().reindexing), (1, 0));
+        e.set_config(Config { embed_model: "model-b".into(), ..c.clone() });
+        // At once the old vectors stop answering (they'd answer wrongly); then they're remade.
+        wait(|| e.stats().unwrap().reindexing == 0);
+        assert_eq!(by_meaning(), 1);
+        // No model chosen: nothing to remake, and nothing is counted as waiting.
+        e.set_config(Config { embed_model: String::new(), ..c });
+        assert_eq!(e.stats().unwrap().reindexing, 0);
         e.shutdown();
     }
 }

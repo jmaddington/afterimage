@@ -204,7 +204,11 @@ struct Sidebar: View {
             HStack {
                 Text(Words.bytes(model.stats.bytes)).monospacedDigit()
                 Spacer()
-                if model.stats.pending > 0 { Text("\(model.stats.pending.formatted()) to describe") }
+                if model.stats.pending > 0 {
+                    Text("\(model.stats.pending.formatted()) to describe")
+                } else if model.stats.reindexing > 0 {
+                    Text("\(model.stats.reindexing.formatted()) to re-index").help("Search by meaning is being rebuilt for the search model you chose")
+                }
             }
             .font(.footnote).foregroundStyle(.secondary).padding(.horizontal, 16).padding(.vertical, 10)
         }
