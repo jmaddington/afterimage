@@ -29,13 +29,4 @@ if [[ ! -f build/AppIcon.icns || scripts/make-icon.swift -nt build/AppIcon.icns 
 fi
 cp build/AppIcon.icns "$APP/Contents/Resources/"
 
-ID=${AFTERIMAGE_SIGN_IDENTITY:-$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' '/Developer ID Application/ {print $2; exit}')}
-if [[ -n "$ID" ]]; then
-  step "Signing bridge" codesign --force --options runtime --timestamp --sign "$ID" "$APP/Contents/MacOS/afterimage-bridge"
-  step "Signing" codesign --force --options runtime --timestamp --sign "$ID" "$APP"
-else
-  codesign --force --options runtime --sign - "$APP/Contents/MacOS/afterimage-bridge"
-  step "Signing (ad-hoc)" codesign --force --options runtime --sign - "$APP"
-fi
-step "Verifying signature" codesign --verify --strict --verbose=2 "$APP"
-echo "✓ $APP (v$VERSION, signed: ${ID:-ad-hoc})"
+./scripts/sign.sh "$APP"
