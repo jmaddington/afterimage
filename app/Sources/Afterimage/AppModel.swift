@@ -36,7 +36,7 @@ struct DayGroup: Identifiable {
     let shots: [Shot]
 }
 
-extension Shot: @retroactive Identifiable {}
+extension Shot: Identifiable {}
 extension Shot {
     var date: Date { Date(timeIntervalSince1970: Double(moment.takenAt) / 1000) }
 }

@@ -45,14 +45,14 @@ public enum Session {
 
 /// What the window server says is on screen. Needs no permission for owners and bounds.
 public struct OnScreenWindow: Sendable {
-    public let id: CGWindowID, pid: pid_t, title: String, layer: Int, bounds: CGRect
+    public let id: CGWindowID, pid: pid_t, title: String, layer: Int, bounds: CGRect, alpha: Double
     public static func all() -> [OnScreenWindow] {
         let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
         return list.compactMap { d in
             guard let id = d[kCGWindowNumber as String] as? CGWindowID, let pid = d[kCGWindowOwnerPID as String] as? pid_t else { return nil }
             var r = CGRect.zero
             if let b = d[kCGWindowBounds as String] as? NSDictionary { CGRectMakeWithDictionaryRepresentation(b, &r) }
-            return OnScreenWindow(id: id, pid: pid, title: d[kCGWindowName as String] as? String ?? "", layer: d[kCGWindowLayer as String] as? Int ?? 0, bounds: r)
+            return OnScreenWindow(id: id, pid: pid, title: d[kCGWindowName as String] as? String ?? "", layer: d[kCGWindowLayer as String] as? Int ?? 0, bounds: r, alpha: d[kCGWindowAlpha as String] as? Double ?? 1)
         }
     }
 }

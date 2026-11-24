@@ -16,10 +16,39 @@ public actor Capturer {
     private var busy = false
     public init(engine: Engine) { self.engine = engine }
 
+    /// Asked of the recorder each time: why not to look right now (nil to go ahead), and what is off-limits.
+    public typealias Gate = @MainActor @Sendable () -> (blocked: String?, exclusions: Exclusions)
+
     private struct Hidden {
         var pids: Set<pid_t> = []
         var reasons: [pid_t: HideReason] = [:]
         var focusedURL: [pid_t: String] = [:]
+    }
+
+    /// Everything that bears on whether a picture may be kept, at one instant.
+    struct Look: Sendable {
+        var blocked: String?
+        var exclusions: Exclusions
+        var front: pid_t?
+        var hidden: Set<pid_t>
+        var drawn: Set<pid_t>
+    }
+
+    /// Why a picture taken between these two looks can't be kept, or nil.
+    static func spoiled(_ before: Look, _ after: Look, omitted: Set<pid_t>) -> String? {
+        if let b = before.blocked ?? after.blocked { return b }
+        if before.exclusions != after.exclusions { return "Your settings changed mid-capture" }
+        if before.front != after.front { return "The app changed mid-capture" }
+        let exposed = before.hidden.union(after.hidden).intersection(before.drawn.union(after.drawn)).subtracting(omitted)
+        return exposed.isEmpty ? nil : "Something private appeared"
+    }
+
+    private func look(_ ex: Exclusions, _ hidden: Hidden, _ gate: Gate) async -> Look {
+        let g = await gate()
+        let front = await MainActor.run { NSWorkspace.shared.frontmostApplication?.processIdentifier }
+        // Status items and slivers can't show anything worth hiding.
+        let drawn = OnScreenWindow.all().filter { $0.bounds.width > 48 && $0.bounds.height > 48 }.map(\.pid)
+        return Look(blocked: Session.isLocked ? "The screen is locked" : g.blocked, exclusions: g.exclusions, front: front, hidden: hidden.pids, drawn: Set(drawn))
     }
 
     /// Vision's first request loads a model and can take a while; get it over with before it matters.
@@ -29,31 +58,36 @@ public actor Capturer {
         _ = try? Recognizer.lines(in: i)
     }
 
-    public func capture(_ trigger: Trigger, exclusions: Exclusions, allDisplays: Bool) async -> CaptureOutcome {
+    public func capture(_ trigger: Trigger, allDisplays: Bool, gate: @escaping Gate) async -> CaptureOutcome {
         // Actors are re-entrant across awaits; without this two cycles could mix one's pixels with the other's facts.
         guard !busy else { return .skipped("Busy") }
         busy = true
         defer { busy = false }
-        guard !Session.isLocked else { return .skipped("The screen is locked") }
 
         let front = await MainActor.run { NSWorkspace.shared.frontmostApplication.map { ($0.processIdentifier, $0.localizedName ?? "", $0.bundleIdentifier ?? "") } }
         guard let front else { return .skipped("No app is in front") }
         if front.0 == getpid() { return .skipped("Afterimage is in front") }
 
-        let before = await hidden(exclusions)
-        if before.pids.contains(front.0) { return .skipped(Self.phrase(before.reasons[front.0], front.1)) }
-        let windowsBefore = OnScreenWindow.all()
-        let title = windowsBefore.first { $0.pid == front.0 && $0.layer == 0 }?.title ?? ""
+        let exclusions = await gate().exclusions
+        let hiddenBefore = await hidden(exclusions)
+        if hiddenBefore.pids.contains(front.0) { return .skipped(Self.phrase(hiddenBefore.reasons[front.0], front.1)) }
+        let frontWindow = OnScreenWindow.all().first { $0.pid == front.0 && $0.layer == 0 }
 
         let content: SCShareableContent
         do {
             content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
         } catch { return .failed(error.localizedDescription) }
-        let omit = content.applications.filter { before.pids.contains($0.processID) }
-        let displays = pick(content.displays, front: windowsBefore.first { $0.pid == front.0 && $0.layer == 0 }?.bounds, all: allDisplays)
+        let omit = content.applications.filter { hiddenBefore.pids.contains($0.processID) }
+        let omitted = Set(omit.map(\.processID))
+        let displays = pick(content.displays, front: frontWindow?.bounds, all: allDisplays)
         guard !displays.isEmpty else { return .failed("No display is available") }
 
-        var shots: [(SCDisplay, CGImage)] = []
+        // The last thing before looking: listing windows above can take long enough for a password prompt to open.
+        let before = await look(exclusions, hiddenBefore, gate)
+        if let why = Self.spoiled(before, before, omitted: omitted) { return .skipped(why) }
+        guard before.front == front.0, before.exclusions == exclusions else { return .skipped("The app changed mid-capture") }
+
+        var shots: [(display: SCDisplay, image: CGImage, at: Date)] = []
         for d in displays {
             let filter = SCContentFilter(display: d, excludingApplications: omit, exceptingWindows: [])
             let cfg = SCStreamConfiguration()
@@ -62,34 +96,39 @@ public actor Capturer {
             cfg.height = Int(Double(d.height) * scale)
             cfg.showsCursor = false
             cfg.captureResolution = .best
-            do { shots.append((d, try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg))) }
+            // AIDEV-NOTE: stamped before the pixels exist, so "forget the last minutes" can never miss them.
+            let at = Date()
+            do { shots.append((d, try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg), at)) }
             catch { return .failed(error.localizedDescription) }
         }
 
         // Anything that became off-limits while we were looking spoils the whole frame.
-        let after = await hidden(exclusions)
-        let frontAfter = await MainActor.run { NSWorkspace.shared.frontmostApplication?.processIdentifier }
-        let omitted = Set(omit.map(\.processID))
-        // Status items and slivers can't show anything worth hiding.
-        let drawn = Set((OnScreenWindow.all() + windowsBefore).filter { $0.bounds.width > 48 && $0.bounds.height > 48 }.map(\.pid))
-        if !after.pids.union(before.pids).intersection(drawn).subtracting(omitted).isEmpty { return .skipped("Something private appeared") }
-        guard frontAfter == front.0 else { return .skipped("The app changed mid-capture") }
-        guard !Session.isLocked else { return .skipped("The screen is locked") }
+        let quick = await look(exclusions, hiddenBefore, gate)
+        if let why = Self.spoiled(before, quick, omitted: omitted) { return .skipped(why) }
+        let hiddenAfter = await hidden(exclusions)
+        let after = await look(exclusions, hiddenAfter, gate)
+        if let why = Self.spoiled(before, after, omitted: omitted) { return .skipped(why) }
 
         let apps = await MainActor.run {
             NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular }
                 .map { AppRef(name: $0.localizedName ?? "", bundleId: $0.bundleIdentifier ?? "") }
         }.filter { hideApp(ex: exclusions, bundleId: $0.bundleId) == nil }
         var queued = 0
-        for (d, image) in shots {
+        for (d, image, at) in shots {
             let key = String(d.displayID)
             guard engine.isNew(displayKey: key, luma: Pixels.thumbprint(image)) || trigger == .manual else { continue }
             let lines: [TextLine]
-            do { lines = try Recognizer.lines(in: image) } catch { return .failed("The screen couldn't be read, so it wasn't saved") }
-            guard let b = Pixels.bitmap(image) else { return .failed("Out of memory") }
+            do { lines = try Recognizer.lines(in: image) } catch {
+                engine.lost(displayKey: key)
+                return .failed("The screen couldn't be read, so it wasn't saved")
+            }
+            guard let b = Pixels.bitmap(image) else {
+                engine.lost(displayKey: key)
+                return .failed("Out of memory")
+            }
             let m = Moment(
-                takenAt: Int64(Date().timeIntervalSince1970 * 1000), trigger: trigger.rawValue, display: await Self.name(d.displayID),
-                appName: front.1, bundleId: front.2, windowTitle: title, url: after.focusedURL[front.0] ?? "",
+                takenAt: Int64(at.timeIntervalSince1970 * 1000), trigger: trigger.rawValue, display: await Self.name(d.displayID),
+                appName: front.1, bundleId: front.2, windowTitle: frontWindow?.title ?? "", url: hiddenAfter.focusedURL[front.0] ?? "",
                 userName: Session.consoleUser, fullName: NSFullUserName(), host: Session.computerName, sessions: Session.loggedIn, runningApps: apps)
             engine.ingest(frame: Frame(rgba: b.data, width: UInt32(b.width), height: UInt32(b.height), stride: UInt32(b.stride), lines: lines, moment: m, displayKey: key))
             queued += 1

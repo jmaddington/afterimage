@@ -109,6 +109,18 @@ import Observation
         return .watching
     }
 
+    /// Asked again right around each capture: pausing, a password field or a new exclusion counts immediately.
+    private func gate() -> (blocked: String?, exclusions: Exclusions) {
+        let why: String? = switch current() {
+        case .watching: nil
+        case .off: "Recording is off"
+        case .needsPermission: "Screen Recording isn’t allowed"
+        case .paused: "Paused"
+        case .waiting(let w): w
+        }
+        return (why, settings.exclusions)
+    }
+
     private func tick() {
         let s = current()
         if s != state { state = s }
@@ -121,10 +133,10 @@ import Observation
         if t == .interval && Session.idleSeconds > max(60, Double(settings.interval)) { return }
         policy.captured(at: now)
         capturing = true
-        let ex = settings.exclusions, all = settings.allDisplays
+        let all = settings.allDisplays
         engine.setConditions(onPower: Session.onPower, calm: Session.calm)
         Task {
-            let r = await capturer.capture(t, exclusions: ex, allDisplays: all)
+            let r = await capturer.capture(t, allDisplays: all) { self.gate() }
             capturing = false
             switch r {
             case .queued:

@@ -223,6 +223,11 @@ impl Engine {
         fresh
     }
 
+    /// A frame that passed `is_new` never arrived; the next look at that display counts as new.
+    pub fn lost(&self, display_key: String) {
+        lock(&self.s.prints).remove(&display_key);
+    }
+
     /// Queue a frame. The newest wins: when the queue is full the oldest unsaved frame is let go.
     pub fn ingest(&self, frame: Frame) {
         let need = frame.stride as usize * frame.height as usize;
@@ -776,6 +781,8 @@ mod tests {
         assert!(!e.is_new("a".into(), vec![10; 64]));
         assert!(e.is_new("b".into(), vec![10; 64]));
         e.s.discard("x");
+        assert!(e.is_new("a".into(), vec![10; 64]));
+        e.lost("a".into());
         assert!(e.is_new("a".into(), vec![10; 64]));
         e.shutdown();
     }
