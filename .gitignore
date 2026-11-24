@@ -1,0 +1,6 @@
+target/
+.build/
+build/
+app/Generated/
+.DS_Store
+*.xcodeproj
