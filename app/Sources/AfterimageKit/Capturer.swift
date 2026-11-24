@@ -178,7 +178,7 @@ public actor Capturer {
                     let answered = engine.refreshPages(pid: pid)
                     let areas = reading.pages.map { PageArea(url: $0.url, rect: Rect(x: $0.frame.minX, y: $0.frame.minY, w: $0.frame.width, h: $0.frame.height), scale: scale(at: $0.frame)) }
                     let plan = planPage(ex: ex, hint: engine.pageHint(pid: pid), areas: areas, complete: reading.complete)
-                    if let r = plan.hide ?? (answered ? nil : .secretField) {
+                    if let r = plan.hide ?? (answered ? nil : .noAnswer) {
                         h.pids.insert(pid)
                         h.reasons[pid] = r
                     } else {
@@ -217,7 +217,7 @@ public actor Capturer {
         NSScreen.screens.first { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID) == id }?.localizedName ?? "Display"
     }
     static func refused(_ r: HideReason?, _ app: String) -> CaptureOutcome {
-        r == .unreadable ? .skipped(phrase(r, app)) : .blocked(phrase(r, app))
+        r == .unreadable || r == .noAnswer ? .skipped(phrase(r, app)) : .blocked(phrase(r, app))
     }
     static func phrase(_ r: HideReason?, _ app: String) -> String {
         switch r {
@@ -226,6 +226,7 @@ public actor Capturer {
         case .privateWindow: "\(app) has a private window open"
         case .unreadable: "\(app)’s address couldn’t be read"
         case .secretField: "\(app) is showing a secret Afterimage can’t place"
+        case .noAnswer: "\(app)’s Afterimage extension didn’t answer"
         case .systemPrompt: "macOS is asking for something"
         case .app, nil: "\(app) is excluded"
         }

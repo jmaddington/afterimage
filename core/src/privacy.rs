@@ -32,6 +32,8 @@ pub enum HideReason {
     Unreadable,
     SystemPrompt,
     SecretField,
+    /// The browser's extension was asked and didn't answer in time.
+    NoAnswer,
 }
 
 /// Desktop password managers. Matched whole, or as a dotted prefix ("com.1password" covers "com.1password.safari").

@@ -1,5 +1,8 @@
 // Runs in every frame. Built together with detect.js by scripts/extension.sh (content scripts can't import).
 (() => {
+  // Injected again into a page that already has it: the first copy carries on.
+  if (globalThis.__afterimage) return;
+  globalThis.__afterimage = true;
   const api = globalThis.browser ?? globalThis.chrome;
   const watcher = new Watcher();
   const SOON = 200, REPEAT = 4000, MOST = 20000;

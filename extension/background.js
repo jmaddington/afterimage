@@ -36,20 +36,41 @@ function send(m) {
     port = null;
   }
 }
-/** Every frame of every tab reports afresh; then the app hears that they have, and which frames still exist. */
+const RUNS_IN = /^(https?:|about:blank|about:srcdoc)/;
+
+/**
+ * Every frame of every tab reports afresh; then the app hears that they have, and which frames still exist.
+ * Anything short of that and the app hears nothing, which it takes as "leave this browser out".
+ */
 async function measure(n) {
   await tabs();
   const list = (await api.tabs.query({})).filter((t) => t.id != null && !t.discarded);
-  const frames = (await Promise.all(list.map((t) =>
-    api.webNavigation.getAllFrames({ tabId: t.id }).then((f) => (f ?? []).map((x) => [t.id, x.frameId]), () => [])))).flat();
-  // A frame the script can't run in (settings, stores) rejects at once and has never said anything to go stale.
-  const all = Promise.all(frames.map(([tab, frame]) =>
-    api.tabs.sendMessage(tab, { type: 'measure', n }, { frameId: frame }).then((sent) => sent === true, () => false)));
+  let frames;
+  try {
+    frames = (await Promise.all(list.map((t) =>
+      api.webNavigation.getAllFrames({ tabId: t.id }).then((f) => {
+        if (!f) throw new Error('no frames');
+        return f.map((x) => ({ tab: t.id, frame: x.frameId, showing: t.active, must: RUNS_IN.test(x.url ?? '') }));
+      })))).flat();
+  } catch {
+    return;
+  }
+  const all = Promise.all(frames.map((f) =>
+    api.tabs.sendMessage(f.tab, { type: 'measure', n }, { frameId: f.frame }).then((sent) => sent === true, () => false)
+      // A frame in a showing tab where the script should be running has to have answered.
+      .then((ok) => ok || !(f.showing && f.must))));
   const slow = new Promise((r) => setTimeout(r, 600, 'slow'));
-  // No answer is an answer: the app leaves this browser out of the picture.
-  if ((await Promise.race([all, slow])) === 'slow') return;
-  // The app holds any frame that reported before and stayed silent now against the whole browser.
-  send({ type: 'asked', n, live: frames.slice(0, 2000) });
+  const done = await Promise.race([all, slow]);
+  if (done === 'slow' || done.includes(false)) return;
+  // Too many to list: say nothing about which exist, so nothing is forgotten on our word.
+  send({ type: 'asked', n, ...(frames.length <= 2000 ? { live: frames.map((f) => [f.tab, f.frame]) } : {}) });
+}
+/** Pages that were open before the extension arrived have no script yet. */
+async function inject() {
+  for (const t of await api.tabs.query({})) {
+    if (t.id == null || t.discarded) continue;
+    api.scripting.executeScript({ target: { tabId: t.id, allFrames: true }, files: ['content.js'] }).catch(() => {});
+  }
 }
 async function tabs() {
   const list = await api.tabs.query({});
@@ -66,6 +87,9 @@ api.tabs.onUpdated.addListener((_, change) => {
 });
 for (const e of ['onActivated', 'onRemoved', 'onCreated', 'onAttached', 'onReplaced']) api.tabs[e]?.addListener(() => void tabs());
 api.runtime.onStartup?.addListener(connect);
-api.runtime.onInstalled?.addListener(connect);
+api.runtime.onInstalled?.addListener(() => {
+  connect();
+  void inject();
+});
 setInterval(() => void tabs(), 4000);
 connect();

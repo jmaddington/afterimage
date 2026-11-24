@@ -249,6 +249,7 @@ impl Pages {
             return;
         }
         let total: usize = self.len();
+        let issued = self.issued.get(&pid).copied().unwrap_or(0);
         let b = self.browsers.entry(browser).or_default();
         b.frames.retain(|_, f| fresh(f.at, now));
         match parse(json, now) {
@@ -269,8 +270,9 @@ impl Pages {
             Some(Message::Asked(n, live)) => {
                 b.asked = b.asked.max(n);
                 // Frames that no longer exist can't answer, and have nothing left to show.
-                if let Some(live) = live {
-                    b.frames.retain(|k, _| live.contains(k));
+                // Only what was clean and has been silent since; and only a list as new as the latest question.
+                if let Some(live) = live.filter(|_| n >= b.asked && n >= issued) {
+                    b.frames.retain(|k, f| live.contains(k) || f.n >= n || f.sensitive || !f.fields.is_empty());
                 }
                 // Keeps a connection with nothing else to say from being forgotten.
                 b.tabs_at = b.tabs_at.or(Some(now));
@@ -622,6 +624,25 @@ mod tests {
         assert_eq!(plan_page(&ex(), &p.hint(7, t), &[area(URL)], true), PagePlan::default());
         p.receive(7, 1, r#"{"v":1,"type":"asked","n":5,"live":[[3,"x"]]}"#, t);
         assert!(p.hint(7, t).sensitive);
+    }
+
+    /// The list of living frames clears out the dead, never the evidence.
+    #[test]
+    fn a_list_of_frames_never_removes_a_secret_or_a_newer_report() {
+        let (mut p, t) = (Pages::default(), Instant::now());
+        p.issue(7, 5);
+        p.receive(7, 1, &page(3, FIELD).replace("\"n\":1,", "\"n\":5,"), t);
+        p.receive(7, 1, &page(4, CLEAN).replace("\"n\":1,", "\"n\":6,"), t);
+        p.receive(7, 1, &page(8, CLEAN), t);
+        p.receive(7, 1, r#"{"v":1,"type":"asked","n":5,"live":[]}"#, t);
+        let h = p.hint(7, t);
+        assert_eq!(h.tabs.iter().map(|x| x.fields.len()).sum::<usize>(), 1, "the field stays until it lapses");
+        assert_eq!(p.len(), 2, "the newer clean report stays; the old clean one of a dead frame goes");
+        // An old list says nothing about now.
+        p.issue(7, 9);
+        p.receive(7, 1, &page(8, CLEAN), t);
+        p.receive(7, 1, r#"{"v":1,"type":"asked","n":5,"live":[]}"#, t);
+        assert_eq!(p.len(), 3);
     }
 
     #[test]

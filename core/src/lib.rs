@@ -579,7 +579,7 @@ impl Shared {
         match l.find_secrets(&c.model, &view) {
             Ok(f) => Ok(f
                 .into_iter()
-                .filter(|(_, v, _)| !v.contains("[hidden]"))
+                .filter(|(_, v, k)| !v.contains("[hidden]") && !detect::keep_despite_model(v, *k))
                 .flat_map(|(i, v, k)| lm::locate(lines, i, &v, k))
                 .collect()),
             Err(lm::LmError::BadAnswer(_)) if chunk.len() >= 8 => {
@@ -1117,7 +1117,7 @@ mod tests {
         let check = log.iter().find(|x| x.kind == "check").expect("the check is logged");
         assert!(check.ok && check.shot_id.is_some() && check.model == "m");
         assert!(check.request.contains("the door says [hidden] today") && check.request.contains("password: [hidden]") && check.request.contains("plain words"), "{}", check.request);
-        assert!(check.request.contains("You find secrets") && check.request.contains("json_schema"), "the whole call: {}", check.request);
+        assert!(check.request.contains("You find credentials") && check.request.contains("json_schema"), "the whole call: {}", check.request);
         assert!(check.response.contains("password") && check.response.contains("\"line\""), "{}", check.response);
         let everything = format!("{log:?}");
         for x in ["quartz", "otter", "hunter22"] {
