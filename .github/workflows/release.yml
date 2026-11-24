@@ -74,13 +74,21 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: unsigned
-          path: build
+          path: ${{ runner.temp }}/unsigned
 
+      # AIDEV-NOTE: the archive comes from code that ran network dependencies. It may contain the app and nothing else.
       - name: Unpack
         run: |
           sudo xcode-select -s "$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)"
-          brew install create-dmg
-          ditto -x -k build/Afterimage.zip build && rm build/Afterimage.zip
+          scripts/ci/get-create-dmg.sh
+          U="$RUNNER_TEMP/unsigned"
+          if zipinfo -1 "$U/Afterimage.zip" | grep -vE '^Afterimage\.app(/|$)' | grep -q . || zipinfo -1 "$U/Afterimage.zip" | grep -qE '(^|/)\.\.(/|$)'; then
+            echo "::error title=Unexpected file::The build archive holds more than Afterimage.app"; exit 1
+          fi
+          mkdir "$U/x" && ditto -x -k "$U/Afterimage.zip" "$U/x"
+          [[ -z "$(find "$U/x" -type l)" ]] || { echo "::error title=Unexpected link::The app holds a symbolic link"; exit 1; }
+          mkdir -p build && mv "$U/x/Afterimage.app" build/ && mv "$U/AppIcon.icns" build/
+          [[ -z "$(git status --porcelain)" ]] || { echo "::error title=Checkout changed::"; git status --porcelain; exit 1; }
 
       - name: Import signing certificate
         env:

@@ -27,7 +27,7 @@ jobs:
           sudo xcode-select -s "$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)"
           echo "DEVELOPER_DIR=$(xcode-select -p)" >> "$GITHUB_ENV"
           rustup default stable
-          brew install create-dmg
+          scripts/ci/get-create-dmg.sh
           swift --version; cargo --version
 
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4

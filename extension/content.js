@@ -30,9 +30,9 @@
 
   function look() {
     timer = 0;
-    if (dead) return;
-    // Out of sight: say so once, so nothing stale is held against whatever shows next.
-    const r = document.visibilityState === 'hidden' ? { v: 1, url: '', top: window === window.top, fields: [], typing: false, unplaced: false } : report({
+    // Out of sight: say nothing and let the last report lapse. "Hidden" can be wrong for a moment, so it never clears one.
+    if (dead || document.visibilityState === 'hidden') return;
+    const r = report({
       elements: () => all(document), styleOf: (el) => getComputedStyle(el), width: innerWidth, height: innerHeight,
       url: location.href, top: window === window.top, focused: focused(),
     }, watcher);
@@ -56,6 +56,10 @@
 
   new MutationObserver(soon).observe(document, { subtree: true, childList: true, attributes: true, attributeFilter: ['type', 'style', 'class', 'hidden', 'name', 'id', 'autocomplete', 'src'] });
   for (const e of ['scroll', 'resize', 'focusin', 'focusout', 'input', 'load', 'transitionend']) addEventListener(e, soon, { capture: true, passive: true });
-  document.addEventListener('visibilitychange', soon);
+  document.addEventListener('visibilitychange', () => {
+    last = ''; // Back in sight: report at once, even if nothing changed.
+    clearTimeout(timer);
+    look();
+  });
   soon();
 })();
