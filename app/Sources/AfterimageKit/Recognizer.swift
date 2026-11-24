@@ -15,8 +15,13 @@ public enum Recognizer {
         let codes = VNDetectBarcodesRequest()
         try autoreleasepool { try VNImageRequestHandler(cgImage: image, options: [:]).perform([req, codes]) }
         guard let found = req.results, let boxes = codes.results else { throw CocoaError(.featureUnsupported) }
-        let payloads = boxes.compactMap { b in b.payloadStringValue.map { TextLine(text: $0, rect: rect(b.boundingBox), tokens: []) } }
+        let payloads = boxes.map { code($0.payloadStringValue, $0.boundingBox) }
         return readingOrder(found.compactMap(line)) + payloads
+    }
+
+    /// The engine hides every code it can't prove harmless; one that can't be decoded has no text at all.
+    static func code(_ payload: String?, _ box: CGRect) -> TextLine {
+        TextLine(text: payload ?? "", rect: rect(box), tokens: [], code: true)
     }
 
     private static func line(_ o: VNRecognizedTextObservation) -> TextLine? {

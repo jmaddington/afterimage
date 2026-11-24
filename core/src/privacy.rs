@@ -207,13 +207,19 @@ const WRAPPERS: &[&str] = &["view-source", "blob", "feed", "chrome-distiller", "
 /// More addresses, or deeper encoding, than any honest page needs.
 const MAX_LAYERS: usize = 32;
 const MAX_DECODES: usize = 6;
+const MAX_ADDRESS: usize = 16_384;
 
 /// This address and every address it carries inside, plain or percent-encoded. A wrapper can add suspicion, never
-/// remove it. False when there was too much to look through, so nothing can be vouched for.
+/// remove it. False when there was too much to look through; what was found is still returned and must be checked.
 fn layers(u: &url::Url) -> (Vec<url::Url>, bool) {
     let mut out = vec![u.clone()];
+    let mut complete = true;
     let mut i = 0;
     while i < out.len() {
+        if i == MAX_LAYERS {
+            complete = false;
+            break;
+        }
         let u = out[i].clone();
         i += 1;
         // Ordinary pages may mention any address; only browser-made schemes display one.
@@ -221,6 +227,10 @@ fn layers(u: &url::Url) -> (Vec<url::Url>, bool) {
             continue;
         }
         let mut rest = u.as_str().split_once(':').map_or("", |x| x.1).to_lowercase();
+        if rest.len() > MAX_ADDRESS {
+            complete = false;
+            continue;
+        }
         let mut found: Vec<url::Url> = u.query_pairs().filter_map(|(_, v)| url::Url::parse(&v).ok()).collect();
         for n in 0.. {
             found.extend(url::Url::parse(&rest));
@@ -232,20 +242,18 @@ fn layers(u: &url::Url) -> (Vec<url::Url>, bool) {
                 break;
             }
             if n == MAX_DECODES {
-                return (out, false);
+                complete = false;
+                break;
             }
             rest = next;
         }
         for f in found {
             if f.has_host() && !out.contains(&f) {
-                if out.len() == MAX_LAYERS {
-                    return (out, false);
-                }
                 out.push(f);
             }
         }
     }
-    (out, true)
+    (out, complete)
 }
 
 /// Could this address be showing a site we can't identify? Anything unfamiliar counts.
@@ -338,6 +346,7 @@ pub fn hide_browser(ex: &Exclusions, bundle_id: &str, windows: Option<Vec<Browse
     let Some(windows) = windows else { return ex.unreadable_browsers.then_some(HideReason::Unreadable) };
     let rules: Vec<Rule> = ex.sites.iter().filter_map(|s| Rule::parse(s)).collect();
     let mut unreadable = false;
+    let mut evasive = false;
     let mut found = None;
     for w in &windows {
         if ex.private_windows {
@@ -354,7 +363,8 @@ pub fn hide_browser(ex: &Exclusions, bundle_id: &str, windows: Option<Vec<Browse
                 continue;
             };
             let (all, complete) = layers(&u);
-            unreadable |= !complete;
+            // Built to evade: hidden whenever any rule might have applied, whatever the unreadable setting says.
+            evasive |= !complete && (ex.password_managers || !rules.is_empty());
             if ex.password_managers && all.iter().any(|u| manager_url(u, w.title.as_deref().unwrap_or(""))) {
                 return Some(HideReason::PasswordManager);
             }
@@ -364,7 +374,7 @@ pub fn hide_browser(ex: &Exclusions, bundle_id: &str, windows: Option<Vec<Browse
             unreadable |= opaque(&u, all.len() > 1);
         }
     }
-    found.or((unreadable && ex.unreadable_browsers).then_some(HideReason::Unreadable))
+    found.or((evasive || unreadable && ex.unreadable_browsers).then_some(HideReason::Unreadable))
 }
 
 /// Tidy what a person typed into a site rule; None if it could never match anything.
@@ -665,5 +675,29 @@ mod tests {
             deep = deep.replace('%', "%25").replace(':', "%3A").replace('/', "%2F");
         }
         assert!(hid(&sites(&["chase.com"]), &format!("{base}{deep}")).is_some());
+    }
+
+    #[test]
+    fn too_much_to_check_still_hides_what_was_found() {
+        // Even with "leave out unreadable browsers" off.
+        let lax = |s: &[&str]| Exclusions { unreadable_browsers: false, ..sites(s) };
+        let base = "chrome-extension://cjpalhdlnbpafiamejdnhcphjbkeiagm/v#";
+        let many: String = (0..200).map(|i| format!("https://a{i}.com,")).collect();
+        let mut deep = "%41".to_owned();
+        for _ in 0..12 {
+            deep = deep.replace('%', "%25");
+        }
+        for u in [format!("{base}https://chase.com/,{deep}"), format!("{base}{many}https://chase.com/"), format!("{base}https://chase.com/,{many}")] {
+            assert_eq!(hid(&lax(&["chase.com"]), &u), Some(HideReason::Site), "{u}");
+        }
+        // Megabytes of address must not take the Mac with them.
+        let t = std::time::Instant::now();
+        assert!(hid(&lax(&["chase.com"]), &format!("{base}{}", "https://a.com,".repeat(200_000))).is_some());
+        assert!(t.elapsed().as_secs() < 2);
+        // Nothing found, but not everything was seen: hidden while any rule could apply.
+        let u = format!("{base}{deep}");
+        assert_eq!(hid(&lax(&["chase.com"]), &u), Some(HideReason::Unreadable));
+        assert_eq!(hid(&Exclusions { password_managers: true, ..lax(&[]) }, &u), Some(HideReason::Unreadable));
+        assert_eq!(hid(&Exclusions { password_managers: false, ..lax(&[]) }, &u), None);
     }
 }

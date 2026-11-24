@@ -67,8 +67,19 @@ func saveAndReread(_ name: String, config: Config = rulesOnly()) async throws ->
     @Test func twoFactorAndWifiCodesAreHidden() async throws {
         let r = try await saveAndReread("qr")
         #expect(r.shot.regions.count >= 2)
-        for s in ["JBSWY3DPEHPK3PXP", "otpauth", "marmalade"] { #expect(!r.seen.contains(s)); #expect(!r.indexed.contains(s)) }
+        for s in ["JBSWY3DPEHPK3PXP", "otpauth", "marmalade", "JBSW", "3PXP"] { #expect(!r.seen.contains(s)); #expect(!r.indexed.contains(s)) }
         #expect(r.seen.contains("Scan to set up")); #expect(r.indexed.contains("example.com/menu"))   // a harmless code stays
+    }
+    @Test func codesAreMarkedAndUndecodableOnesKeepTheirBox() throws {
+        let image = try #require(Pixels.load(fixtures.appending(path: "qr.png").path))
+        #expect(try Recognizer.lines(in: image).filter(\.code).count == 3)
+        let blank = Recognizer.code(nil, CGRect(x: 0.1, y: 0.2, width: 0.3, height: 0.4))
+        #expect(blank.code && blank.text.isEmpty && blank.rect.w == 0.3 && abs(blank.rect.y - 0.4) < 1e-9)
+    }
+    /// Bytes that aren't text: Vision finds the square but has no string for it.
+    @Test func aBinaryCodeIsHidden() async throws {
+        let r = try await saveAndReread("qr-binary")
+        #expect(r.shot.regions.count == 1)
     }
     @Test func savedFilesArePrivate() async throws {
         let dir = FileManager.default.temporaryDirectory.appending(path: "afterimage-\(UUID())")

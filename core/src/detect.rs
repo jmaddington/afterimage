@@ -225,6 +225,16 @@ fn push(hits: &mut Vec<Hit>, line: usize, range: Range<usize>, kind: SecretKind)
 
 /// Detect within a single line, no layout context. Also used for window titles and URLs.
 pub fn scan_text(text: &str, line: usize, hits: &mut Vec<Hit>) {
+    if text.is_ascii() {
+        return scan_latin(text, line, hits);
+    }
+    let (t, at) = latinised(text);
+    let mut found = Vec::new();
+    scan_latin(&t, line, &mut found);
+    hits.extend(found.into_iter().map(|h| Hit { range: at[h.range.start]..at[h.range.end], ..h }));
+}
+
+fn scan_latin(text: &str, line: usize, hits: &mut Vec<Hit>) {
     use SecretKind::*;
     for m in SSN.find_iter(text) {
         push(hits, line, m.range(), Ssn);
@@ -301,11 +311,12 @@ pub fn scan_text(text: &str, line: usize, hits: &mut Vec<Hit>) {
 pub fn scan(lines: &[TextLine]) -> Vec<Hit> {
     let mut hits = Vec::new();
     let mut in_pem = false;
+    let latin: Vec<String> = lines.iter().map(|l| latinised(&l.text).0).collect();
     for (i, l) in lines.iter().enumerate() {
-        let t = &l.text;
+        let t = &latin[i];
         if l.code {
-            if !code_is_harmless(t) {
-                hits.push(Hit { line: i, range: 0..t.len(), kind: SecretKind::Key });
+            if !code_is_harmless(&l.text) {
+                hits.push(Hit { line: i, range: 0..l.text.len(), kind: SecretKind::Key });
             }
             continue;
         }
@@ -313,24 +324,24 @@ pub fn scan(lines: &[TextLine]) -> Vec<Hit> {
             in_pem = true;
         }
         if in_pem {
-            push(&mut hits, i, 0..t.len(), SecretKind::Key);
+            push(&mut hits, i, 0..l.text.len(), SecretKind::Key);
         }
         if PEM_END.is_match(t) {
             in_pem = false;
         }
-        scan_text(t, i, &mut hits);
+        scan_text(&l.text, i, &mut hits);
 
         if PASS_LABEL.is_match(t) {
             for j in neighbours(lines, i) {
-                let v = &lines[j].text;
+                let v = &latin[j];
                 if plausible_value(v) && !PASS_LABEL.is_match(v) {
-                    push(&mut hits, j, 0..v.len(), SecretKind::Password);
+                    push(&mut hits, j, 0..lines[j].text.len(), SecretKind::Password);
                 }
             }
         }
         if CVV_LABEL.is_match(t) {
             for j in neighbours(lines, i) {
-                let v = lines[j].text.trim();
+                let v = latin[j].trim();
                 if v.len() <= 4 && v.chars().all(|c| c.is_ascii_digit()) {
                     push(&mut hits, j, 0..lines[j].text.len(), SecretKind::Financial);
                 }
@@ -340,14 +351,14 @@ pub fn scan(lines: &[TextLine]) -> Vec<Hit> {
         let fin_label = FIN_LABEL.is_match(t) && t.split_whitespace().count() <= 5;
         if ssn_label || fin_label {
             for j in neighbours(lines, i) {
-                let v = &lines[j].text;
+                let v = &latin[j];
                 let digits = v.chars().filter(char::is_ascii_digit).count();
                 let compact = v.chars().filter(|c| !c.is_whitespace()).count().max(1);
                 let mostly = digits * 10 >= compact * 6;
                 if ssn_label && digits >= 4 && digits <= 9 && mostly {
-                    push(&mut hits, j, 0..v.len(), SecretKind::Ssn);
+                    push(&mut hits, j, 0..lines[j].text.len(), SecretKind::Ssn);
                 } else if fin_label && (6..=24).contains(&digits) && mostly && !v.contains(['$', '€', '£', '/']) {
-                    push(&mut hits, j, 0..v.len(), SecretKind::Financial);
+                    push(&mut hits, j, 0..lines[j].text.len(), SecretKind::Financial);
                 }
             }
         }
@@ -371,9 +382,9 @@ pub fn extend_wrapped(lines: &[TextLine], hits: &mut Vec<Hit>) {
                 let dy = o.rect.y - (cur.y + cur.h);
                 *j != at && dy > -0.3 * cur.h && dy < 1.2 * cur.h && o.rect.x < cur.x + cur.w && o.rect.x + o.rect.w > cur.x
                     && o.text.split_whitespace().count() == 1
-                    && o.text.trim().len() >= 6
-                    && o.text.trim().chars().all(|c| c.is_ascii_alphanumeric() || "+/=_-.".contains(c))
-                    && o.text.chars().any(|c| c.is_ascii_digit() || c.is_ascii_uppercase())
+                    && o.text.trim().chars().count() >= 6
+                    && o.text.trim().chars().map(latin).all(|c| c.is_ascii_alphanumeric() || "+/=_-.".contains(c))
+                    && o.text.chars().map(latin).any(|c| c.is_ascii_digit() || c.is_ascii_uppercase())
             });
             let Some((j, o)) = next else { break };
             let h = Hit { line: j, range: 0..o.text.len(), kind: SecretKind::Key };
@@ -427,6 +438,9 @@ pub fn scrub_url(raw: &str) -> String {
     mask_text(u.as_str())
 }
 
+// A path made of words ("/our-story/menu.html"): no digits, no mixed case, nothing long enough to be a token.
+re!(WORDY_PATH, r"^(?:/|(?:/(?:[a-z]{1,14}|[A-Z][a-z]{0,13})(?:[-_.](?:[a-z]{1,14}|[A-Z][a-z]{0,13}))*)+/?)$");
+re!(WORDY_PATH_CAPS, r"^(?:/[A-Z]{1,11}(?:[-_.][A-Z]{1,11})*)+/?$");
 /// Longest code payload that can still be an ordinary web address.
 const CODE_MAX: usize = 300;
 
@@ -444,6 +458,9 @@ fn code_is_harmless(payload: &str) -> bool {
         && u.password().is_none()
         && u.query().is_none()
         && u.fragment().is_none()
+        && u.port().is_none()
+        && (WORDY_PATH.is_match(u.path()) || WORDY_PATH_CAPS.is_match(u.path()))
+        && u.host_str().is_some_and(|h| h.split('.').all(|l| l.len() <= 18))
         && found.is_empty()
 }
 
@@ -475,6 +492,29 @@ pub fn code_secrets(payload: &str) -> Vec<String> {
     out
 }
 
+/// The Latin letter a character is drawn like. Vision returns Cyrillic or Greek twins for isolated capitals.
+fn latin(c: char) -> char {
+    if matches!(c, '\u{ff01}'..='\u{ff5e}') {
+        return char::from_u32(c as u32 - 0xfee0).unwrap_or(c);
+    }
+    const FROM: &str = "АВЕЅІЈКМНОРСТХУЗЬаеѕіјкморсхуһԁΑΒΕΖΗΙΚΜΝΟΡΤΥΧοκν";
+    const TO: &str = "ABESIJKMHOPCTXY3baesijkmopcxyhdABEZHIKMNOPTYXokv";
+    if c.is_ascii() { c } else { FROM.chars().position(|f| f == c).map_or(c, |i| TO.as_bytes()[i] as char) }
+}
+
+/// Text with lookalikes made Latin, and the original byte offset of every byte boundary in it.
+fn latinised(text: &str) -> (String, Vec<usize>) {
+    let mut out = String::with_capacity(text.len());
+    let mut at = Vec::with_capacity(text.len() + 1);
+    for (i, c) in text.char_indices() {
+        let l = latin(c);
+        out.push(l);
+        at.extend(std::iter::repeat_n(i, l.len_utf8()));
+    }
+    at.push(text.len());
+    (out, at)
+}
+
 /// Case, spacing and the letters OCR confuses don't make it a different secret.
 fn fold(c: char) -> char {
     match c {
@@ -489,7 +529,7 @@ fn fold(c: char) -> char {
 fn folded(text: &str) -> impl Iterator<Item = (char, Range<usize>)> + '_ {
     text.char_indices()
         .filter(|(_, c)| !c.is_whitespace() && !matches!(c, '-' | '\u{2010}'..='\u{2015}' | '\u{2212}'))
-        .flat_map(|(i, c)| c.to_lowercase().map(move |l| (fold(l), i..i + c.len_utf8())))
+        .flat_map(|(i, c)| latin(c).to_lowercase().map(move |l| (fold(l), i..i + c.len_utf8())))
 }
 
 /// Every place a known secret appears, however it is spaced, grouped or broken across rows.
@@ -677,8 +717,12 @@ mod tests {
             let h = scan(&[code(t)]);
             assert!(h.iter().any(|h| h.line == 0 && h.range == (0..t.len())), "{t:?} {h:?}");
         }
+        for t in ["https://x.com/j/abc123", "https://x.com/i/8f14e45f", "https://x.com/550e8400-e29b-41d4-a716-446655440000", "https://x.com/JBSWYDPEHPKPXP", "https://x.com/aBcDeF",
+                  "https://x.com/4417", "https://x.com/%61bc", "https://x.com/jbswydpehpkpxpjbswydpehpkpxp", "https://q7x9k2m4p8w3z6v1b5n0.x.com/", "https://x.com:8443/"] {
+            assert!(!scan(&[code(t)]).is_empty(), "{t}");
+        }
         assert!(!scan(&[code(&format!("https://x.com/{}", "a/".repeat(400)))]).is_empty());
-        for t in ["https://example.com/menu", "http://example.com", "HTTPS://EXAMPLE.COM/MENU"] {
+        for t in ["https://example.com/menu", "http://example.com", "HTTPS://EXAMPLE.COM/MENU", "https://www.example.co.uk/our-story/Opening_Hours.html"] {
             assert_eq!(scan(&[code(t)]), vec![], "{t}");
         }
         // The same characters as ordinary text aren't a code.
@@ -737,5 +781,28 @@ mod tests {
         // Too short to trust loosely.
         assert_eq!(find(&[line("see 77 25 rows", 0.1, 0.1)], "7725").len(), 0);
         assert_eq!(find(&[line("code 7725", 0.1, 0.1)], "7725").len(), 1);
+    }
+
+    /// Vision reads isolated capitals as Cyrillic or Greek twins ("ЕНРК ЗРХР" for EHPK 3PXP).
+    #[test]
+    fn lookalike_letters_do_not_hide_a_secret() {
+        for (t, rest) in [
+            ("АКIАIОSFОDNN7ЕХАМРLЕ", ""),
+            ("é ТОКЕN=zq81хуwerty ok", "é ТОКЕN= ok"),
+            ("раsswоrd: hunter2", "раsswоrd: "),
+            ("ЅЅN 219099999", "ЅЅN "),
+            ("ｐａｓｓｗｏｒｄ： hunter2", "ｐａｓｓｗｏｒｄ： "),
+            ("４１１１ １１１１ １１１１ １１１１", ""),
+        ] {
+            assert_eq!(masked(t).replace("[hidden]", ""), rest, "{t}");
+        }
+        for c in ('\u{80}'..='\u{ffff}').filter(|c| latin(*c) != *c) {
+            assert!(latin(c).is_ascii(), "{c}");
+        }
+        assert_eq!(masked("Привет, СССР и Москва"), "Привет, СССР и Москва");
+        let l = vec![line("Раsswоrd", 0.1, 0.10), line("синяя-heron-7", 0.1, 0.14)];
+        assert!(scan(&l).iter().any(|x| x.line == 1 && x.range == (0..l[1].text.len())));
+        let found = find_secret(&[line("type JBSW Y3DP ЕНРК ЗРХР", 0.1, 0.1)], "JBSWY3DPEHPK3PXP");
+        assert_eq!(found, vec![(0, 5.."type JBSW Y3DP ЕНРК ЗРХР".len())]);
     }
 }
