@@ -544,8 +544,10 @@ impl Engine {
     pub fn drop_queued(&self, bundle_ids: Vec<String>) {
         let mut q = lock(&self.s.queue);
         let upto = q.arrived;
-        let gone: Vec<String> = q.frames.iter().filter(|(_, f)| bundle_ids.contains(&f.moment.bundle_id)).map(|(_, f)| f.display_key.clone()).collect();
-        q.frames.retain(|(_, f)| !bundle_ids.contains(&f.moment.bundle_id));
+        // Lower case throughout: the exclusion list matches bundle ids whatever their case, and so must this.
+        let bundle_ids: Vec<String> = bundle_ids.iter().map(|b| b.to_lowercase()).collect();
+        let gone: Vec<String> = q.frames.iter().filter(|(_, f)| bundle_ids.contains(&f.moment.bundle_id.to_lowercase())).map(|(_, f)| f.display_key.clone()).collect();
+        q.frames.retain(|(_, f)| !bundle_ids.contains(&f.moment.bundle_id.to_lowercase()));
         let mut d = lock(&self.s.dropped);
         let asked = now_ms();
         d.extend(bundle_ids.into_iter().map(|b| (b, upto, asked)));
@@ -976,7 +978,7 @@ impl Shared {
         }
         // Its app became off-limits while it waited.
         // AIDEV-NOTE: by number or by time, like forget: a picture taken before the request can arrive after it.
-        if lock(&self.dropped).iter().any(|(b, upto, asked)| *b == f.moment.bundle_id && (arrived <= *upto || at <= *asked)) {
+        if lock(&self.dropped).iter().any(|(b, upto, asked)| *b == f.moment.bundle_id.to_lowercase() && (arrived <= *upto || at <= *asked)) {
             drop(store);
             remove();
             return Ok(None);
@@ -1051,17 +1053,14 @@ fn evict(frames: &mut VecDeque<(u64, Frame)>) -> Option<Frame> {
     frames.remove(i).map(|(_, f)| f)
 }
 
-const RECENT_SECRETS: usize = 256;
+const RECENT_SECRETS: usize = 512;
 /// The most one picture may add, so a window full of look-alikes can't push out what the others taught.
 const RECENT_PER_FRAME: usize = 64;
 
 /// Newest last. One seen again becomes the newest.
-// AIDEV-NOTE: what the rules would find wherever it stood needs no remembering; leaving it out keeps a window full of
-// AIDEV-NOTE: key-shaped strings from using up the room that label-, model- and field-found secrets need.
 fn remember(r: &mut VecDeque<String>, values: &[String]) {
     let mut added = 0;
-    let alone = |v: &str| !detect::scan(&[TextLine { text: v.to_owned(), rect: Rect { x: 0.0, y: 0.0, w: 1.0, h: 0.1 }, tokens: vec![], code: false }]).is_empty();
-    for v in values.iter().filter(|v| !alone(v)) {
+    for v in values {
         if let Some(i) = r.iter().position(|x| x == v) {
             r.remove(i);
         } else if added >= RECENT_PER_FRAME {
@@ -1383,7 +1382,7 @@ mod tests {
         for (i, b) in ["com.chat", "com.notes", "com.chat", "com.chat"].iter().enumerate() {
             e.ingest(window(1000 + i as i64, &i.to_string(), false, b));
         }
-        e.drop_queued(vec!["com.chat".into()]);
+        e.drop_queued(vec!["COM.Chat".into()]);
         let q = lock(&e.s.queue);
         assert!(q.frames.iter().all(|(_, f)| f.moment.bundle_id != "com.chat"), "still waiting");
         drop(q);
@@ -1401,6 +1400,8 @@ mod tests {
         let e = Engine::new(d.path().to_string_lossy().into(), config(false), Arc::new(FakeHost(Default::default()))).unwrap();
         lock(&e.s.dropped).push(("com.chat".into(), 5, 1500));
         e.s.process(&mut window(1000, "a", false, "com.chat"), 3, false).unwrap();
+        // Bundle ids are matched whatever their case, as the exclusion list matches them.
+        e.s.process(&mut window(1000, "a", false, "Com.Chat"), 3, false).unwrap();
         // Photographed before the app was put off-limits, handed over after: still not saved.
         e.s.process(&mut window(1400, "a", false, "com.chat"), 9, false).unwrap();
         assert_eq!(e.stats().unwrap().count, 0);
@@ -1491,10 +1492,9 @@ mod tests {
         remember(&mut r, &flood);
         assert_eq!(r.len(), RECENT_SECRETS);
         assert!(r.iter().any(|v| v == "old-0") && r.iter().filter(|v| v.starts_with("new-")).count() == RECENT_PER_FRAME);
-        // What the rules find anywhere by its shape takes up no room.
-        let before = r.clone();
+        // Even what the rules can find by its shape is remembered: found elsewhere it may be wrapped or cut short.
         remember(&mut r, &["AKIAIOSFODNN7EXAMPLE".into()]);
-        assert_eq!(r, before);
+        assert_eq!(r.back().map(String::as_str), Some("AKIAIOSFODNN7EXAMPLE"));
     }
 
     #[test]

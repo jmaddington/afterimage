@@ -137,6 +137,9 @@ public actor Capturer {
         // Nothing hidden is ever chosen, so nothing hidden beforehand can be in a window's picture.
         let omit = content.applications.filter { hiddenBefore.pids.contains($0.processID) }
         let omitted = hiddenBefore.pids
+        // The first bracket also photographs the displays, where only apps ScreenCaptureKit lists can be left out:
+        // a hidden app that is drawn but not listed spoils that look, as it does for whole-display capture.
+        let leftOut = Set(omit.map(\.processID))
 
         struct Shot { let choice: WindowChoice; let image: CGImage; let at: Date; let content: CGSize? }
         func grab(_ c: WindowChoice) async -> Shot? {
@@ -164,7 +167,7 @@ public actor Capturer {
 
         // First bracket: the window in front, and the displays as whole-display capture would have seen them.
         let before = await look(exclusions, hiddenBefore, gate)
-        if let why = Self.spoiled(before, before, omitted: omitted) { return why }
+        if let why = Self.spoiled(before, before, omitted: leftOut) { return why }
         guard before.front == front.0, before.exclusions == exclusions else { return .skipped("The app changed mid-capture") }
         let frontChoice = wanted.first(where: \.front)
         var frontShot: Shot?
@@ -186,7 +189,7 @@ public actor Capturer {
         let quick = await look(exclusions, hiddenBefore, gate)
         let hiddenAfter = await hidden(exclusions)
         let after = await look(exclusions, hiddenAfter, gate)
-        if let why = Self.spoiled(before, after, during: [quick], omitted: omitted) { return why }
+        if let why = Self.spoiled(before, after, during: [quick], omitted: leftOut) { return why }
         var everHidden = hiddenBefore.pids.union(hiddenAfter.pids)
         let kept = Set(keepWindows(before: planned.choices, after: await plan(everHidden).choices))
         if let f = frontChoice {
