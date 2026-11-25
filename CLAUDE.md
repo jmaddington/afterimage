@@ -88,6 +88,10 @@ Releases: `docs/agents/release.md`. Cargo `strip` must stay off (macOS 27 reject
   again if it is loaded too small. The model's words pass `hide_known` (rules plus secrets lately found) before disk or the dev log.
   Try it live: `AFTERIMAGE_LIVE=1 AFTERIMAGE_DETAIL=both AFTERIMAGE_ROUNDS=1 swift run afterimage-checks seed <dir> ../fixtures`.
 
+- Thinking (developer setting `reasoning`): `lm::effort` picks the nearest level each model allows (LM Studio lists them per
+  model; the API spells them none/minimal/low/medium/high). Thinking gets room in answer length, time limit and context.
+  A model without vision describes from the words alone. Compare models: `afterimage-checks compare` (see Compare.swift).
+
 ## Conventions & Patterns
 
 - Privacy is the product: when unsure, don't capture. A new signal may only add hiding, never remove it.

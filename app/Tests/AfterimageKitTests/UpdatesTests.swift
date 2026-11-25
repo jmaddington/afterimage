@@ -68,6 +68,12 @@ import Testing
         s.customEdge = 2000
         let c = s.config
         #expect(c.detail == .custom && !c.customLong && c.customTokens == 1500 && c.customChars == 6000 && c.customEdge == 2000)
+        // Thinking is the same kind of choice.
+        #expect(c.reasoning == "off")
+        s.reasoning = "medium"
+        #expect(s.config.reasoning == "medium")
+        s.developer = false
+        #expect(s.config.reasoning == "off" && s.config.detail == .brief)
         #expect(AppSettings.detail("detailed", developer: true) == .detailed && AppSettings.detail("nonsense", developer: true) == .brief)
     }
 
