@@ -226,7 +226,6 @@ public actor Capturer {
         // Read once, when the first picture needs it.
         var context: [TextLine]?
         var perDisplay: [[TextLine]] = []
-        var overviewSettled = false
         func surroundings() -> [TextLine]? {
             if let context { return context }
             var each: [[TextLine]] = []
@@ -236,15 +235,17 @@ public actor Capturer {
             }
             perDisplay = each
             context = each.flatMap { $0 }
-            // The pictures themselves are needed only until the whole screen has been saved, or passed over.
-            if overviewSettled { around = [] }
             return context
         }
         var queued = 0
         // Now and then the whole screen is saved too, so there is a picture of how it all sat together.
         // AIDEV-NOTE: the same pictures the first bracket vouched for, saved the way whole-display capture saves them:
         // AIDEV-NOTE: hidden apps left out, the extension's fields placed, deduplicated per display.
-        if WindowShots.overviewDue(last: lastOverview, now: Date(), every: overviewEvery), surroundings() != nil {
+        // AIDEV-NOTE: saved after the windows of the same look, so what they gave away is already remembered; and only
+        // AIDEV-NOTE: if the address in front was the same before and after, window in front or not.
+        func overview() async {
+            guard WindowShots.overviewDue(last: lastOverview, now: Date(), every: overviewEvery), !around.isEmpty,
+                  hiddenBefore.focusedURL[front.0] == hiddenAfter.focusedURL[front.0], let everything = surroundings() else { return }
             lastOverview = Date()
             let frontWindow = OnScreenWindow.front(of: front.0, in: planned.list)
             for (i, a) in around.enumerated() {
@@ -255,13 +256,10 @@ public actor Capturer {
                     appName: front.1, bundleId: front.2, windowTitle: ours ? "" : frontWindow?.title ?? "", url: ours ? "" : hiddenAfter.focusedURL[front.0] ?? "",
                     userName: Session.consoleUser, fullName: NSFullUserName(), host: Session.computerName, sessions: Session.loggedIn, runningApps: apps)
                 engine.ingest(frame: Frame(rgba: b.data, width: UInt32(b.width), height: UInt32(b.height), stride: UInt32(b.stride), lines: perDisplay[i], moment: m, displayKey: key,
-                                           covers: Self.onDisplay(before.covers.filter { !leftOut.contains($0.key) }.values.flatMap { $0 }, a.display.frame)))
+                                           covers: Self.onDisplay(before.covers.filter { !leftOut.contains($0.key) }.values.flatMap { $0 }, a.display.frame), context: everything))
                 queued += 1
             }
         }
-        // AIDEV-NOTE: not before: `surroundings` reads these pictures the first time a window needs them.
-        overviewSettled = true
-        if context != nil { around = [] }
         /// Read one picture and hand it over. False when it couldn't be, and its thumbprint has been let go.
         /// `ifWordsChanged`: the picture differs only slightly from the last look, so it is saved only if it reads
         /// differently from the last one saved. Not saving it then is not a failure.
@@ -349,6 +347,8 @@ public actor Capturer {
                 _ = await send(s, covers: covers, url: "", ifWordsChanged: slight.contains(s.choice.id))
             }
         }
+        await overview()
+        around = []
         return queued == 0 ? .unchanged : .queued(queued)
     }
 

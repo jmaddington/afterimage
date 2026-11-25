@@ -906,7 +906,9 @@ impl Shared {
         // to hide here and goes no further.
         // AIDEV-NOTE: privacy-critical. Nothing at or past `own` may reach the model, the index, the log or the disk.
         let own = all.len();
-        let windowed = !f.moment.window_key.is_empty();
+        // Taken while windows are photographed on their own: a window, or the whole screen saved alongside them
+        // (which arrives with the text of every display as its context).
+        let windowed = !f.moment.window_key.is_empty() || !f.context.is_empty();
         // Cloned, not taken: a second try must know what the first did. Moved far aside but otherwise as it lay,
         // so rules that read layout work on it and it can't be mistaken for part of this picture.
         all.extend(f.context.iter().cloned().map(|mut l| {
@@ -1509,6 +1511,36 @@ mod tests {
         // What the other windows said is used and thrown away: not indexed, not sent to the model, not logged.
         let everything = format!("{lines}{s:?}{:?}", e.dev_log(50, None).unwrap());
         assert!(!everything.contains("marigoldcontext") && !everything.contains("Tr0ub4dor9x"), "{everything}");
+        e.shutdown();
+    }
+
+    /// The whole-screen picture saved alongside the windows knows what the windows gave away, and adds to it.
+    #[test]
+    fn a_whole_screen_picture_taken_with_the_windows_shares_their_memory() {
+        let d = tempfile::tempdir().unwrap();
+        let e = Engine::new(d.path().to_string_lossy().into(), config(false), Arc::new(FakeHost(Default::default()))).unwrap();
+        lock(&e.s.recent_secrets).plain.push_back("quartz-otter-9".into());
+        let mut f = frame(1000);
+        f.lines[0].text = "written down: quartz-otter-9".into();
+        f.lines[1].text = "plain".into();
+        f.lines[2].text = "words".into();
+        f.moment = Moment { taken_at: 1000, ..Default::default() };
+        // Its own text again, as the capturer passes it: that is what marks it as taken in window mode.
+        f.context = f.lines.clone();
+        e.ingest(f);
+        wait(|| e.stats().unwrap().count == 1);
+        let s = e.list(Filter::default(), 10, 0).unwrap().remove(0);
+        assert!(!format!("{:?}", e.lines(s.id).unwrap()).contains("quartz-otter-9"));
+        // An ordinary whole-display picture, with no windows in play, is untouched by that memory.
+        let mut g = frame(2000);
+        g.display_key = "other".into();
+        g.lines[0].text = "written down: quartz-otter-9".into();
+        g.lines[1].text = "plain".into();
+        g.moment = Moment { taken_at: 2000, ..Default::default() };
+        e.ingest(g);
+        wait(|| e.stats().unwrap().count == 2);
+        let all: String = e.list(Filter::default(), 10, 0).unwrap().iter().map(|s| format!("{:?}", e.lines(s.id).unwrap())).collect();
+        assert!(all.contains("quartz-otter-9"), "whole-display capture behaves as it always did");
         e.shutdown();
     }
 
