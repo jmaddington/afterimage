@@ -8,9 +8,13 @@ writes, or by meaning. The app is SwiftUI; the engine that hides, saves and sear
 
 ## What it never does
 
-- **It never contacts a cloud service.** The only model it talks to is LM Studio on the same Mac, over a loopback
-  address, with proxies and redirects turned off. If you have set up LM Link, LM Studio may run the model on one of
-  your own linked machines; the app names them in Settings.
+- **It never sends what it sees to a cloud service.** The only model it talks to is LM Studio: on the same Mac by
+  default, or, if you name one in Settings, on another computer on your own network. Public addresses are refused,
+  and proxies and redirects are turned off. To another computer, the text on your screen travels over your network
+  before anything is hidden, unencrypted unless the network encrypts it (Tailscale does). If you have set up LM
+  Link, LM Studio may run the model on one of your own linked machines; the app names them in Settings.
+- **It goes online for one thing only: "Check for Updates", when you click it.** That asks GitHub which release is
+  the latest and sends nothing about you, your Mac or your library. It never checks by itself.
 - **Raw pixels never touch the disk.** A capture lives in memory until its secrets have been frosted. One code path
   writes pictures, and it is only handed the frosted frame. The same goes for text: the index, window titles and
   page addresses are masked first, and addresses lose their query and fragment.

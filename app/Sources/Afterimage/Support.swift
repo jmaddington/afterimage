@@ -95,8 +95,34 @@ enum Words {
         let i = Bundle.main.infoDictionary
         return "Afterimage \(i?["CFBundleShortVersionString"] as? String ?? "?") (\(i?["CFBundleVersion"] as? String ?? "?"))"
     }
-    /// Opened in the browser. The app itself never goes looking for updates.
-    static let releases = URL(string: "https://github.com/jmaddington/afterimage/releases")!
+    /// Opened in the browser. The app looks for updates only when asked to (Updates.check).
+    static let releases = Updates.releases
+    static var shortVersion: String { Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0" }
+    /// Ask GitHub once and say what it answered. Only ever called from a button.
+    @MainActor static func checkForUpdates() {
+        Task { @MainActor in
+            let answer = await Updates.check(current: shortVersion)
+            let a = NSAlert()
+            switch answer {
+            case .current:
+                a.messageText = "Afterimage is up to date"
+                a.informativeText = "\(shortVersion) is the latest version."
+            case .newer(let r):
+                a.messageText = "Afterimage \(r.version) is available"
+                a.informativeText = "You have \(shortVersion). The download opens in your browser."
+                a.addButton(withTitle: "Open Download Page")
+                a.addButton(withTitle: "Not Now")
+                NSApp.activate()
+                if a.runModal() == .alertFirstButtonReturn { NSWorkspace.shared.open(r.page) }
+                return
+            case .failed(let why):
+                a.messageText = "Couldn’t check for updates"
+                a.informativeText = why
+            }
+            NSApp.activate()
+            a.runModal()
+        }
+    }
     static func bytes(_ n: UInt64) -> String { Int64(n).formatted(.byteCount(style: .file)) }
     static func count(_ n: Int, _ one: String, _ many: String) -> String { n == 1 ? "1 \(one)" : "\(n.formatted()) \(many)" }
 }

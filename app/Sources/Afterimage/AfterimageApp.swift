@@ -40,6 +40,9 @@ struct AppCommands: Commands {
     @Environment(\.openWindow) private var openWindow
 
     var body: some Commands {
+        CommandGroup(after: .appInfo) {
+            Button("Check for Updates…") { Words.checkForUpdates() }
+        }
         CommandGroup(replacing: .newItem) {
             Button("Capture Now") { model.recorder.captureNow() }.keyboardShortcut("n")
         }

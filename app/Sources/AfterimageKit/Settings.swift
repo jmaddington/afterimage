@@ -27,6 +27,8 @@ import Observation
     public var embedModel: String { didSet { save("embedModel", embedModel) } }
     public var describe: String { didSet { save("describe", describe) } }
     public var port: Int { didSet { save("port", port) } }
+    /// The machine LM Studio runs on. Empty: this Mac. Otherwise an address on the person's own network.
+    public var lmHost: String { didSet { save("lmHost", lmHost) } }
     public var keepDays: Int { didSet { save("keepDays", keepDays) } }
     public var keepGB: Int { didSet { save("keepGB", keepGB) } }
     /// Let an AI agent on this Mac read the library. Only honoured in developer mode.
@@ -59,6 +61,7 @@ import Observation
         embedModel = get("embedModel", "text-embedding-nomic-embed-text-v1.5")
         describe = get("describe", "pluggedIn")
         port = get("port", 1234)
+        lmHost = get("lmHost", "")
         keepDays = get("keepDays", 30)
         keepGB = get("keepGB", 20)
         agentAccess = get("agentAccess", false)
@@ -117,8 +120,26 @@ import Observation
         if interval > 0 { t.insert(.interval) }
         return t
     }
+    /// Whatever was typed, as a plain address: no scheme, no path, no name and password, and the port from its own field.
+    /// AIDEV-NOTE: the engine decides whether the address is allowed (core/src/lm.rs check_host); this only tidies.
+    public nonisolated static func lmURL(host: String, port: Int) -> String {
+        var h = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let r = h.range(of: "://") { h = String(h[r.upperBound...]) }
+        if let i = h.firstIndex(where: { "/?#".contains($0) }) { h = String(h[..<i]) }
+        if let i = h.lastIndex(of: "@") { h = String(h[h.index(after: i)...]) }
+        if h.hasPrefix("[") {
+            if let i = h.firstIndex(of: "]") { h = String(h[...i]) }
+        } else if h.filter({ $0 == ":" }).count > 1 {
+            h = "[\(h)]"
+        } else if let i = h.firstIndex(of: ":") {
+            h = String(h[..<i])
+        }
+        return "http://\(h.isEmpty ? "127.0.0.1" : h):\(port)"
+    }
+    /// LM Studio is on another machine: what it is asked crosses the network.
+    public var modelIsElsewhere: Bool { !isThisMac(base: Self.lmURL(host: lmHost, port: port)) }
     public var config: Config {
-        Config(lmUrl: "http://127.0.0.1:\(port)", model: model, embedModel: embedModel, requireAi: requireAI,
+        Config(lmUrl: Self.lmURL(host: lmHost, port: port), model: model, embedModel: embedModel, requireAi: requireAI,
                describe: describe == "always" ? .always : describe == "never" ? .never : .pluggedIn,
                maxAgeDays: UInt32(max(0, keepDays)), maxBytes: UInt64(max(0, keepGB)) * 1_000_000_000, unloadAfterSecs: 300, developer: developer)
     }

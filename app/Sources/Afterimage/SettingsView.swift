@@ -151,11 +151,16 @@ private struct IntelligenceSettings: View {
                     LabeledContent("Linked machines", value: d.joined(separator: ", "))
                 }
                 ModelPicker(models: models, vision: true, selection: $settings.model)
+                LabeledContent("Computer") { TextField("This Mac", text: $settings.lmHost).labelsHidden().frame(width: 200).autocorrectionDisabled() }
                 LabeledContent("Port") { TextField("Port", value: $settings.port, format: .number.grouping(.never)).labelsHidden().frame(width: 80) }
             } footer: {
-                Text(model.status?.linkedDevices.isEmpty == false
-                     ? "LM Link may run the model on one of your linked machines. Afterimage never contacts a cloud service."
-                     : "Afterimage only talks to LM Studio on this Mac. It never contacts a cloud service.").foregroundStyle(.secondary)
+                if settings.modelIsElsewhere {
+                    Text("LM Studio on another computer: the text on your screen is sent to it over your network before anything is hidden, without encryption unless the network provides it (Tailscale does). Only addresses on your own network are accepted, never a public one.").foregroundStyle(.orange)
+                } else {
+                    Text(model.status?.linkedDevices.isEmpty == false
+                         ? "LM Link may run the model on one of your linked machines. Leave Computer empty to use LM Studio on this Mac."
+                         : "Afterimage talks to LM Studio on this Mac. To use another computer on your own network, enter its name or address.").foregroundStyle(.secondary)
+                }
             }
             Section {
                 Picker("If the model isn’t available", selection: $settings.requireAI) {
@@ -223,6 +228,7 @@ private struct IntelligenceSettings: View {
         }
         .onChange(of: settings.model) { Task { await model.probe() } }
         .onChange(of: settings.port) { Task { await model.probe() } }
+        .onChange(of: settings.lmHost) { Task { await model.probe() } }
     }
 }
 
