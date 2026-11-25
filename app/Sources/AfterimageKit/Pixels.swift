@@ -45,9 +45,10 @@ public enum Pixels {
 
     /// Small greyscale fingerprint for "has anything changed". The menu bar is skipped: its clock always changes.
     /// AIDEV-NOTE: 128x80 so one typed character still moves a cell; a coarser grid misses typing.
-    public static func thumbprint(_ image: CGImage) -> Data {
+    /// A single window has no menu bar: pass `skipBar: false` and all of it counts.
+    public static func thumbprint(_ image: CGImage, skipBar: Bool = true) -> Data {
         let w = 128, h = 80
-        let bar = min(image.height / 25, 80)
+        let bar = skipBar ? min(image.height / 25, 80) : 0
         guard let body = image.cropping(to: CGRect(x: 0, y: bar, width: image.width, height: image.height - bar)) else { return Data() }
         var out = Data(count: w * h)
         out.withUnsafeMutableBytes { p in
@@ -57,6 +58,12 @@ public enum Pixels {
             c.draw(body, in: CGRect(x: 0, y: 0, width: w, height: h))
         }
         return out
+    }
+
+    /// A thumbprint with nothing in it: a window that gave no content, or one flat colour.
+    public static func isBlank(_ print: Data) -> Bool {
+        guard let lo = print.min(), let hi = print.max() else { return true }
+        return hi - lo <= 2
     }
 
     public static func load(_ path: String, maxEdge: Int? = nil) -> CGImage? {

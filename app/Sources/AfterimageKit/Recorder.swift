@@ -40,6 +40,7 @@ import Observation
         self.settings = settings
         self.engine = engine
         capturer = Capturer(engine: engine)
+        settings.onAppsExcluded = { [engine] in engine.dropQueued(bundleIds: $0) }
     }
 
     public func start() {
@@ -146,16 +147,16 @@ import Observation
         if t == .interval && Session.idleSeconds > max(60, Double(settings.interval)) { return }
         policy.captured(at: now)
         capturing = true
-        let all = settings.allDisplays, generation = policy.generation
+        let all = settings.allDisplays, windows = settings.windowsSeparately, generation = policy.generation
         let shown = frontNow()
         engine.setConditions(onPower: Session.onPower, calm: Session.calm)
         Task {
-            let (r, refused) = await capturer.capture(t, allDisplays: all) { self.gate() }
+            let (r, refused) = await capturer.capture(t, allDisplays: all, windows: windows) { self.gate() }
             capturing = false
             if settings.developer {
                 let refusal = refused.map(Capturer.logPhrase)
                 let what: String = switch r {
-                case .queued(let n): n == 1 ? "Taken" : "Taken (\(n) displays)"
+                case .queued(let n): Self.taken(n, windows: windows)
                 case .unchanged: "Nothing had changed"
                 case .skipped(let why): "Skipped, will retry: \(refusal ?? why)"
                 case .blocked(let why): "Not taken: \(refusal ?? why)"
@@ -189,6 +190,12 @@ import Observation
                 NSLog("capture failed: %@ [AIMG-CAPFAIL]", why)
             }
         }
+    }
+
+    /// For the developer log: how many pictures one look led to.
+    nonisolated static func taken(_ n: Int, windows: Bool) -> String {
+        if windows { return n == 1 ? "Taken (1 window)" : "Taken (\(n) windows)" }
+        return n == 1 ? "Taken" : "Taken (\(n) displays)"
     }
 
     private func pollWindow() {

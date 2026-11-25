@@ -46,6 +46,7 @@ pub struct IndexedLine {
 }
 
 /// Everything recorded about the moment of capture.
+// AIDEV-NOTE: stored as JSON in shots.moment; a field added later needs #[serde(default)] or every older row reads as blank.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, uniffi::Record)]
 pub struct Moment {
     pub taken_at: i64,
@@ -60,6 +61,22 @@ pub struct Moment {
     pub host: String,
     pub sessions: Vec<String>,
     pub running_apps: Vec<AppRef>,
+    /// Which window this is a picture of: the same for as long as the window lives and Afterimage runs. Empty for a
+    /// picture of a whole display, and for every picture from before windows were photographed on their own.
+    #[serde(default)]
+    #[uniffi(default = "")]
+    pub window_key: String,
+    /// That window was the one in front. False for a window photographed in the background.
+    #[serde(default)]
+    #[uniffi(default = false)]
+    pub window_front: bool,
+}
+
+impl Moment {
+    /// A window nobody was looking at: photographed because it changed, not because the person was in it.
+    pub fn background_window(&self) -> bool {
+        !self.window_key.is_empty() && !self.window_front
+    }
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -632,6 +649,24 @@ mod tests {
         assert_eq!((got.check_model.as_str(), got.describe_model.as_str()), ("checker", ""));
         s.finish_index(id, "A bill", &[], None, "m", "viewer").unwrap();
         assert_eq!(s.get(id).unwrap().unwrap().describe_model, "viewer");
+    }
+
+    #[test]
+    fn a_picture_remembers_which_window_it_was_of_and_older_ones_say_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = Store::open(d.path()).unwrap();
+        let mut n = shot(d.path(), 1, "words", 5);
+        (n.moment.window_key, n.moment.window_front) = ("ab12-77".into(), true);
+        let id = s.insert(&n).unwrap();
+        let got = s.get(id).unwrap().unwrap().moment;
+        assert_eq!((got.window_key.as_str(), got.window_front, got.background_window()), ("ab12-77", true, false));
+        // A picture saved before this was kept still knows everything else it knew.
+        let old = r#"{"taken_at":1,"trigger":"app","display":"Built-in","app_name":"Safari","bundle_id":"com.apple.Safari","window_title":"Plan","url":"","user_name":"dana","full_name":"Dana","host":"Mac","sessions":[],"running_apps":[]}"#;
+        s.db.execute("UPDATE shots SET moment=? WHERE id=?", params![old, id]).unwrap();
+        let got = s.get(id).unwrap().unwrap().moment;
+        assert_eq!((got.app_name.as_str(), got.display.as_str(), got.window_key.as_str(), got.window_front, got.background_window()), ("Safari", "Built-in", "", false, false));
+        let back = Moment { window_key: "ab12-78".into(), ..Default::default() };
+        assert!(back.background_window());
     }
 
     /// A library made before the models were recorded opens, and its pictures say nothing rather than guess.

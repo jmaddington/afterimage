@@ -155,6 +155,21 @@ pub fn shows_pages(bundle_id: &str) -> bool {
     family_of(bundle_id, false).is_some() || SHOWN_PAGES.read().unwrap_or_else(|e| e.into_inner()).contains(&bundle_id.to_lowercase())
 }
 
+/// Could a window of this app be showing a web page? A browser we know, an app that has shown one, or an app this
+/// Mac says opens pages that hasn't yet been looked at three times running and found without any.
+/// AIDEV-NOTE: privacy-critical; errs towards yes. Mirrors the evidence `hide_browser` needs before it lets a registered app go.
+#[uniffi::export]
+pub fn might_show_pages(bundle_id: &str) -> bool {
+    if shows_pages(bundle_id) {
+        return true;
+    }
+    if !only_registered(bundle_id) {
+        return false;
+    }
+    let looks = PAGELESS_LOOKS.read().unwrap_or_else(|e| e.into_inner());
+    looks.get(&bundle_id.to_lowercase()).is_none_or(|(n, _)| *n < 3)
+}
+
 #[uniffi::export]
 pub fn hide_app(ex: &Exclusions, bundle_id: &str) -> Option<HideReason> {
     let b = bundle_id.to_lowercase();
@@ -942,5 +957,36 @@ mod tests {
         assert_eq!(hide_browser(&e, "net.mullvad.mullvadbrowser", &[plain], true), Some(HideReason::Unreadable));
         let private = BrowserWindow { title: Some("Chase — Private Browsing".into()), ..win("https://a.com") };
         assert_eq!(hide_browser(&ex(), "one.ablaze.floorp", &[private], true), Some(HideReason::PrivateWindow));
+    }
+
+    #[test]
+    fn an_app_might_show_pages_until_it_has_been_seen_not_to() {
+        for b in [CHROME, SAFARI, "org.mozilla.firefox", "company.thebrowser.Browser", "org.torproject.torbrowser", "com.google.Chrome.canary"] {
+            assert!(might_show_pages(b), "{b}");
+        }
+        assert!(!might_show_pages("com.apple.finder") && !might_show_pages(""));
+        // Registered for links and never looked at: nobody knows yet.
+        register_browsers(vec!["com.example.maybe".into(), "com.example.shower".into()]);
+        assert!(might_show_pages("com.example.maybe") && might_show_pages("COM.EXAMPLE.MAYBE"));
+        let plain = BrowserWindow { urls: vec![], ..win("x") };
+        let nap = || std::thread::sleep(std::time::Duration::from_millis(40));
+        // Two looks without a page aren't enough; the third is.
+        for _ in 0..2 {
+            hide_browser(&ex(), "com.example.maybe", &[plain.clone()], true);
+            assert!(might_show_pages("com.example.maybe"));
+            nap();
+        }
+        assert_eq!(hide_browser(&ex(), "com.example.maybe", &[plain.clone()], true), None);
+        assert!(!might_show_pages("com.example.maybe"));
+        // A look that came up short takes that back.
+        hide_browser(&ex(), "com.example.maybe", &[plain.clone()], false);
+        assert!(might_show_pages("com.example.maybe"));
+        // One page seen and it is a browser from then on, whatever later looks find.
+        hide_browser(&ex(), "com.example.shower", &[win("https://a.com/")], true);
+        for _ in 0..4 {
+            hide_browser(&ex(), "com.example.shower", &[plain.clone()], true);
+            nap();
+        }
+        assert!(might_show_pages("com.example.shower") && shows_pages("com.example.shower"));
     }
 }

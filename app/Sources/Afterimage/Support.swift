@@ -70,6 +70,8 @@ enum Words {
         default: "On schedule"
         }
     }
+    /// For a picture of one window rather than a whole display.
+    static func windowRole(front: Bool) -> String { front ? "The window in front" : "A window in the background" }
     static func kind(_ k: String) -> String {
         switch k {
         case "password": "Password"

@@ -15,12 +15,23 @@ import Observation
     /// Keep a log of which window is in front and what else is open.
     public var trackActivity: Bool { didSet { save("trackActivity", trackActivity) } }
     public var allDisplays: Bool { didSet { save("allDisplays", allDisplays) } }
+    /// Photograph each window on its own, covered or not, instead of the whole display. Off unless chosen.
+    public var windowsSeparately: Bool { didSet { save("windowsSeparately", windowsSeparately) } }
     public var skipSecureInput: Bool { didSet { save("skipSecureInput", skipSecureInput) } }
     public var hidePasswordManagers: Bool { didSet { save("hidePasswordManagers", hidePasswordManagers) } }
     public var hidePrivateWindows: Bool { didSet { save("hidePrivateWindows", hidePrivateWindows) } }
     public var hideTor: Bool { didSet { save("hideTor", hideTor) } }
     public var hideUnreadable: Bool { didSet { save("hideUnreadable", hideUnreadable) } }
-    public var excludedApps: [String] { didSet { save("excludedApps", excludedApps) } }
+    public var excludedApps: [String] {
+        didSet {
+            save("excludedApps", excludedApps)
+            let added = excludedApps.filter { !oldValue.contains($0) }
+            if !added.isEmpty { onAppsExcluded?(added) }
+        }
+    }
+    /// Told which apps were just put off-limits, so pictures of them still waiting can be let go.
+    // AIDEV-NOTE: privacy-critical. The recorder points this at Engine.dropQueued.
+    @ObservationIgnored public var onAppsExcluded: (([String]) -> Void)?
     public var excludedSites: [String] { didSet { save("excludedSites", excludedSites) } }
     public var requireAI: Bool { didSet { save("requireAI", requireAI) } }
     public var model: String { didSet { save("model", model) } }
@@ -47,6 +58,7 @@ import Observation
         interval = get("interval", 120)
         trackActivity = get("trackActivity", true)
         allDisplays = get("allDisplays", false)
+        windowsSeparately = get("windowsSeparately", false)
         skipSecureInput = get("skipSecureInput", true)
         hidePasswordManagers = get("hidePasswordManagers", true)
         hidePrivateWindows = get("hidePrivateWindows", true)
