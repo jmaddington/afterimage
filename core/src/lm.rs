@@ -132,7 +132,14 @@ impl Lm {
     /// AIDEV-NOTE: JIT loading would use the model's max context (262k on Gemma 4), which can eat RAM on GGUF.
     pub fn ensure_loaded(&self, key: &str, context: u32) -> Result<bool, LmError> {
         let ms = self.models()?;
-        let m = ms.iter().find(|m| m.key == key).ok_or_else(|| LmError::Model(format!("{key} isn't installed")))?;
+        let Some(m) = ms.iter().find(|m| m.key == key) else {
+            // LM Studio can re-list a model under a new key while the old one stays loaded and answering.
+            let serving = self.call("/v1/models", None, 5)?;
+            if serving["data"].as_array().into_iter().flatten().any(|m| m["id"] == key) {
+                return Ok(false);
+            }
+            return Err(LmError::Model(format!("{key} isn't in LM Studio any more. Choose a model in Settings.")));
+        };
         if m.loaded {
             return Ok(false);
         }
