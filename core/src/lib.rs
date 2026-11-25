@@ -13,6 +13,7 @@ pub mod pages;
 mod privacy;
 mod redact;
 mod store;
+mod windows;
 
 pub use detect::{Rect, SecretKind, TextLine, Token};
 pub use activity::{ActivitySample, ActivitySpan, OpenWindow};
@@ -20,6 +21,7 @@ pub use lm::ModelInfo;
 pub use pages::{Cover, PageArea, PageHint, PagePlan, plan_page};
 pub use privacy::*;
 pub use store::*;
+pub use windows::{WindowChoice, WindowScene, WindowSeen, WindowSkip, keep_windows, plan_windows};
 
 use detect::Hit;
 use std::collections::{HashMap, HashSet, VecDeque};
