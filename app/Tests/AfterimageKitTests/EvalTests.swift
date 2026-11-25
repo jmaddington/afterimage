@@ -68,6 +68,13 @@ import Testing
                 rows.append(row)
             }
             engine.shutdown()
+            // AIDEV-NOTE: free the model before the next one; left loaded, later models fail for lack of memory.
+            if !rulesOnly, let u = URL(string: config.lmUrl + "/api/v1/models/unload") {
+                var r = URLRequest(url: u); r.httpMethod = "POST"; r.timeoutInterval = 60
+                r.setValue("application/json", forHTTPHeaderField: "content-type")
+                r.httpBody = try JSONSerialization.data(withJSONObject: ["instance_id": model])
+                _ = try? await URLSession.shared.data(for: r)
+            }
         }
         let out = root.appending(path: "build/eval")
         try FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
