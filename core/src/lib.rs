@@ -171,7 +171,7 @@ struct Shared {
     config: Mutex<Config>,
     queue: Mutex<Queue>,
     wake: Condvar,
-    /// Last accepted thumbprint per display; cleared when a frame is lost so the next look is taken afresh.
+    /// Last accepted thumbprint per display or per window; cleared when a frame is lost so the next look is taken afresh.
     prints: Mutex<HashMap<String, Vec<u8>>>,
     /// Line neighbourhoods the model has already called clean. Keyed hash, RAM only.
     clean: Mutex<HashSet<u64>>,
@@ -210,6 +210,8 @@ fn now_ms() -> i64 {
 
 /// About 30 MB each on a Retina display; deep enough for a flurry of window switches.
 const QUEUE_CAP: usize = 12;
+/// Displays are few, windows come and go: past this many thumbprints the oldest knowledge is let go.
+const PRINTS_CAP: usize = 256;
 const CONTEXT: u32 = 8192;
 const CHUNK_CHARS: usize = 5000;
 const CHUNK_LINES: usize = 90;
@@ -313,7 +315,8 @@ impl Engine {
         self.s.calm.store(calm, SeqCst);
     }
 
-    /// Cheap pre-check on a small greyscale thumbprint. False means "same screen as last time".
+    /// Cheap pre-check on a small greyscale thumbprint. False means "same screen as last time". The key names a
+    /// display, or a single window ("win:" and its number) when windows are photographed on their own.
     pub fn is_new(&self, display_key: String, luma: Vec<u8>) -> bool {
         let mut p = lock(&self.s.prints);
         let fresh = match p.get(&display_key) {
@@ -330,6 +333,10 @@ impl Engine {
             _ => true,
         };
         if fresh {
+            // Windows come and go and their numbers aren't reused. Forgetting costs one repeated picture each, no more.
+            if p.len() >= PRINTS_CAP && !p.contains_key(&display_key) {
+                p.clear();
+            }
             p.insert(display_key, luma);
         }
         fresh
@@ -1234,6 +1241,37 @@ mod tests {
         assert!(e.is_new("a".into(), vec![10; 64]));
         e.lost("a".into());
         assert!(e.is_new("a".into(), vec![10; 64]));
+        e.shutdown();
+    }
+
+    #[test]
+    fn thumbprints_of_windows_long_gone_do_not_pile_up() {
+        let d = tempfile::tempdir().unwrap();
+        let e = Engine::new(d.path().to_string_lossy().into(), config(true), Arc::new(FakeHost(Default::default()))).unwrap();
+        assert!(e.is_new("42".into(), vec![10; 64]));
+        for i in 0..2000 {
+            assert!(e.is_new(format!("win:{i}"), vec![10; 64]));
+            assert!(!e.is_new(format!("win:{i}"), vec![10; 64]));
+        }
+        assert!(lock(&e.s.prints).len() <= PRINTS_CAP);
+        // Each window has its own: one changing says nothing about another.
+        assert!(e.is_new("win:a".into(), vec![10; 64]) && e.is_new("win:b".into(), vec![10; 64]));
+        assert!(e.is_new("win:a".into(), vec![90; 64]) && !e.is_new("win:b".into(), vec![10; 64]));
+        e.shutdown();
+    }
+
+    #[test]
+    fn a_window_picture_keeps_which_window_it_was() {
+        let d = tempfile::tempdir().unwrap();
+        let e = Engine::new(d.path().to_string_lossy().into(), config(false), Arc::new(FakeHost(Default::default()))).unwrap();
+        let mut f = frame(1000);
+        (f.display_key, f.moment.window_key, f.moment.window_front) = ("win:77".into(), "ab12-77".into(), false);
+        e.ingest(f);
+        wait(|| e.stats().unwrap().count == 1);
+        let m = e.list(Filter::default(), 10, 0).unwrap().remove(0).moment;
+        assert_eq!((m.window_key.as_str(), m.window_front), ("ab12-77", false));
+        // Its title went through the same check as any other.
+        assert!(!m.window_title.contains("hunter22"));
         e.shutdown();
     }
 

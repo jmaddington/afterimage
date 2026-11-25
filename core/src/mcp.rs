@@ -283,6 +283,15 @@ fn token_like(t: &str) -> bool {
 }
 
 fn brief(s: &Shot, off: i32) -> Value {
+    let mut v = brief_of(s, off);
+    // Photographed because it changed behind something else, not because the person was in it.
+    if s.moment.background_window() {
+        v["background_window"] = json!(true);
+    }
+    v
+}
+
+fn brief_of(s: &Shot, off: i32) -> Value {
     json!({"id": s.id, "time": iso(s.moment.taken_at, off), "app": s.moment.app_name, "bundle_id": s.moment.bundle_id, "window": s.moment.window_title,
            "page": s.moment.url, "description": s.description,
            // Tags are the model's words about the screen; masked again here for pictures saved before they were masked at source.
@@ -356,15 +365,22 @@ fn timeline(s: &Shared, a: &Value, off: i32) -> Result<Value, String> {
     let mut shots = lock(&s.store).list(&Filter { from: Some(from), to: Some(to), ..Default::default() }, MAX_SHOTS, 0).map_err(|e| e.to_string())?;
     let truncated = shots.len() as u32 == MAX_SHOTS;
     shots.reverse();
-    Ok(json!({"note": UNTRUSTED, "from": iso(from, off), "to": iso(to, off), "pictures": shots.len(), "more_than_shown": truncated, "stretches": stretches(&shots, off)}))
+    let mut v = json!({"note": UNTRUSTED, "from": iso(from, off), "to": iso(to, off), "pictures": shots.len(), "more_than_shown": truncated, "stretches": stretches(&shots, off)});
+    let behind: Vec<i64> = shots.iter().filter(|s| s.moment.background_window()).map(|s| s.id).collect();
+    if !behind.is_empty() {
+        v["background_windows"] = json!({"pictures": behind, "about": "Windows that changed behind the one in front. The person wasn't in them, so they are no part of a stretch."});
+    }
+    Ok(v)
 }
 
 /// Consecutive pictures of the same window are one stretch; a long quiet spell is shown as what it is.
+/// A window photographed in the background says nothing about where the person was, so it is no part of a stretch.
 pub(crate) fn stretches(shots: &[Shot], off: i32) -> Vec<Value> {
+    let shots: Vec<&Shot> = shots.iter().filter(|s| !s.moment.background_window()).collect();
     let mut out: Vec<Value> = Vec::new();
     let mut i = 0;
     while i < shots.len() {
-        let first = &shots[i];
+        let first = shots[i];
         let mut j = i;
         while j + 1 < shots.len()
             && shots[j + 1].moment.bundle_id == first.moment.bundle_id
@@ -434,6 +450,26 @@ fn get_image(s: &Shared, a: &Value) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shot(id: i64, at: i64, bundle: &str, title: &str, key: &str, front: bool) -> Shot {
+        let moment = crate::store::Moment { taken_at: at, app_name: bundle.into(), bundle_id: bundle.into(), window_title: title.into(), window_key: key.into(), window_front: front, ..Default::default() };
+        Shot { id, moment, path: String::new(), thumb_path: String::new(), width: 1, height: 1, bytes: 1, regions: vec![], description: String::new(), tags: vec![],
+               kept: false, indexed: false, ai_checked: true, check_model: String::new(), describe_model: String::new() }
+    }
+
+    #[test]
+    fn a_window_photographed_in_the_background_is_not_where_the_person_was() {
+        let shots = [shot(1, 0, "edit", "Doc", "k-1", true), shot(2, 10, "chat", "Room", "k-2", false), shot(3, 60_000, "edit", "Doc", "k-1", true)];
+        let s = stretches(&shots, 0);
+        assert_eq!(s.len(), 1, "{s:?}");
+        assert_eq!((s[0]["app"].as_str(), s[0]["pictures"].clone()), (Some("edit"), json!([1, 3])));
+        assert_eq!(brief(&shots[1], 0)["background_window"], json!(true));
+        assert!(brief(&shots[0], 0).get("background_window").is_none());
+        // A picture of a whole display is as it always was.
+        let whole = [shot(4, 0, "edit", "Doc", "", false)];
+        assert_eq!(stretches(&whole, 0)[0]["pictures"], json!([4]));
+        assert!(brief(&whole[0], 0).get("background_window").is_none());
+    }
 
     #[test]
     fn tags_that_look_like_keys_are_left_out() {
