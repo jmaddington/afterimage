@@ -99,6 +99,9 @@ re!(DIGIT_RUN, r"\d(?:[\s\-\u{2010}-\u{2015}\u{2212}.]{0,2}\d){11,}");
 re!(CARD_PREFIX, r"^(?:3[47]\d{13}|(?:4\d|5[1-5]|2[2-7]|35|6[025])\d{14}|64[4-9]\d{13})$");
 re!(CARD_GROUPS, r"\b\d{4}[\s\-.]{1,2}\d{4}[\s\-.]{1,2}\d{4}[\s\-.]{1,2}\d{1,7}\b|\b3[47]\d{2}[\s\-.]{1,2}\d{6}[\s\-.]{1,2}\d{5}\b");
 re!(IBAN, r"\b[A-Z]{2}\d{2}(?:\s?[A-Z0-9]{4}){2,7}(?:\s?[A-Z0-9]{1,4})?\b");
+re!(SSN_HINT, r"ssn|\bs\s*s\s*n\b|\bss\s*(?:#|no\b|num)|soc(?:ial)?\s*sec|tax\s*(?:payer)?(?:\s*s)?\s*(?:id|no\b|num)|\bi?tins?\b|\bsocial\b");
+// Read with everything but letters and digits taken out. ("itin" is left to the spaced readings: it is inside "waiting".)
+re!(SSN_HINT_COMPACT, r"ssn|socialsec|socsec|taxpayer|taxid|employeeitin");
 re!(SSN_LABEL, r"(?i)\b(?:ssn|social\s+security|tax(?:payer)?\s*id|itin|tin)\b");
 re!(FIN_LABEL, r"(?i)\b(?:routing|aba|account|acct|a/c|iban|sort\s*code|swift|bic|card|debit|credit)(?:\s*(?:number|num|no\.?|nbr|code|#))?(?:\s*\(?(?:required|optional)\)?)?\s*[:#]?");
 re!(FIN_VALUE, r"[0-9Xx*•](?:[\s\-.]?[0-9Xx*•]){4,24}");
@@ -589,6 +592,37 @@ pub fn scan(lines: &[TextLine]) -> Vec<Hit> {
     // The kind of block that is open. Only an END of the same kind closes it.
     let mut in_pem: Option<String> = None;
     let latin: Vec<String> = lines.iter().map(|l| latinised(&l.text, false).0).collect();
+    // AIDEV-NOTE: privacy-critical, narrow on purpose. A spaced SSN shape is let go only when its whole line is one
+    // AIDEV-NOTE: long row of bare numbers (six or more groups, single spaces, nothing else), holds a single such
+    // AIDEV-NOTE: shape, and nothing anywhere on the screen or in the title names an SSN. Seen live: a misread line.
+    // Looser than the label rule on purpose: any hint anywhere keeps the number hidden. Names run together
+    // ("employee_ssn", "SocialSecurityNumber") and headers split over two lines count.
+    let ssn_named = {
+        // Three readings of the screen, any of which may say so: as written, lowered and stripped to letters and
+        // digits, and the same with capitals starting new words. The gate can only get stricter.
+        let (mut plain, mut split) = (String::new(), String::new());
+        for t in &latin {
+            let mut prev = ' ';
+            for c in t.chars() {
+                if c.is_uppercase() && prev.is_lowercase() {
+                    split.push(' ');
+                }
+                let k = if c.is_alphanumeric() || c == '#' { c.to_ascii_lowercase() } else { ' ' };
+                plain.push(k);
+                split.push(k);
+                prev = c;
+            }
+            plain.push(' ');
+            split.push(' ');
+        }
+        let compact: String = plain.chars().filter(|c| c.is_alphanumeric()).collect();
+        latin.iter().any(|t| SSN_LABEL.is_match(t)) || SSN_HINT.is_match(&plain) || SSN_HINT.is_match(&split) || SSN_HINT_COMPACT.is_match(&compact)
+    };
+    let number_row = |t: &str| {
+        let t = t.trim();
+        let groups = t.split(' ').count();
+        groups >= 6 && t.chars().all(|c| c.is_ascii_digit() || c == ' ') && !t.contains("  ") && SSN.find_iter(t).count() == 1
+    };
     // Three or more block lines in a row are key material whether or not a header is in view.
     let mut i = 0;
     while i < lines.len() {
@@ -623,6 +657,9 @@ pub fn scan(lines: &[TextLine]) -> Vec<Hit> {
             }
         }
         scan_text(&l.text, i, &mut hits);
+        if !ssn_named && number_row(t) {
+            hits.retain(|h| !(h.line == i && h.why == "ssn"));
+        }
 
         if PASS_LABEL.is_match(t) {
             for j in neighbours(lines, i) {
@@ -1480,5 +1517,32 @@ mod tests {
                    vec![line("thequickbrownfoxjumpsoverthelazydogthequickbrownfox", 0.1, 0.1), line("thequickbrownfoxjumpsoverthelazydogthequickbrownfox", 0.1, 0.2), line("thequickbrownfoxjumpsoverthelazydogthequickbrownfox", 0.1, 0.3)]] {
             assert!(hidden(&ok).is_empty(), "{:?}", ok[0].text);
         }
+    }
+
+    #[test]
+    fn a_row_of_numbers_is_not_a_social_security_number() {
+        let ssn = |l: &[TextLine]| scan(l).iter().filter(|h| h.why == "ssn").count();
+        let one = |t: &str| ssn(&[line(t, 0.1, 0.1)]);
+        // Seen live: a misread line of digit groups frosted part of a terminal.
+        for t in ["0000 57 50 4005 50 123 45 6789", "12 40 123 45 6789 22 10 7"] {
+            assert_eq!(one(t), 0, "{t}");
+            // Ordinary words around it don't count as naming one (the live screen said "Still waiting on CI").
+            assert_eq!(ssn(&[line("Still waiting on CI for main, writing the listing", 0.1, 0.1), line(t, 0.1, 0.2)]), 0, "{t}");
+        }
+        // Anything short of a long bare row is still hidden.
+        for t in ["219 09 9999", "1 219 09 9999", "1042 219 09 9999 52000", "call me, 219 09 9999 is it", "219-09-9999 22 10 4 5 6", "0000 57 219.09.9999 4 5 6",
+                  "12 40 219 09 9999 22  10 7", "id 12 40 219 09 9999 22 10 7", "219 09 9999 123 45 6789"] {
+            assert!(one(t) >= 1, "{t}");
+        }
+        // And so is a long row when anything on the screen names it: a column header, or the window's title.
+        let row = "12 40 219 09 9999 22 10 7";
+        assert!(ssn(&[line("Dept  Code  SSN  Grade", 0.1, 0.1), line(row, 0.1, 0.2)]) >= 1);
+        assert!(ssn(&[line(row, 0.1, 0.2), line("ok", 0.1, 0.3), line("Payroll: social security export", -10.0, -10.0)]) >= 1);
+        for header in ["employee_ssn", "SSNs", "SocialSecurityNumber", "SS# list", "TaxpayerId", "soc sec", "TaxPayer ID", "sSN", "SSNField", "socialsecuritynumber", "Tax ID", "S.S.N.", "S S N", "ITINs", "TINs", "Taxpayer's ID", "EMPLOYEEITIN"] {
+            assert!(ssn(&[line(header, 0.1, 0.1), line(row, 0.1, 0.2)]) >= 1, "{header}");
+        }
+        assert!(ssn(&[line("Social", 0.1, 0.1), line("Security", 0.1, 0.15), line(row, 0.1, 0.2)]) >= 1);
+        // A single piece of text on its own (a title, a caption) is never given the benefit of the doubt.
+        assert!(!masked(row).contains("9999"));
     }
 }

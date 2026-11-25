@@ -1369,6 +1369,9 @@ mod tests {
                     }
                     let (code, body) = if h.starts_with("get /api/v1/models") {
                         (200, r#"{"models":[{"key":"m","loaded_instances":[{}],"type":"llm"},{"key":"model-a","loaded_instances":[{}],"type":"embedding"},{"key":"model-b","loaded_instances":[{}],"type":"embedding"}]}"#.to_owned())
+                    } else if h.starts_with("get /v1/models") {
+                        // What can be asked right now. "old-name" is loaded but no longer in the library listing.
+                        (200, r#"{"data":[{"id":"m"},{"id":"old-name"}]}"#.to_owned())
                     } else if h.starts_with("post /v1/embeddings") {
                         // A different direction for each model, so their vectors can be told apart.
                         let body = String::from_utf8_lossy(&buf[head..]).into_owned();
@@ -1891,5 +1894,24 @@ mod tests {
         });
         assert!(rx.recv_timeout(Duration::from_secs(20)).is_ok(), "deadlocked");
         e.shutdown();
+    }
+
+    #[test]
+    fn a_model_lm_studio_still_serves_is_used_even_when_its_library_entry_was_renamed() {
+        // Seen live: LM Studio re-listed a model under a new key while the old one stayed loaded. Every picture was
+        // then refused as "isn't installed".
+        const NONE: &str = r#"{"findings":[]}"#;
+        for (model, saved) in [("old-name", true), ("never-heard-of-it", false)] {
+            let d = tempfile::tempdir().unwrap();
+            let c = Config { lm_url: fake_lm(NONE, 200), model: model.into(), ..config(true) };
+            let e = Engine::new(d.path().to_string_lossy().into(), c, Arc::new(FakeHost(Default::default()))).unwrap();
+            e.ingest(frame(1000));
+            wait(|| e.stats().unwrap().count == 1 || e.status().discarded == 1);
+            assert_eq!(e.stats().unwrap().count == 1, saved, "{model}: {}", e.status().discard_reason);
+            if !saved {
+                assert!(e.status().discard_reason.contains("Settings"), "{}", e.status().discard_reason);
+            }
+            e.shutdown();
+        }
     }
 }
