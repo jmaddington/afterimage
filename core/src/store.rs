@@ -70,6 +70,10 @@ pub struct Moment {
     #[serde(default)]
     #[uniffi(default = false)]
     pub window_front: bool,
+    /// Seconds since a key or the pointer was last touched when this was taken. 0 on pictures from before it was kept.
+    #[serde(default)]
+    #[uniffi(default = 0)]
+    pub idle_secs: u32,
 }
 
 impl Moment {
@@ -104,6 +108,9 @@ pub struct Shot {
     /// The fuller account kept beside the description, when both were asked for. Empty otherwise.
     #[uniffi(default = "")]
     pub detail: String,
+    /// The model that wrote the fuller account in the idle pass. Empty: there was none, or the describing model wrote it.
+    #[uniffi(default = "")]
+    pub detail_model: String,
 }
 
 #[derive(Debug, Clone, Default, uniffi::Record)]
@@ -168,10 +175,10 @@ pub struct Store {
     pub root: PathBuf,
 }
 
-const COLS: &str = "s.id,s.moment,s.path,s.thumb,s.width,s.height,s.bytes,s.regions,s.description,s.tags,s.kept,s.indexed,s.ai_checked,s.check_model,s.describe_model,s.detail";
+const COLS: &str = "s.id,s.moment,s.path,s.thumb,s.width,s.height,s.bytes,s.regions,s.description,s.tags,s.kept,s.indexed,s.ai_checked,s.check_model,s.describe_model,s.detail,s.detail_model";
 
 // AIDEV-NOTE: where a column selected right after COLS lands; keep in step with COLS.
-const LINES_COL: usize = 16;
+const LINES_COL: usize = 17;
 
 fn row_to_shot(root: &Path, r: &Row) -> Res<Shot> {
     let js = |i: usize| -> Res<String> { r.get(i) };
@@ -193,6 +200,7 @@ fn row_to_shot(root: &Path, r: &Row) -> Res<Shot> {
         check_model: r.get::<_, Option<String>>(13)?.unwrap_or_default(),
         describe_model: r.get::<_, Option<String>>(14)?.unwrap_or_default(),
         detail: r.get::<_, Option<String>>(15)?.unwrap_or_default(),
+        detail_model: r.get::<_, Option<String>>(16)?.unwrap_or_default(),
     })
 }
 
@@ -268,7 +276,8 @@ impl Store {
         }
         // AIDEV-NOTE: added in 0.1.6: which model checked each picture and which described it. NULL on older rows.
         // AIDEV-NOTE: `detail` added in 0.1.10: the fuller account beside the description. NULL on older rows.
-        for col in ["check_model", "describe_model", "detail"] {
+        // AIDEV-NOTE: `deep` (0.1.12): the idle pass. NULL/0 not yet, 1 done, 2 given up. `detail_model`: who wrote it.
+        for col in ["check_model", "describe_model", "detail", "detail_model", "deep"] {
             let has: bool = db.query_row("SELECT COUNT(*) FROM pragma_table_info('shots') WHERE name=?", [col], |r| r.get::<_, i64>(0))? > 0;
             if !has {
                 db.execute_batch(&format!("ALTER TABLE shots ADD COLUMN {col} TEXT;"))?;
@@ -317,6 +326,33 @@ impl Store {
     pub fn keep_brief(&mut self, id: i64, description: &str, tags: &[String]) -> Res<()> {
         self.db.execute("UPDATE shots SET description=?,tags=? WHERE id=? AND indexed=0", params![description, serde_json::to_string(tags).unwrap_or_default(), id])?;
         Ok(())
+    }
+
+    /// The newest described picture the idle pass hasn't been over: (shot, text body).
+    pub fn next_shallow(&self) -> Res<Option<(Shot, String)>> {
+        self.db
+            .query_row(&format!("SELECT {COLS},s.lines FROM shots s WHERE indexed=1 AND COALESCE(deep,0)=0 ORDER BY taken_at DESC LIMIT 1"), [], |r| {
+                let lines: Vec<IndexedLine> = serde_json::from_str(&r.get::<_, String>(LINES_COL)?).unwrap_or_default();
+                Ok((row_to_shot(&self.root, r)?, lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n")))
+            })
+            .optional()
+    }
+
+    /// The idle pass is done with a picture: its fuller account and who wrote it. `None`: it couldn't, and won't try again.
+    pub fn finish_deep(&mut self, id: i64, detail: Option<(&str, &str)>) -> Res<()> {
+        let tx = self.db.transaction()?;
+        match detail {
+            Some((text, by)) => {
+                tx.execute("UPDATE shots SET detail=?,detail_model=?,deep=1 WHERE id=?", params![text, by, id])?;
+                let (d, tags): (String, String) = tx.query_row("SELECT description,tags FROM shots WHERE id=?", [id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                let tags: Vec<String> = serde_json::from_str(&tags).unwrap_or_default();
+                tx.execute("UPDATE fts SET description=? WHERE rowid=?", params![format!("{d} {text} {}", tags.join(" ")), id])?;
+            }
+            None => {
+                tx.execute("UPDATE shots SET deep=2 WHERE id=?", [id])?;
+            }
+        }
+        tx.commit()
     }
 
     /// `detail`: the fuller account kept beside the description, or empty. Searched with it.

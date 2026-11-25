@@ -35,6 +35,7 @@ import Observation
     private var capturing = false
     private var ready = false
     private var lastWindowPoll = Date.distantPast
+    private var lastIdleCheck = Date.distantPast
 
     public init(settings: AppSettings, engine: Engine) {
         self.settings = settings
@@ -131,6 +132,12 @@ import Observation
     }
 
     private func tick() {
+        // Whatever else is going on (locked, paused, off): the slow pass hears whether anyone is here.
+        if Date().timeIntervalSince(lastIdleCheck) >= 5 {
+            lastIdleCheck = Date()
+            engine.setIdle(idle: AppSettings.leftAlone(idleSeconds: Session.idleSeconds, minutes: settings.idleMinutes, enabled: settings.idlePass))
+            engine.setConditions(onPower: Session.onPower, calm: Session.calm)
+        }
         let s = current()
         if s != state {
             // What happened before a pause isn't a reason to look after it.

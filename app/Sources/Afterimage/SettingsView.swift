@@ -206,6 +206,23 @@ private struct IntelligenceSettings: View {
                 Text("Descriptions and search by meaning are made after secrets are hidden. The model is released after five idle minutes.").foregroundStyle(.secondary)
             }
             Section {
+                Toggle("Second pass when idle", isOn: $settings.idlePass).disabled(settings.describe == "never")
+                if settings.idlePass {
+                    LabeledContent("Model") { ModelPicker(models: models, vision: true, selection: $settings.idleModel).labelsHidden() }
+                    Picker("Thinking", selection: $settings.idleReasoning) {
+                        Text("As little as the model allows").tag("off")
+                        Text("Low").tag("low")
+                        Text("Medium").tag("medium")
+                        Text("High").tag("high")
+                    }
+                    Stepper("After \(settings.idleMinutes) minute\(settings.idleMinutes == 1 ? "" : "s") away", value: $settings.idleMinutes, in: 1...60)
+                }
+            } header: {
+                Text("🧪 Labs")
+            } footer: {
+                Text("Experiments that may change or go. Second pass: while nobody is at the Mac and it is plugged in, a second model, which can be bigger and slower, writes a fuller account of each saved picture, newest first. It stops when you come back.").foregroundStyle(.secondary)
+            }
+            Section {
                 Toggle("Developer mode", isOn: $settings.developer)
                 Button("Show Log") { openWindow(id: "devlog") }
                 if settings.developer {

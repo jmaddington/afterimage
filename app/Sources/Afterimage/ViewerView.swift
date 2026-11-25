@@ -165,7 +165,7 @@ struct Details: View {
                         Text(shot.description).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
                     }
                     if !shot.detail.isEmpty {
-                        DisclosureGroup("In full") {
+                        DisclosureGroup(shot.detailModel.isEmpty ? "In full" : "In full, by \(shot.detailModel)") {
                             Text(shot.detail).textSelection(.enabled).fixedSize(horizontal: false, vertical: true).frame(maxWidth: .infinity, alignment: .leading)
                         }
                     }
@@ -176,6 +176,7 @@ struct Details: View {
             Section {
                 row("When", shot.date.formatted(date: .abbreviated, time: .standard))
                 row("Why", Words.trigger(shot.moment.trigger))
+                if let away = Words.away(shot.moment.idleSecs) { row("Idle", away) }
                 row("App", shot.moment.appName)
                 if !shot.moment.windowTitle.isEmpty { row("Window", shot.moment.windowTitle) }
                 if !shot.moment.url.isEmpty { row("Page", shot.moment.url) }

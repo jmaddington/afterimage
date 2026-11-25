@@ -15,6 +15,9 @@ public enum Session {
     public static var idleSeconds: Double {
         CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: CGEventType(rawValue: ~0)!)
     }
+    /// Whole seconds since the last key or pointer event, for a picture's record.
+    public static var idleWhole: UInt32 { whole(idleSeconds) }
+    static func whole(_ seconds: Double) -> UInt32 { seconds.isFinite ? UInt32(min(max(seconds, 0), 4_000_000_000)) : 0 }
     public static var onPower: Bool {
         guard let s = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
               let t = IOPSGetProvidingPowerSourceType(s)?.takeUnretainedValue() as String? else { return true }

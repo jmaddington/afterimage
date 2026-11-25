@@ -68,6 +68,14 @@ import Testing
         s.customEdge = 2000
         let c = s.config
         #expect(c.detail == .custom && !c.customLong && c.customTokens == 1500 && c.customChars == 6000 && c.customEdge == 2000)
+        // Labs: the second pass has a model only while it is switched on.
+        s.idleModel = "big"
+        #expect(s.config.idleModel == "")
+        s.idlePass = true
+        #expect(s.config.idleModel == "big" && s.config.idleReasoning == "off")
+        #expect(!AppSettings.leftAlone(idleSeconds: 179, minutes: 3, enabled: true) && AppSettings.leftAlone(idleSeconds: 180, minutes: 3, enabled: true))
+        #expect(!AppSettings.leftAlone(idleSeconds: 9999, minutes: 3, enabled: false) && AppSettings.leftAlone(idleSeconds: 60, minutes: 0, enabled: true))
+        #expect(Session.whole(125.9) == 125 && Session.whole(-3) == 0 && Session.whole(.infinity) == 0 && Session.whole(.nan) == 0)
         // Thinking is the same kind of choice.
         #expect(c.reasoning == "off")
         s.reasoning = "medium"

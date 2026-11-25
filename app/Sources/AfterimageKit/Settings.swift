@@ -59,6 +59,12 @@ import Observation
     public var customEdge: Int { didSet { save("customEdge", customEdge) } }
     /// How much the model thinks before it answers: "off", "low", "medium" or "high". Only honoured in developer mode.
     public var reasoning: String { didSet { save("reasoning", reasoning) } }
+    /// Labs: a second, slower pass over saved pictures while nobody is at the Mac.
+    public var idlePass: Bool { didSet { save("idlePass", idlePass) } }
+    public var idleModel: String { didSet { save("idleModel", idleModel) } }
+    public var idleReasoning: String { didSet { save("idleReasoning", idleReasoning) } }
+    /// Minutes without a key or the pointer before the Mac counts as left alone.
+    public var idleMinutes: Int { didSet { save("idleMinutes", idleMinutes) } }
     public var onboarded: Bool { didSet { save("onboarded", onboarded) } }
     public var recording: Bool { didSet { save("recording", recording) } }
 
@@ -98,6 +104,10 @@ import Observation
         customChars = get("customChars", 8000)
         customEdge = get("customEdge", 1600)
         reasoning = get("reasoning", "off")
+        idlePass = get("idlePass", false)
+        idleModel = get("idleModel", "")
+        idleReasoning = get("idleReasoning", "off")
+        idleMinutes = get("idleMinutes", 3)
         onboarded = get("onboarded", false)
         recording = get("recording", true)
     }
@@ -178,12 +188,17 @@ import Observation
         default: .brief
         }
     }
+    /// Whether the Mac has been left alone long enough for the slow pass.
+    public nonisolated static func leftAlone(idleSeconds: Double, minutes: Int, enabled: Bool) -> Bool {
+        enabled && idleSeconds >= Double(max(1, minutes)) * 60
+    }
     public var config: Config {
         Config(lmUrl: Self.lmURL(host: lmHost, port: port), model: model, embedModel: embedModel, requireAi: requireAI,
                describe: describe == "always" ? .always : describe == "never" ? .never : .pluggedIn,
                maxAgeDays: UInt32(max(0, keepDays)), maxBytes: UInt64(max(0, keepGB)) * 1_000_000_000, unloadAfterSecs: 300, developer: developer,
                detail: Self.detail(describeDetail, developer: developer), customLong: customLong,
                customTokens: UInt32(clamping: customTokens), customChars: UInt32(clamping: customChars), customEdge: UInt32(clamping: customEdge),
-               reasoning: developer ? reasoning : "off")
+               reasoning: developer ? reasoning : "off",
+               idleModel: idlePass && describe != "never" ? idleModel : "", idleReasoning: idleReasoning)
     }
 }

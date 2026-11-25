@@ -254,7 +254,7 @@ public actor Capturer {
                 let m = Moment(
                     takenAt: Int64(a.at.timeIntervalSince1970 * 1000), trigger: trigger.rawValue, display: await Self.name(a.display.displayID),
                     appName: front.1, bundleId: front.2, windowTitle: ours ? "" : frontWindow?.title ?? "", url: ours ? "" : hiddenAfter.focusedURL[front.0] ?? "",
-                    userName: Session.consoleUser, fullName: NSFullUserName(), host: Session.computerName, sessions: Session.loggedIn, runningApps: apps)
+                    userName: Session.consoleUser, fullName: NSFullUserName(), host: Session.computerName, sessions: Session.loggedIn, runningApps: apps, idleSecs: Session.idleWhole)
                 engine.ingest(frame: Frame(rgba: b.data, width: UInt32(b.width), height: UInt32(b.height), stride: UInt32(b.stride), lines: perDisplay[i], moment: m, displayKey: key,
                                            covers: Self.onDisplay(before.covers.filter { !leftOut.contains($0.key) }.values.flatMap { $0 }, a.display.frame), context: everything))
                 queued += 1
@@ -284,7 +284,7 @@ public actor Capturer {
                 takenAt: Int64(s.at.timeIntervalSince1970 * 1000), trigger: trigger.rawValue, display: await Self.name(display ?? CGMainDisplayID()),
                 appName: planned.names[w.pid] ?? "", bundleId: owner.bundleId, windowTitle: w.title, url: url,
                 userName: Session.consoleUser, fullName: NSFullUserName(), host: Session.computerName, sessions: Session.loggedIn, runningApps: apps,
-                windowKey: WindowShots.key(session: session, id: w.id), windowFront: s.choice.front)
+                windowKey: WindowShots.key(session: session, id: w.id), windowFront: s.choice.front, idleSecs: Session.idleWhole)
             engine.ingest(frame: Frame(rgba: b.data, width: UInt32(b.width), height: UInt32(b.height), stride: UInt32(b.stride), lines: lines, moment: m, displayKey: key, covers: covers, context: around))
             queued += 1
             return true
@@ -430,7 +430,7 @@ public actor Capturer {
                 appName: front.1, bundleId: front.2,
                 // Afterimage's own title can hold what was being searched for; the picture doesn't show its window anyway.
                 windowTitle: ours ? "" : frontWindow?.title ?? "", url: ours ? "" : hiddenAfter.focusedURL[front.0] ?? "",
-                userName: Session.consoleUser, fullName: NSFullUserName(), host: Session.computerName, sessions: Session.loggedIn, runningApps: apps)
+                userName: Session.consoleUser, fullName: NSFullUserName(), host: Session.computerName, sessions: Session.loggedIn, runningApps: apps, idleSecs: Session.idleWhole)
             engine.ingest(frame: Frame(rgba: b.data, width: UInt32(b.width), height: UInt32(b.height), stride: UInt32(b.stride), lines: lines, moment: m, displayKey: key, covers: Self.onDisplay(before.covers.filter { !omitted.contains($0.key) }.values.flatMap { $0 }, d.frame)))
             queued += 1
         }
