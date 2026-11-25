@@ -132,6 +132,8 @@ private struct PrivacySettings: View {
 }
 
 private struct IntelligenceSettings: View {
+    /// What is being typed into Computer. It becomes the setting only when committed.
+    @State private var hostDraft = ""
     @Environment(AppModel.self) private var model
     @Environment(AppSettings.self) private var settings
     @Environment(\.openWindow) private var openWindow
@@ -151,11 +153,21 @@ private struct IntelligenceSettings: View {
                     LabeledContent("Linked machines", value: d.joined(separator: ", "))
                 }
                 ModelPicker(models: models, vision: true, selection: $settings.model)
-                LabeledContent("Computer") { TextField("This Mac", text: $settings.lmHost).labelsHidden().frame(width: 200).autocorrectionDisabled() }
+                // AIDEV-NOTE: privacy-critical. Typed into a draft and used only once committed: a half-typed address is
+                // AIDEV-NOTE: a different machine, and screen text must never be sent to it.
+                LabeledContent("Computer") {
+                    HStack {
+                        TextField("This Mac", text: $hostDraft).labelsHidden().frame(width: 200).autocorrectionDisabled()
+                            .onSubmit { settings.lmHost = hostDraft.trimmingCharacters(in: .whitespacesAndNewlines) }
+                        if hostDraft.trimmingCharacters(in: .whitespacesAndNewlines) != settings.lmHost {
+                            Button("Use") { settings.lmHost = hostDraft.trimmingCharacters(in: .whitespacesAndNewlines) }
+                        }
+                    }
+                }
                 LabeledContent("Port") { TextField("Port", value: $settings.port, format: .number.grouping(.never)).labelsHidden().frame(width: 80) }
             } footer: {
                 if settings.modelIsElsewhere {
-                    Text("LM Studio on another computer: the text on your screen is sent to it over your network before anything is hidden, without encryption unless the network provides it (Tailscale does). Only addresses on your own network are accepted, never a public one.").foregroundStyle(.orange)
+                    Text("LM Studio on another computer: the text on your screen is sent to it before anything is hidden, along with saved pictures (for descriptions), their text and titles, and what you search for. Nothing checks that the computer at that address is yours, and nothing is encrypted unless the network encrypts it. Only private addresses are accepted, but on a network you don’t control someone else’s machine can have one. A Tailscale address is the safe choice.").foregroundStyle(.orange)
                 } else {
                     Text(model.status?.linkedDevices.isEmpty == false
                          ? "LM Link may run the model on one of your linked machines. Leave Computer empty to use LM Studio on this Mac."
@@ -229,6 +241,7 @@ private struct IntelligenceSettings: View {
         .onChange(of: settings.model) { Task { await model.probe() } }
         .onChange(of: settings.port) { Task { await model.probe() } }
         .onChange(of: settings.lmHost) { Task { await model.probe() } }
+        .onAppear { hostDraft = settings.lmHost }
     }
 }
 

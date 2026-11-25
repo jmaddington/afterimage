@@ -68,6 +68,11 @@ fn pin(base: &str, lookup: impl Fn(&str) -> Vec<std::net::IpAddr>) -> Result<Str
     if u.scheme() != "http" || !u.username().is_empty() || u.password().is_some() {
         return Err(LmError::NotOwnNetwork);
     }
+    // An address must be spelled in full, in plain decimal: "10.1" and "0x7f.1" are read as other machines.
+    let typed = base.split("://").nth(1).unwrap_or("").split(['/', ':', '?', '#']).next().unwrap_or("");
+    if matches!(u.host(), Some(url::Host::Ipv4(_))) && typed.parse::<std::net::Ipv4Addr>().is_err() {
+        return Err(LmError::NotOwnNetwork);
+    }
     let addr: std::net::IpAddr = match u.host() {
         Some(url::Host::Ipv4(a)) => a.into(),
         Some(url::Host::Ipv6(a)) => a.into(),
@@ -443,7 +448,9 @@ mod tests {
         }
         // Anywhere a stranger could be listening: never.
         for bad in ["http://8.8.8.8:1234", "http://172.32.0.1:1234", "http://100.128.0.1:1234", "http://[2001:4860::1]:1234", "https://api.example.com", "https://10.0.0.4:1234",
-            "http://localhost.evil.com", "http://127.0.0.1@evil.com", "http://10.0.0.4@8.8.8.8", "http://0.0.0.0:1234", "http://255.255.255.255", "http://224.0.0.1", "file:///x", "x", ""] {
+            "http://localhost.evil.com", "http://127.0.0.1@evil.com", "http://10.0.0.4@8.8.8.8", "http://0.0.0.0:1234", "http://255.255.255.255", "http://224.0.0.1", "file:///x", "x", "",
+            // Short and odd spellings of an address name a different machine than they seem to.
+            "http://10.1:1234", "http://192.168.1:1234", "http://2130706433", "http://0x7f.1", "http://010.0.0.4:1234"] {
             assert!(check_host(bad).is_err(), "{bad}");
         }
         assert!(is_this_mac("http://localhost:1234") && is_this_mac("http://[::1]:1") && !is_this_mac("http://10.0.0.4:1234") && !is_this_mac("nonsense"));
