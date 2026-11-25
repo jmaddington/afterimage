@@ -1419,7 +1419,8 @@ fn describe_one(s: &Shared) -> Result<bool, String> {
 // AIDEV-NOTE: way to a picture waiting to be checked, and its words pass hide_known before disk and the dev log.
 fn deepen_one(s: &Shared) -> Result<bool, String> {
     let c = lock(&s.config).clone();
-    if c.idle_model.is_empty() {
+    // "Never describe" means no model writes about a picture, in any pass.
+    if c.idle_model.is_empty() || c.describe == DescribeWhen::Never {
         return Ok(false);
     }
     let away = s.idle.load(SeqCst) && s.on_power.load(SeqCst) && s.calm.load(SeqCst);
@@ -1451,13 +1452,32 @@ fn deepen_one(s: &Shared) -> Result<bool, String> {
     let how = lm::Detail::DETAILED;
     s.ensure(&l, &c.idle_model, how.context()).map_err(|e| e.to_string())?;
     // Gives way to a picture waiting to be checked, and to the person coming back.
-    let stop = || s.busy.load(SeqCst) || !lock(&s.queue).frames.is_empty() || !s.idle.load(SeqCst);
+    // And to being switched off part-way.
+    let still_wanted = || {
+        let now = lock(&s.config);
+        now.idle_model == c.idle_model && now.describe != DescribeWhen::Never
+    };
+    let stop = || s.busy.load(SeqCst) || !lock(&s.queue).frames.is_empty() || !s.idle.load(SeqCst) || !still_wanted();
     let answer = s.host.model_image(shot.path.clone(), how.picture_edge).map_err(|e| lm::LmError::Model(e.to_string()))
         .and_then(|img| l.describe(&c.idle_model, &img, &shot.moment.app_name, &shot.moment.window_title, &body, how, &stop));
     *lock(&s.last_lm_use) = Instant::now();
     match answer {
         Ok((text, _)) => {
+            // AIDEV-NOTE: privacy-critical. An old picture's secrets are no longer remembered, and a long account says
+            // AIDEV-NOTE: more of the screen than anything before it. So its words get a secret check of their own, by
+            // AIDEV-NOTE: the model, and are kept only if that check could run.
             let text = hide_known(&known(s), &text);
+            let lines: Vec<&str> = text.split('\n').collect();
+            let numbered: Vec<(usize, &str)> = lines.iter().enumerate().filter(|(_, t)| !t.trim().is_empty()).map(|(i, t)| (i, *t)).collect();
+            let found = match l.find_secrets(&c.idle_model, &numbered) {
+                Ok(f) => f.into_iter().map(|(_, value, _)| value).filter(|v| v.trim().chars().count() >= 4).collect::<Vec<String>>(),
+                Err(e @ lm::LmError::Offline) => return Err(e.to_string()),
+                Err(e) => return lock(&s.store).finish_deep(shot.id, None).map(|_| true).map_err(|x| format!("{e}; {x}")),
+            };
+            let text = hide_known(&found, &text);
+            if !still_wanted() {
+                return Ok(false);
+            }
             lock(&s.store).finish_deep(shot.id, Some((&text, &c.idle_model))).map(|_| true).map_err(|e| e.to_string())
         }
         Err(lm::LmError::Yielded) => {
@@ -2550,6 +2570,39 @@ mod tests {
         assert_eq!(e.search(Filter { text: "full".into(), ..Default::default() }, false, 5).unwrap().len(), 1);
         assert!(lock(&e.s.store).next_shallow().unwrap().is_none());
         e.shutdown();
+    }
+
+    #[test]
+    fn the_second_pass_checks_its_own_words_and_never_runs_when_describing_is_off() {
+        // The model, asked about secrets, names a word that is in the fuller account it then writes.
+        let said = r#"{"findings":[{"line":0,"value":"otters","kind":"password"}],"description":"a page about otters","tags":[]}"#;
+        let run = |then: DescribeWhen| {
+            let d = tempfile::tempdir().unwrap();
+            let never = then == DescribeWhen::Never;
+            let c = Config { lm_url: fake_lm(said, 200), describe: DescribeWhen::Always, idle_model: "m".into(), ..config(false) };
+            let e = Engine::new(d.path().to_string_lossy().into(), c.clone(), Arc::new(FakeHost(Default::default()))).unwrap();
+            let mut f = frame(1000);
+            f.lines.truncate(1);
+            f.moment.window_title = "t".into();
+            f.moment.url.clear();
+            e.ingest(f);
+            wait(|| e.stats().unwrap().count == 1 && e.stats().unwrap().pending == 0);
+            // Described; then describing is switched off (or not) before the Mac is left alone.
+            e.set_config(Config { describe: then, ..c });
+            e.set_idle(true);
+            let shot = || e.list(Filter::default(), 5, 0).unwrap().remove(0);
+            if never {
+                std::thread::sleep(Duration::from_millis(2500));
+            } else {
+                wait(|| !shot().detail.is_empty());
+            }
+            let s = shot();
+            e.shutdown();
+            s.detail
+        };
+        assert_eq!(run(DescribeWhen::Never), "");
+        let detail = run(DescribeWhen::Always);
+        assert!(detail.starts_with("In full") && !detail.contains("otters") && detail.contains("a page about [hidden]"), "{detail}");
     }
 
     #[test]

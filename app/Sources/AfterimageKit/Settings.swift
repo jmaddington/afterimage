@@ -199,6 +199,6 @@ import Observation
                detail: Self.detail(describeDetail, developer: developer), customLong: customLong,
                customTokens: UInt32(clamping: customTokens), customChars: UInt32(clamping: customChars), customEdge: UInt32(clamping: customEdge),
                reasoning: developer ? reasoning : "off",
-               idleModel: idlePass ? idleModel : "", idleReasoning: idleReasoning)
+               idleModel: idlePass && describe != "never" ? idleModel : "", idleReasoning: idleReasoning)
     }
 }

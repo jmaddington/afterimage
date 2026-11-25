@@ -206,7 +206,7 @@ private struct IntelligenceSettings: View {
                 Text("Descriptions and search by meaning are made after secrets are hidden. The model is released after five idle minutes.").foregroundStyle(.secondary)
             }
             Section {
-                Toggle("Second pass when idle", isOn: $settings.idlePass)
+                Toggle("Second pass when idle", isOn: $settings.idlePass).disabled(settings.describe == "never")
                 if settings.idlePass {
                     LabeledContent("Model") { ModelPicker(models: models, vision: true, selection: $settings.idleModel).labelsHidden() }
                     Picker("Thinking", selection: $settings.idleReasoning) {
