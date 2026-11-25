@@ -78,6 +78,12 @@ pub struct Shot {
     pub indexed: bool,
     /// Whether the language model checked this shot, or only the built-in rules did.
     pub ai_checked: bool,
+    /// The model that checked this picture for secrets. Empty when only the rules did, or it was saved before this was kept.
+    #[uniffi(default = "")]
+    pub check_model: String,
+    /// The model that wrote the description. Empty when there is none yet, or it was written before this was kept.
+    #[uniffi(default = "")]
+    pub describe_model: String,
 }
 
 #[derive(Debug, Clone, Default, uniffi::Record)]
@@ -123,6 +129,8 @@ pub struct NewShot {
     pub regions: Vec<Region>,
     pub lines: Vec<IndexedLine>,
     pub ai_checked: bool,
+    /// The model that checked it, or empty.
+    pub check_model: String,
 }
 
 /// A question as a vector, with the model that made it and how to read its scores.
@@ -140,7 +148,10 @@ pub struct Store {
     pub root: PathBuf,
 }
 
-const COLS: &str = "s.id,s.moment,s.path,s.thumb,s.width,s.height,s.bytes,s.regions,s.description,s.tags,s.kept,s.indexed,s.ai_checked";
+const COLS: &str = "s.id,s.moment,s.path,s.thumb,s.width,s.height,s.bytes,s.regions,s.description,s.tags,s.kept,s.indexed,s.ai_checked,s.check_model,s.describe_model";
+
+// AIDEV-NOTE: where a column selected right after COLS lands; keep in step with COLS.
+const LINES_COL: usize = 15;
 
 fn row_to_shot(root: &Path, r: &Row) -> Res<Shot> {
     let js = |i: usize| -> Res<String> { r.get(i) };
@@ -159,6 +170,8 @@ fn row_to_shot(root: &Path, r: &Row) -> Res<Shot> {
         kept: r.get(10)?,
         indexed: r.get::<_, i64>(11)? == 1,
         ai_checked: r.get(12)?,
+        check_model: r.get::<_, Option<String>>(13)?.unwrap_or_default(),
+        describe_model: r.get::<_, Option<String>>(14)?.unwrap_or_default(),
     })
 }
 
@@ -232,6 +245,13 @@ impl Store {
         if !has {
             db.execute_batch("ALTER TABLE shots ADD COLUMN embed_model TEXT;")?;
         }
+        // AIDEV-NOTE: added in 0.1.6: which model checked each picture and which described it. NULL on older rows.
+        for col in ["check_model", "describe_model"] {
+            let has: bool = db.query_row("SELECT COUNT(*) FROM pragma_table_info('shots') WHERE name=?", [col], |r| r.get::<_, i64>(0))? > 0;
+            if !has {
+                db.execute_batch(&format!("ALTER TABLE shots ADD COLUMN {col} TEXT;"))?;
+            }
+        }
         let _ = std::fs::set_permissions(root.join("index.sqlite"), std::fs::Permissions::from_mode(0o600));
         Ok(Self { db, root: root.to_owned() })
     }
@@ -240,9 +260,9 @@ impl Store {
         let j = |v: &dyn erased::Ser| v.json();
         let tx = self.db.transaction()?;
         tx.execute(
-            "INSERT INTO shots(taken_at,bundle_id,app_name,moment,path,thumb,width,height,bytes,regions,hidden,lines,ai_checked) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO shots(taken_at,bundle_id,app_name,moment,path,thumb,width,height,bytes,regions,hidden,lines,ai_checked,check_model) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![n.moment.taken_at, n.moment.bundle_id, n.moment.app_name, j(&n.moment), n.path, n.thumb_path, n.width, n.height,
-                    n.bytes as i64, j(&n.regions), n.regions.len() as i64, j(&n.lines), n.ai_checked],
+                    n.bytes as i64, j(&n.regions), n.regions.len() as i64, j(&n.lines), n.ai_checked, n.check_model],
         )?;
         let id = tx.last_insert_rowid();
         let body = n.lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
@@ -256,7 +276,7 @@ impl Store {
     pub fn next_pending(&self) -> Res<Option<(Shot, String)>> {
         self.db
             .query_row(&format!("SELECT {COLS}, s.lines FROM shots s WHERE indexed=0 AND attempts<3 ORDER BY id DESC LIMIT 1"), [], |r| {
-                let lines: Vec<IndexedLine> = serde_json::from_str(&r.get::<_, String>(13)?).unwrap_or_default();
+                let lines: Vec<IndexedLine> = serde_json::from_str(&r.get::<_, String>(LINES_COL)?).unwrap_or_default();
                 Ok((row_to_shot(&self.root, r)?, lines.into_iter().map(|l| l.text).collect::<Vec<_>>().join("\n")))
             })
             .optional()
@@ -270,11 +290,11 @@ impl Store {
         emb.map(|e| e.iter().map(|x| (x * 127.0).round().clamp(-127.0, 127.0) as i8 as u8).collect())
     }
 
-    /// `model`: the embedding model that made `emb`, or that was tried.
-    pub fn finish_index(&mut self, id: i64, description: &str, tags: &[String], emb: Option<&[f32]>, model: &str) -> Res<bool> {
+    /// `model`: the embedding model that made `emb`, or that was tried. `by`: the model that wrote the description.
+    pub fn finish_index(&mut self, id: i64, description: &str, tags: &[String], emb: Option<&[f32]>, model: &str, by: &str) -> Res<bool> {
         let tx = self.db.transaction()?;
-        let n = tx.execute("UPDATE shots SET description=?,tags=?,embedding=?,embed_model=?,indexed=1 WHERE id=?",
-            params![description, serde_json::to_string(tags).unwrap_or_default(), Self::blob(emb), model, id])?;
+        let n = tx.execute("UPDATE shots SET description=?,tags=?,embedding=?,embed_model=?,describe_model=?,indexed=1 WHERE id=?",
+            params![description, serde_json::to_string(tags).unwrap_or_default(), Self::blob(emb), model, by, id])?;
         if n == 1 {
             tx.execute("UPDATE fts SET description=? WHERE rowid=?", params![format!("{description} {}", tags.join(" ")), id])?;
         }
@@ -288,7 +308,7 @@ impl Store {
     pub fn next_stale(&self, model: &str) -> Res<Option<(Shot, String)>> {
         self.db
             .query_row(&format!("SELECT {COLS}, s.lines FROM shots s WHERE {} ORDER BY id DESC LIMIT 1", Self::STALE), [crate::lm::FIRST_EMBED_MODEL, model], |r| {
-                let lines: Vec<IndexedLine> = serde_json::from_str(&r.get::<_, String>(13)?).unwrap_or_default();
+                let lines: Vec<IndexedLine> = serde_json::from_str(&r.get::<_, String>(LINES_COL)?).unwrap_or_default();
                 Ok((row_to_shot(&self.root, r)?, lines.into_iter().map(|l| l.text).collect::<Vec<_>>().join("\n")))
             })
             .optional()
@@ -599,8 +619,32 @@ mod tests {
         NewShot {
             moment: Moment { taken_at: at, app_name: "Safari".into(), bundle_id: "com.apple.Safari".into(), window_title: "Plan".into(), ..Default::default() },
             path: p, thumb_path: t, width: 10, height: 10, bytes, regions: vec![],
-            lines: vec![IndexedLine { text: body.into(), rect: Rect { x: 0.0, y: 0.0, w: 1.0, h: 1.0 } }], ai_checked: true,
+            lines: vec![IndexedLine { text: body.into(), rect: Rect { x: 0.0, y: 0.0, w: 1.0, h: 1.0 } }], ai_checked: true, check_model: "checker".into(),
         }
+    }
+
+    #[test]
+    fn a_picture_remembers_which_models_worked_on_it() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = Store::open(d.path()).unwrap();
+        let id = s.insert(&shot(d.path(), 1, "words", 5)).unwrap();
+        let got = s.get(id).unwrap().unwrap();
+        assert_eq!((got.check_model.as_str(), got.describe_model.as_str()), ("checker", ""));
+        s.finish_index(id, "A bill", &[], None, "m", "viewer").unwrap();
+        assert_eq!(s.get(id).unwrap().unwrap().describe_model, "viewer");
+    }
+
+    /// A library made before the models were recorded opens, and its pictures say nothing rather than guess.
+    #[test]
+    fn an_older_library_gains_the_model_columns() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = Store::open(d.path()).unwrap();
+        let id = s.insert(&shot(d.path(), 1, "words", 5)).unwrap();
+        s.db.execute_batch("ALTER TABLE shots DROP COLUMN check_model; ALTER TABLE shots DROP COLUMN describe_model;").unwrap();
+        drop(s);
+        let s = Store::open(d.path()).unwrap();
+        let got = s.get(id).unwrap().unwrap();
+        assert_eq!((got.check_model.as_str(), got.describe_model.as_str()), ("", ""));
     }
 
     #[test]
@@ -611,11 +655,11 @@ mod tests {
         s.insert(&shot(d.path(), 2, "other words", 5)).unwrap();
         let q = |s: &Store, t: &str| s.search(&Filter { text: t.into(), ..Default::default() }, None, 10).unwrap().len();
         assert_eq!((q(&s, "zebraq"), q(&s, "\"invoice zebraquartz\""), q(&s, "plan -zebraquartz")), (1, 0, 1));
-        assert!(s.finish_index(id, "A purplewalrus bill", &["bills".into()], Some(&[1.0, 0.0]), "m").unwrap());
+        assert!(s.finish_index(id, "A purplewalrus bill", &["bills".into()], Some(&[1.0, 0.0]), "m", "viewer").unwrap());
         assert_eq!((q(&s, "purplewalrus"), q(&s, "zebraquartz"), q(&s, "safari")), (1, 1, 2));
         assert_eq!(s.delete(&[id]).unwrap(), (1, 0));
         assert_eq!(q(&s, "zebraquartz"), 0);
-        assert!(!s.finish_index(id, "ghostcaption", &[], None, "m").unwrap());
+        assert!(!s.finish_index(id, "ghostcaption", &[], None, "m", "viewer").unwrap());
         assert!(!d.path().join("Shots/1.heic").exists());
         drop(s);
         for f in ["index.sqlite", "index.sqlite-wal"] {
@@ -656,15 +700,16 @@ mod tests {
         let mut s = Store::open(d.path()).unwrap();
         let a = s.insert(&shot(d.path(), 1, "x", 1)).unwrap();
         let b = s.insert(&shot(d.path(), 2, "y", 1)).unwrap();
-        s.finish_index(a, "", &[], Some(&[1.0, 0.0]), "m").unwrap();
-        s.finish_index(b, "", &[], Some(&[0.0, 1.0]), "m").unwrap();
+        s.finish_index(a, "", &[], Some(&[1.0, 0.0]), "m", "viewer").unwrap();
+        s.finish_index(b, "", &[], Some(&[0.0, 1.0]), "m", "viewer").unwrap();
         let near = |model: &'static str| Near { vector: &[1.0, 0.0], model, floor: 0.58, band: 0.09 };
         let r = s.search(&Filter { text: "nomatch".into(), ..Default::default() }, Some(&near("m")), 10).unwrap();
         // A question put by another model finds nothing: its numbers mean something else.
         assert!(s.search(&Filter { text: "nomatch".into(), ..Default::default() }, Some(&near("other")), 10).unwrap().is_empty());
         // Until the pictures are remade for it, one at a time.
         assert_eq!(s.stale_count("other").unwrap(), 2);
-        let (stale, _) = s.next_stale("other").unwrap().unwrap();
+        let (stale, body) = s.next_stale("other").unwrap().unwrap();
+        assert!(!body.is_empty(), "the text goes with it, for the new vector");
         s.set_embedding(stale.id, Some(&[1.0, 0.0]), "other").unwrap();
         s.set_embedding(s.next_stale("other").unwrap().unwrap().0.id, None, "other").unwrap();
         assert_eq!((s.stale_count("other").unwrap(), s.stale_count("m").unwrap()), (0, 2));
@@ -679,7 +724,7 @@ mod tests {
     fn the_developer_log_goes_when_its_picture_does() {
         let d = tempfile::tempdir().unwrap();
         let mut s = Store::open(d.path()).unwrap();
-        let mk = |s: &mut Store, at: i64| s.insert(&NewShot { moment: Moment { taken_at: at, ..Default::default() }, path: format!("Shots/{at}"), thumb_path: format!("Shots/{at}t"), width: 1, height: 1, bytes: 1, regions: vec![], lines: vec![], ai_checked: true }).unwrap();
+        let mk = |s: &mut Store, at: i64| s.insert(&NewShot { moment: Moment { taken_at: at, ..Default::default() }, path: format!("Shots/{at}"), thumb_path: format!("Shots/{at}t"), width: 1, height: 1, bytes: 1, regions: vec![], lines: vec![], ai_checked: true, check_model: String::new() }).unwrap();
         let (a, b) = (mk(&mut s, 100), mk(&mut s, 200));
         let e = |shot, at| DevEntry { shot_id: shot, at, kind: "check".into(), request: format!("zebra{at}"), ..Default::default() };
         for (shot, at) in [(Some(a), 150), (Some(b), 250), (None, 300)] {
@@ -720,7 +765,7 @@ mod tests {
     fn kept_pictures_over_the_limit_do_not_cost_every_new_one() {
         let d = tempfile::tempdir().unwrap();
         let mut s = Store::open(d.path()).unwrap();
-        let mut mk = |at: i64, bytes: u64| s.insert(&NewShot { moment: Moment { taken_at: at, ..Default::default() }, path: format!("Shots/{at}"), thumb_path: format!("Shots/{at}t"), width: 1, height: 1, bytes, regions: vec![], lines: vec![], ai_checked: true }).unwrap();
+        let mut mk = |at: i64, bytes: u64| s.insert(&NewShot { moment: Moment { taken_at: at, ..Default::default() }, path: format!("Shots/{at}"), thumb_path: format!("Shots/{at}t"), width: 1, height: 1, bytes, regions: vec![], lines: vec![], ai_checked: true, check_model: String::new() }).unwrap();
         let (a, b, c, e) = (mk(1, 100), mk(2, 100), mk(3, 10), mk(4, 60));
         s.set_kept(&[a, b], true).unwrap();
         // Kept ones are outside the budget: only what can be removed is counted against it.

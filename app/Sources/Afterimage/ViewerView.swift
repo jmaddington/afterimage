@@ -165,6 +165,7 @@ struct Details: View {
                         Text(shot.description).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
                     }
                     if !shot.tags.isEmpty { Text(shot.tags.joined(separator: " · ")).font(.callout).foregroundStyle(.secondary) }
+                    if !shot.describeModel.isEmpty { Text("Described by \(shot.describeModel)").font(.caption).foregroundStyle(.tertiary).textSelection(.enabled) }
                 }
             }
             Section {
@@ -188,6 +189,7 @@ struct Details: View {
                     }
                 }
                 LabeledContent("Checked by", value: shot.aiChecked ? "Local model and rules" : "Rules only")
+                if !shot.checkModel.isEmpty { row("Model", shot.checkModel) }
             }
             Section("Signed In") {
                 row("User", shot.moment.fullName.isEmpty ? shot.moment.userName : "\(shot.moment.fullName) (\(shot.moment.userName))")
