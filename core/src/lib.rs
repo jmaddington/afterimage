@@ -263,7 +263,15 @@ impl Engine {
     pub fn set_config(&self, config: Config) {
         // AIDEV-NOTE: lock order is store, then config. Held together so no entry can slip in between "off" and the clear.
         let store = lock(&self.s.store);
-        *lock(&self.s.config) = config.clone();
+        let changed = {
+            let mut c = lock(&self.s.config);
+            let changed = c.model != config.model || c.lm_url != config.lm_url;
+            *c = config.clone();
+            changed
+        };
+        if changed {
+            lock(&self.s.clean).clear();
+        }
         if !config.developer {
             if let Err(e) = store.dev_clear() {
                 log::error!("the developer log couldn't be cleared: {e} [AIMG-DEVCLEAR]");
@@ -1361,6 +1369,22 @@ mod tests {
         std::thread::sleep(Duration::from_secs(5));
         assert_eq!(e.stats().unwrap().count, 0);
         assert!(std::fs::read_dir(d.path().join("Shots")).unwrap().flatten().all(|x| std::fs::read_dir(x.path()).unwrap().count() == 0));
+        e.shutdown();
+    }
+
+    /// "This line is clean" was one model's opinion on one machine. Another model, or another machine, starts afresh.
+    #[test]
+    fn a_change_of_model_or_server_forgets_what_was_called_clean() {
+        let d = tempfile::tempdir().unwrap();
+        let e = Engine::new(d.path().to_string_lossy().into(), config(false), Arc::new(FakeHost(Default::default()))).unwrap();
+        lock(&e.s.clean).insert(7);
+        e.set_config(Config { max_age_days: 3, ..config(false) });
+        assert!(lock(&e.s.clean).contains(&7), "an unrelated setting leaves it");
+        e.set_config(Config { model: "other".into(), ..config(false) });
+        assert!(lock(&e.s.clean).is_empty());
+        lock(&e.s.clean).insert(7);
+        e.set_config(Config { model: "other".into(), lm_url: "http://10.0.0.4:1234".into(), ..config(false) });
+        assert!(lock(&e.s.clean).is_empty());
         e.shutdown();
     }
 

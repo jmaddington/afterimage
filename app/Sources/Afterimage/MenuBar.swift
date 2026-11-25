@@ -20,6 +20,7 @@ struct MenuBarContent: View {
         SettingsLink { Text("Settings…") }
         Divider()
         Text(Words.version)
+        Button("Check for Updates…") { Words.checkForUpdates() }
         Button("See Releases…") { NSWorkspace.shared.open(Words.releases) }
         Divider()
         Button("Quit Afterimage") { NSApp.terminate(nil) }

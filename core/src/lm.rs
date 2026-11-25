@@ -8,8 +8,8 @@ use std::time::Duration;
 pub enum LmError {
     #[error("LM Studio isn't running")]
     Offline,
-    #[error("The address must be on this Mac")]
-    NotLoopback,
+    #[error("The address must be this Mac or a machine on your own network")]
+    NotOwnNetwork,
     #[error("Model unavailable: {0}")]
     Model(String),
     #[error("Unusable answer: {0}")]
@@ -38,22 +38,75 @@ pub struct Lm {
     pub tape: Option<Tape>,
 }
 
-/// AIDEV-NOTE: privacy-critical. Only literal loopback; no proxies, no redirects (a redirect could leave the Mac).
-pub fn check_loopback(base: &str) -> Result<String, LmError> {
-    let u = url::Url::parse(base).map_err(|_| LmError::NotLoopback)?;
-    let ok = match u.host() {
+/// Addresses that can only be this Mac or a machine on the person's own network: loopback, the private and
+/// link-local ranges, and 100.64/10 (what Tailscale and other overlay networks hand out).
+fn own_network(a: &std::net::IpAddr) -> bool {
+    match a {
+        std::net::IpAddr::V4(a) => {
+            let o = a.octets();
+            a.is_loopback() || a.is_private() || a.is_link_local() || (o[0] == 100 && (64..128).contains(&o[1]))
+        }
+        std::net::IpAddr::V6(a) => {
+            let s = a.segments()[0];
+            a.is_loopback() || (s & 0xfe00) == 0xfc00 || (s & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// AIDEV-NOTE: privacy-critical. What is sent to the model is screen text before hiding. It may go to this Mac or to
+/// AIDEV-NOTE: an address on the person's own network, never a public one; no proxies, no redirects, plain addresses
+/// AIDEV-NOTE: only. A name is looked up once here and the answer is what gets called, so it can't change afterwards.
+pub fn check_host(base: &str) -> Result<String, LmError> {
+    pin(base, |name| {
+        use std::net::ToSocketAddrs;
+        (name, 0).to_socket_addrs().map(|a| a.map(|s| s.ip()).collect()).unwrap_or_default()
+    })
+}
+
+fn pin(base: &str, lookup: impl Fn(&str) -> Vec<std::net::IpAddr>) -> Result<String, LmError> {
+    let u = url::Url::parse(base).map_err(|_| LmError::NotOwnNetwork)?;
+    if u.scheme() != "http" || !u.username().is_empty() || u.password().is_some() {
+        return Err(LmError::NotOwnNetwork);
+    }
+    // An address must be spelled in full, in plain decimal: "10.1" and "0x7f.1" are read as other machines.
+    let typed = base.split("://").nth(1).unwrap_or("").split(['/', ':', '?', '#']).next().unwrap_or("");
+    if matches!(u.host(), Some(url::Host::Ipv4(_))) && typed.parse::<std::net::Ipv4Addr>().is_err() {
+        return Err(LmError::NotOwnNetwork);
+    }
+    let addr: std::net::IpAddr = match u.host() {
+        Some(url::Host::Ipv4(a)) => a.into(),
+        Some(url::Host::Ipv6(a)) => a.into(),
+        // Pinned rather than resolved through hosts/DNS.
+        Some(url::Host::Domain("localhost")) => std::net::Ipv4Addr::LOCALHOST.into(),
+        Some(url::Host::Domain(d)) => {
+            let all = lookup(d);
+            // Every address the name has must be the person's own: one public answer and the name isn't trusted.
+            if all.is_empty() || !all.iter().all(own_network) {
+                return Err(LmError::NotOwnNetwork);
+            }
+            all[0]
+        }
+        None => return Err(LmError::NotOwnNetwork),
+    };
+    if !own_network(&addr) {
+        return Err(LmError::NotOwnNetwork);
+    }
+    let port = u.port().unwrap_or(1234);
+    Ok(match addr {
+        std::net::IpAddr::V4(a) => format!("http://{a}:{port}"),
+        std::net::IpAddr::V6(a) => format!("http://[{a}]:{port}"),
+    })
+}
+
+/// Whether this address is this Mac itself. Elsewhere, what the model is sent crosses the network.
+#[uniffi::export]
+pub fn is_this_mac(base: &str) -> bool {
+    url::Url::parse(base).ok().is_some_and(|u| match u.host() {
         Some(url::Host::Ipv4(a)) => a.is_loopback(),
         Some(url::Host::Ipv6(a)) => a.is_loopback(),
         Some(url::Host::Domain(d)) => d == "localhost",
         None => false,
-    };
-    if !ok || u.scheme() != "http" {
-        return Err(LmError::NotLoopback);
-    }
-    let port = u.port().unwrap_or(1234);
-    // Pin to an address rather than resolving "localhost" through hosts/DNS.
-    let host = if matches!(u.host(), Some(url::Host::Ipv6(_))) { "[::1]" } else { "127.0.0.1" };
-    Ok(format!("http://{host}:{port}"))
+    })
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -68,7 +121,7 @@ pub struct ModelInfo {
 
 impl Lm {
     pub fn new(base: &str) -> Result<Self, LmError> {
-        let base = check_loopback(base)?;
+        let base = check_host(base)?;
         let agent = ureq::Agent::config_builder()
             .proxy(None)
             .max_redirects(0)
@@ -386,13 +439,31 @@ mod tests {
     use crate::detect::Rect;
 
     #[test]
-    fn loopback_only() {
-        for ok in ["http://localhost:1234", "http://127.0.0.1:99/v1", "http://[::1]:1234"] {
-            assert!(check_loopback(ok).is_ok(), "{ok}");
+    fn this_mac_or_the_persons_own_network_only() {
+        for (given, pinned) in [("http://localhost:1234", "http://127.0.0.1:1234"), ("http://127.0.0.1:99/v1", "http://127.0.0.1:99"), ("http://[::1]:1234", "http://[::1]:1234"),
+            // Another machine of theirs: home and office ranges, link-local, and the range Tailscale uses.
+            ("http://10.0.0.4:1234", "http://10.0.0.4:1234"), ("http://192.168.1.20", "http://192.168.1.20:1234"), ("http://172.16.5.5:8080", "http://172.16.5.5:8080"),
+            ("http://169.254.10.2:1234", "http://169.254.10.2:1234"), ("http://100.72.164.86:1234", "http://100.72.164.86:1234"), ("http://[fd12:3456::1]:1234", "http://[fd12:3456::1]:1234")] {
+            assert_eq!(check_host(given).ok().as_deref(), Some(pinned), "{given}");
         }
-        for bad in ["http://10.0.0.4:1234", "https://api.example.com", "http://localhost.evil.com", "http://127.0.0.1@evil.com", "file:///x", "x"] {
-            assert!(check_loopback(bad).is_err(), "{bad}");
+        // Anywhere a stranger could be listening: never.
+        for bad in ["http://8.8.8.8:1234", "http://172.32.0.1:1234", "http://100.128.0.1:1234", "http://[2001:4860::1]:1234", "https://api.example.com", "https://10.0.0.4:1234",
+            "http://localhost.evil.com", "http://127.0.0.1@evil.com", "http://10.0.0.4@8.8.8.8", "http://0.0.0.0:1234", "http://255.255.255.255", "http://224.0.0.1", "file:///x", "x", "",
+            // Short and odd spellings of an address name a different machine than they seem to.
+            "http://10.1:1234", "http://192.168.1:1234", "http://2130706433", "http://0x7f.1", "http://010.0.0.4:1234"] {
+            assert!(check_host(bad).is_err(), "{bad}");
         }
+        assert!(is_this_mac("http://localhost:1234") && is_this_mac("http://[::1]:1") && !is_this_mac("http://10.0.0.4:1234") && !is_this_mac("nonsense"));
+    }
+
+    /// A name is looked up once and the answer is what gets called: every address it has must be the person's own.
+    #[test]
+    fn a_name_counts_only_if_everything_it_resolves_to_is_private() {
+        let lookup = |addrs: &[&str]| { let v: Vec<std::net::IpAddr> = addrs.iter().map(|a| a.parse().unwrap()).collect(); move |_: &str| v.clone() };
+        assert_eq!(pin("http://studio.local:1234", lookup(&["192.168.1.20"])).ok().as_deref(), Some("http://192.168.1.20:1234"));
+        assert!(pin("http://studio.example.com:1234", lookup(&["192.168.1.20", "8.8.8.8"])).is_err());
+        assert!(pin("http://studio.example.com:1234", lookup(&["8.8.8.8"])).is_err());
+        assert!(pin("http://nothing.local:1234", lookup(&[])).is_err());
     }
 
     #[test]
