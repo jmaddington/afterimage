@@ -1,13 +1,18 @@
 // Developer tool.  seed <dir> [fixtures]: fill a demo library from synthetic pictures.  ocr <png>: show what OCR reads.
+// compare <dir> [pictures]: describe the same pictures with each model in AFTERIMAGE_MODELS and score them (Compare.swift).
 import AfterimageEngine
 import AfterimageKit
 import Foundation
 
 let args = CommandLine.arguments
-guard args.count >= 3 else { print("usage: afterimage-checks seed <dir> [fixtures] | ocr <png>"); exit(2) }
+guard args.count >= 3 else { print("usage: afterimage-checks seed <dir> [fixtures] | ocr <png> | compare <dir> [pictures]"); exit(2) }
 if args[1] == "ocr" {
     guard let i = Pixels.load(args[2]) else { print("can't read \(args[2])"); exit(1) }
     for l in try Recognizer.lines(in: i) { print(String(format: "%.3f %.3f  ", l.rect.x, l.rect.y) + l.text) }
+    exit(0)
+}
+if args[1] == "compare" {
+    try compare(out: args[2], pictures: args.count > 3 ? args[3] : "fixtures", env: ProcessInfo.processInfo.environment)
     exit(0)
 }
 let fixtures = args.count > 3 ? args[3] : "fixtures"
