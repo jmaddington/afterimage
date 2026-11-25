@@ -200,10 +200,10 @@ struct Shared {
     // AIDEV-NOTE: lock order is now_doing, then store, then cleared. `forgotten` is never held while taking another.
     now_doing: Mutex<Option<Doing>>,
     /// Secrets found in windows photographed on their own, newest last, so the next window hides them too.
-    // AIDEV-NOTE: RAM only, bounded, emptied by forget/delete. Taken alone, never with another lock held.
+    // AIDEV-NOTE: RAM only, bounded, only ever adds hiding, so nothing empties it. Taken alone, never with another lock.
     recent_secrets: Mutex<VecDeque<String>>,
-    /// Apps that became off-limits: (bundle id, the last frame number that had arrived by then).
-    dropped: Mutex<Vec<(String, u64)>>,
+    /// Apps that became off-limits: (bundle id, the last frame number that had arrived by then, when it was asked).
+    dropped: Mutex<Vec<(String, u64, i64)>>,
     /// Window key -> its title as a saved picture left it. In memory only.
     cleared: Mutex<HashMap<u64, String>>,
 }
@@ -491,7 +491,6 @@ impl Engine {
             lock(&self.s.cleared).clear();
             store.delete(&ids)?
         };
-        lock(&self.s.recent_secrets).clear();
         self.s.host.library_changed();
         if failed > 0 {
             return Err(EngineError::Failed(format!("{failed} files couldn't be removed. Afterimage will try again next time it opens.")));
@@ -548,7 +547,8 @@ impl Engine {
         let gone: Vec<String> = q.frames.iter().filter(|(_, f)| bundle_ids.contains(&f.moment.bundle_id)).map(|(_, f)| f.display_key.clone()).collect();
         q.frames.retain(|(_, f)| !bundle_ids.contains(&f.moment.bundle_id));
         let mut d = lock(&self.s.dropped);
-        d.extend(bundle_ids.into_iter().map(|b| (b, upto)));
+        let asked = now_ms();
+        d.extend(bundle_ids.into_iter().map(|b| (b, upto, asked)));
         let extra = d.len().saturating_sub(256);
         d.drain(..extra);
         drop(d);
@@ -873,7 +873,12 @@ impl Shared {
         // AIDEV-NOTE: privacy-critical. Nothing at or past `own` may reach the model, the index, the log or the disk.
         let own = all.len();
         let windowed = !f.moment.window_key.is_empty();
-        all.extend(std::mem::take(&mut f.context).into_iter().map(|l| TextLine { rect: nowhere, tokens: vec![], ..l }));
+        // Cloned, not taken: a second try must know what the first did. Moved far aside but otherwise as it lay,
+        // so rules that read layout work on it and it can't be mistaken for part of this picture.
+        all.extend(f.context.iter().cloned().map(|mut l| {
+            l.rect.x += 100.0;
+            l
+        }));
         let all = all;
         let mut hits = detect::scan(&all);
         hits.extend(covered(&f.lines, &f.covers));
@@ -893,6 +898,10 @@ impl Shared {
                     }
                 }
             }
+        }
+        if windowed {
+            // Before any way out: what was found counts for the other windows even if this picture isn't saved.
+            remember(&mut lock(&self.recent_secrets), &secret_values(&all, &hits));
         }
         let ai_checked = match checked {
             Ok(()) => true,
@@ -918,14 +927,7 @@ impl Shared {
 
         let values: Vec<String> = secret_values(&all, &hits);
         if windowed {
-            let mut r = lock(&self.recent_secrets);
-            for v in &values {
-                if !r.contains(v) {
-                    r.push_back(v.clone());
-                }
-            }
-            let extra = r.len().saturating_sub(RECENT_SECRETS);
-            r.drain(..extra);
+            remember(&mut lock(&self.recent_secrets), &values);
         }
         // Nothing of the other windows leaves this function.
         hits.retain(|h| h.line < own);
@@ -973,7 +975,8 @@ impl Shared {
             return Ok(None);
         }
         // Its app became off-limits while it waited.
-        if lock(&self.dropped).iter().any(|(b, upto)| *b == f.moment.bundle_id && arrived <= *upto) {
+        // AIDEV-NOTE: by number or by time, like forget: a picture taken before the request can arrive after it.
+        if lock(&self.dropped).iter().any(|(b, upto, asked)| *b == f.moment.bundle_id && (arrived <= *upto || at <= *asked)) {
             drop(store);
             remove();
             return Ok(None);
@@ -1049,6 +1052,25 @@ fn evict(frames: &mut VecDeque<(u64, Frame)>) -> Option<Frame> {
 }
 
 const RECENT_SECRETS: usize = 256;
+/// The most one picture may add, so a window full of look-alikes can't push out what the others taught.
+const RECENT_PER_FRAME: usize = 64;
+
+/// Newest last. One seen again becomes the newest.
+fn remember(r: &mut VecDeque<String>, values: &[String]) {
+    let mut added = 0;
+    for v in values {
+        if let Some(i) = r.iter().position(|x| x == v) {
+            r.remove(i);
+        } else if added >= RECENT_PER_FRAME {
+            continue;
+        } else {
+            added += 1;
+        }
+        r.push_back(v.clone());
+    }
+    let extra = r.len().saturating_sub(RECENT_SECRETS);
+    r.drain(..extra);
+}
 
 fn secret_values(lines: &[TextLine], hits: &[Hit]) -> Vec<String> {
     let mut v: Vec<String> = hits.iter().filter(|h| h.why != HINT).map(|h| lines[h.line].text[h.range.clone()].trim().to_owned()).filter(|v| v.chars().count() >= 6).collect();
@@ -1374,8 +1396,10 @@ mod tests {
     fn a_frame_being_checked_when_its_app_became_off_limits_is_not_saved() {
         let d = tempfile::tempdir().unwrap();
         let e = Engine::new(d.path().to_string_lossy().into(), config(false), Arc::new(FakeHost(Default::default()))).unwrap();
-        lock(&e.s.dropped).push(("com.chat".into(), 5));
+        lock(&e.s.dropped).push(("com.chat".into(), 5, 1500));
         e.s.process(&mut window(1000, "a", false, "com.chat"), 3, false).unwrap();
+        // Photographed before the app was put off-limits, handed over after: still not saved.
+        e.s.process(&mut window(1400, "a", false, "com.chat"), 9, false).unwrap();
         assert_eq!(e.stats().unwrap().count, 0);
         assert!(std::fs::read_dir(d.path().join("Shots")).unwrap().flatten().all(|x| std::fs::read_dir(x.path()).unwrap().count() == 0));
         // One that arrived after the app was allowed again is an ordinary picture.
@@ -1429,10 +1453,41 @@ mod tests {
         let all = e.list(Filter::default(), 10, 0).unwrap();
         let text: String = all.iter().map(|s| format!("{:?}", e.lines(s.id).unwrap())).collect();
         assert!(!text.contains("quartz-otter-9") && text.contains("written down"), "{text}");
-        // Forgetting forgets these too.
-        e.forget(0, i64::MAX / 2).unwrap();
-        assert!(lock(&e.s.recent_secrets).is_empty());
+        // Deleting pictures is no reason to hide less in the next one.
+        e.delete(all.iter().map(|s| s.id).collect()).unwrap();
+        assert!(lock(&e.s.recent_secrets).iter().any(|v| v == "quartz-otter-9"));
         e.shutdown();
+    }
+
+    /// The first try at checking fails and the picture is tried again: the second try knows no less than the first.
+    #[test]
+    fn what_else_was_on_screen_survives_a_retry() {
+        let d = tempfile::tempdir().unwrap();
+        let e = Engine::new(d.path().to_string_lossy().into(), config(true), Arc::new(FakeHost(Default::default()))).unwrap();
+        let mut f = window(1000, "editor", true, "com.editor");
+        f.lines[1].text = "Tr0ub4dor9x-zebra".into();
+        f.lines[2].text = "plain words".into();
+        f.context = vec![TextLine { text: "password: Tr0ub4dor9x-zebra".into(), rect: Rect { x: 0.1, y: 0.1, w: 0.5, h: 0.1 }, tokens: vec![], code: false }];
+        assert!(e.s.process(&mut f, 1, true).is_err());
+        // Refused for want of the model, yet what the rules found is already remembered for other windows.
+        assert!(lock(&e.s.recent_secrets).iter().any(|v| v == "Tr0ub4dor9x-zebra"));
+        lock(&e.s.recent_secrets).clear();
+        e.s.process(&mut f, 1, false).unwrap();
+        let s = e.list(Filter::default(), 10, 0).unwrap().remove(0);
+        assert!(!format!("{:?}", e.lines(s.id).unwrap()).contains("Tr0ub4dor9x"));
+        e.shutdown();
+    }
+
+    #[test]
+    fn remembered_secrets_stay_fresh_and_one_window_cannot_push_the_rest_out() {
+        let mut r: VecDeque<String> = (0..RECENT_SECRETS).map(|i| format!("old-{i}")).collect();
+        remember(&mut r, &["old-0".into()]);
+        // Seen again: it is the newest now, and the next to go is the one after it.
+        assert_eq!(r.back().map(String::as_str), Some("old-0"));
+        let flood: Vec<String> = (0..1000).map(|i| format!("new-{i}")).collect();
+        remember(&mut r, &flood);
+        assert_eq!(r.len(), RECENT_SECRETS);
+        assert!(r.iter().any(|v| v == "old-0") && r.iter().filter(|v| v.starts_with("new-")).count() == RECENT_PER_FRAME);
     }
 
     #[test]

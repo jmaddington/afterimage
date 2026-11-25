@@ -30,8 +30,32 @@ import Testing
     func w(_ id: CGWindowID, _ pid: pid_t, title: String = "Doc", layer: Int = 0, alpha: Double = 1, _ b: CGRect = CGRect(x: 10, y: 20, width: 900, height: 600)) -> OnScreenWindow {
         OnScreenWindow(id: id, pid: pid, title: title, layer: layer, bounds: b, alpha: alpha)
     }
-    func plan(front: pid_t, _ bundle: String, _ list: [OnScreenWindow], shareable: Set<CGWindowID>? = nil, hidden: Set<pid_t> = [1]) -> [WindowChoice] {
-        WindowShots.plan(ex, front: (front, bundle), list: list, owners: owners, shareable: shareable ?? Set(list.map(\.id)), hidden: hidden, own: me)
+    let laptop = CGRect(x: 0, y: 0, width: 1440, height: 900), monitor = CGRect(x: 1440, y: 0, width: 1920, height: 1080)
+    func plan(front: pid_t, _ bundle: String, _ list: [OnScreenWindow], shareable: Set<CGWindowID>? = nil, hidden: Set<pid_t> = [1], desktop: [CGRect]? = nil) -> [WindowChoice] {
+        WindowShots.plan(ex, front: (front, bundle), list: list, owners: owners, shareable: shareable ?? Set(list.map(\.id)), hidden: hidden, own: me, desktop: desktop ?? [laptop, monitor])
+    }
+
+    /// "Displays: the one in use" holds for windows too: one on another display, or parked off every display, is left alone.
+    @Test func onlyWindowsOnTheDisplaysBeingCapturedAreTaken() {
+        let list = [w(7, 10), w(8, 11, CGRect(x: 1600, y: 50, width: 900, height: 600)), w(9, 11, CGRect(x: -895, y: 20, width: 900, height: 600))]
+        #expect(taken(plan(front: 10, xcode, list)) == [7, 8])
+        #expect(taken(plan(front: 10, xcode, list, desktop: [laptop])) == [7])
+        #expect(plan(front: 10, xcode, list, desktop: [laptop]).map(\.skip) == [nil, .notShown, .notShown])
+    }
+
+    /// A window photographed while it was behind something is photographed again when the person goes to it,
+    /// changed or not: otherwise nothing would say they were ever in it.
+    @Test func aWindowComingToTheFrontGetsAPictureAsTheFrontWindow() {
+        let busy = Data((0..<64).map { UInt8($0 * 3) })
+        #expect(WindowShots.take(front: true, manual: false, print: busy, queued: 0, hadFront: false, isNew: { _ in false }) == .take)
+        #expect(WindowShots.take(front: true, manual: false, print: busy, queued: 0, hadFront: true, isNew: { _ in false }) == .unchanged)
+        #expect(WindowShots.take(front: false, manual: false, print: busy, queued: 0, hadFront: false, isNew: { _ in false }) == .unchanged)
+        // The thumbprint is recorded either way, exactly once.
+        var asked = 0
+        _ = WindowShots.take(front: true, manual: true, print: busy, queued: 0, hadFront: false) { _ in asked += 1; return true }
+        #expect(asked == 1)
+        // One look never fills the engine's queue of twelve by itself, twice over.
+        #expect(WindowShots.maxQueued * 2 <= 12)
     }
     func taken(_ p: [WindowChoice]) -> [UInt32] { p.filter { $0.skip == nil }.map(\.id) }
 
@@ -104,19 +128,19 @@ import Testing
         let busy = Data((0..<64).map { UInt8($0 * 3) }), flat = Data(repeating: 40, count: 64)
         var asked = 0
         func new(_ answer: Bool) -> (Data) -> Bool { { _ in asked += 1; return answer } }
-        #expect(WindowShots.take(front: true, manual: false, print: busy, queued: 0, isNew: new(true)) == .take)
-        #expect(WindowShots.take(front: false, manual: false, print: busy, queued: 3, isNew: new(true)) == .take)
+        #expect(WindowShots.take(front: true, manual: false, print: busy, queued: 0, hadFront: true, isNew: new(true)) == .take)
+        #expect(WindowShots.take(front: false, manual: false, print: busy, queued: 3, hadFront: true, isNew: new(true)) == .take)
         // A background window is its own picture only when it changed, even when asked for by hand.
-        #expect(WindowShots.take(front: false, manual: false, print: busy, queued: 0, isNew: new(false)) == .unchanged)
-        #expect(WindowShots.take(front: false, manual: true, print: busy, queued: 0, isNew: new(false)) == .unchanged)
-        #expect(WindowShots.take(front: true, manual: false, print: busy, queued: 0, isNew: new(false)) == .unchanged)
-        #expect(WindowShots.take(front: true, manual: true, print: busy, queued: 0, isNew: new(false)) == .take)
+        #expect(WindowShots.take(front: false, manual: false, print: busy, queued: 0, hadFront: true, isNew: new(false)) == .unchanged)
+        #expect(WindowShots.take(front: false, manual: true, print: busy, queued: 0, hadFront: true, isNew: new(false)) == .unchanged)
+        #expect(WindowShots.take(front: true, manual: false, print: busy, queued: 0, hadFront: true, isNew: new(false)) == .unchanged)
+        #expect(WindowShots.take(front: true, manual: true, print: busy, queued: 0, hadFront: true, isNew: new(false)) == .take)
         #expect(asked == 6)
         // A window that gave nothing isn't a picture, and isn't remembered as one.
-        #expect(WindowShots.take(front: true, manual: true, print: flat, queued: 0, isNew: new(true)) == .blank)
-        #expect(WindowShots.take(front: false, manual: false, print: Data(), queued: 0, isNew: new(true)) == .blank)
+        #expect(WindowShots.take(front: true, manual: true, print: flat, queued: 0, hadFront: true, isNew: new(true)) == .blank)
+        #expect(WindowShots.take(front: false, manual: false, print: Data(), queued: 0, hadFront: true, isNew: new(true)) == .blank)
         // The queue is never flooded, and what was left out is looked at afresh next time.
-        #expect(WindowShots.take(front: false, manual: false, print: busy, queued: WindowShots.maxQueued, isNew: new(true)) == .full)
+        #expect(WindowShots.take(front: false, manual: false, print: busy, queued: WindowShots.maxQueued, hadFront: true, isNew: new(true)) == .full)
         #expect(asked == 6)
         #expect(WindowShots.maxQueued < 12)
     }

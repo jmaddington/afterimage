@@ -39,6 +39,8 @@ pub struct WindowScene {
     pub front_window: Option<u32>,
     /// Apps the capture check found off-limits just now (excluded, a private window, an address it couldn't read).
     pub hidden: Vec<i32>,
+    /// The displays a picture may come from, in the same points as window bounds. A window must lie mostly on them.
+    pub desktop: Vec<Rect>,
 }
 
 /// Why a window isn't photographed.
@@ -54,7 +56,7 @@ pub enum WindowSkip {
     Unknown,
     /// A window of an app that shows pages, and it isn't the one in front.
     BackgroundPages,
-    /// Minimised, hidden, transparent or on another desktop.
+    /// Minimised, hidden, faint, on another desktop, or mostly off the displays being captured.
     NotShown,
     /// A menu, a panel or an overlay.
     NotAWindow,
@@ -87,6 +89,13 @@ pub fn plan_windows(ex: &Exclusions, scene: &WindowScene, windows: &[WindowSeen]
         .map(|w| {
             let front = w.pid == scene.front_pid && scene.front_window == Some(w.id);
             let sized = w.bounds.w.is_finite() && w.bounds.h.is_finite() && w.bounds.w > 160.0 && w.bounds.h > 160.0;
+            // AIDEV-NOTE: privacy-critical. "Listed as on screen" isn't "visible": tiling managers park windows past the edge.
+            let on: f64 = scene.desktop.iter().map(|d| {
+                let x = (w.bounds.x + w.bounds.w).min(d.x + d.w) - w.bounds.x.max(d.x);
+                let y = (w.bounds.y + w.bounds.h).min(d.y + d.h) - w.bounds.y.max(d.y);
+                if x > 0.0 && y > 0.0 { x * y } else { 0.0 }
+            }).sum();
+            let visible = sized && on >= 0.5 * w.bounds.w * w.bounds.h && w.alpha >= 0.5;
             let skip = if w.pid == scene.own_pid {
                 Some(WindowSkip::Ours)
             } else if scene.hidden.contains(&w.pid) || hide_app(ex, &w.bundle_id).is_some() {
@@ -103,6 +112,8 @@ pub fn plan_windows(ex: &Exclusions, scene: &WindowScene, windows: &[WindowSeen]
                 Some(WindowSkip::NotAWindow)
             } else if !sized {
                 Some(WindowSkip::TooSmall)
+            } else if !visible {
+                Some(WindowSkip::NotShown)
             } else if !front && !w.regular {
                 Some(WindowSkip::NotAnApp)
             } else if !front && background >= MAX_BACKGROUND {
@@ -151,8 +162,38 @@ mod tests {
         WindowSeen { id, pid, bundle_id: bundle.into(), regular: true, layer: 0, alpha: 1.0, on_screen: true, bounds: Rect { x: 10.0, y: 20.0, w: 900.0, h: 600.0 } }
     }
     fn scene(front_pid: i32, bundle: &str, window: Option<u32>) -> WindowScene {
-        WindowScene { own_pid: ME, front_pid, front_bundle_id: bundle.into(), front_window: window, hidden: vec![ME] }
+        WindowScene { own_pid: ME, front_pid, front_bundle_id: bundle.into(), front_window: window, hidden: vec![ME], desktop: vec![Rect { x: 0.0, y: 0.0, w: 1440.0, h: 900.0 }, Rect { x: 1440.0, y: 0.0, w: 1920.0, h: 1080.0 }] }
     }
+    /// Whole-display capture can only show what is on a display. A window parked past the edge, or all but
+    /// invisible, is something the person can't see and it never photographed.
+    #[test]
+    fn a_window_the_person_cannot_see_is_not_photographed() {
+        let s = scene(7, "com.editor", Some(1));
+        let at = |x: f64, y: f64| { let mut w = win(2, 8, "com.notes"); w.bounds = Rect { x, y, w: 900.0, h: 600.0 }; w };
+        let skip = |w: WindowSeen| plan_windows(&ex(), &s, &[win(1, 7, "com.editor"), w])[1].skip;
+        // A sliver left on the desktop, the rest parked off it.
+        assert_eq!(skip(at(-899.0, 20.0)), Some(WindowSkip::NotShown));
+        assert_eq!(skip(at(100.0, 890.0)), Some(WindowSkip::NotShown));
+        assert_eq!(skip(at(50_000.0, 50_000.0)), Some(WindowSkip::NotShown));
+        // Mostly on: taken. Straddling two displays counts both.
+        assert_eq!(skip(at(-300.0, 20.0)), None);
+        assert_eq!(skip(at(1000.0, 20.0)), None);
+        // Faint enough to be a trick rather than a window.
+        let mut faint = win(2, 8, "com.notes");
+        faint.alpha = 0.3;
+        assert_eq!(skip(faint), Some(WindowSkip::NotShown));
+        let mut sheer = win(2, 8, "com.notes");
+        sheer.alpha = 0.9;
+        assert_eq!(skip(sheer), None);
+        // The window in front is held to the same rule.
+        let mut f = win(1, 7, "com.editor");
+        f.bounds.x = -899.0;
+        assert_eq!(plan_windows(&ex(), &s, &[f])[0].skip, Some(WindowSkip::NotShown));
+        // Nothing known about the displays: nothing can be shown to be on one.
+        let blind = WindowScene { desktop: vec![], ..s.clone() };
+        assert_eq!(plan_windows(&ex(), &blind, &[win(1, 7, "com.editor")])[0].skip, Some(WindowSkip::NotShown));
+    }
+
     fn verdicts(s: &WindowScene, w: &[WindowSeen]) -> Vec<(u32, bool, Option<WindowSkip>)> {
         plan_windows(&ex(), s, w).into_iter().map(|c| (c.id, c.front, c.skip)).collect()
     }
@@ -301,6 +342,11 @@ mod tests {
         let mut moved = w.clone();
         moved[0].bounds.x += 40.0;
         assert_eq!(keep_windows(&before, &plan_windows(&ex(), &s, &moved)), vec![8]);
+        for change in [|r: &mut Rect| r.y += 40.0, |r: &mut Rect| r.w -= 40.0, |r: &mut Rect| r.h -= 40.0] {
+            let mut m = w.clone();
+            change(&mut m[0].bounds);
+            assert_eq!(keep_windows(&before, &plan_windows(&ex(), &s, &m)), vec![8]);
+        }
         let mut jitter = w.clone();
         jitter[0].bounds.x += 0.5;
         assert_eq!(keep_windows(&before, &plan_windows(&ex(), &s, &jitter)), vec![7, 8]);
