@@ -57,6 +57,7 @@ fn rank(level: &str) -> u32 {
 /// None: the model doesn't think, and nothing is said to it about thinking.
 // AIDEV-NOTE: models differ: off/on, low/medium/high, off/low/medium/on, or only on. Asking one for a level it lacks
 // AIDEV-NOTE: leaves it at its default, which is usually the most.
+#[uniffi::export(name = "thinking_level")]
 pub fn effort(wanted: &str, allowed: &[String]) -> Option<String> {
     let w = rank(wanted) as i64;
     allowed.iter().min_by_key(|a| ((rank(a) as i64 - w).abs(), rank(a))).cloned()

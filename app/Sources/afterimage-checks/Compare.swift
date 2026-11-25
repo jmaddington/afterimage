@@ -6,7 +6,7 @@ import Foundation
 
 struct Picture { let name: String, bitmap: Bitmap, lines: [TextLine], screen: String, facts: [String], secrets: [String] }
 struct Row: Codable { var model, variant, picture: String; var seconds: Double?; var text: String }
-struct Line { var label: String; var done = 0, of = 0; var seconds: [Double] = [], chars: [Double] = [], recall: [Double] = [], grounded: [Double] = [], words: [Double] = [], meaning: [Double] = []; var leaks = 0; var problem = "" }
+struct Line { var label: String; var done = 0, of = 0; var check: [Double] = []; var seconds: [Double] = [], chars: [Double] = [], recall: [Double] = [], grounded: [Double] = [], words: [Double] = [], meaning: [Double] = []; var leaks = 0; var problem = "" }
 
 func post(_ path: String, _ body: [String: Any], timeout: TimeInterval = 120) -> [String: Any]? {
     var r = URLRequest(url: URL(string: "http://127.0.0.1:1234\(path)")!, timeoutInterval: timeout)
@@ -52,9 +52,21 @@ func compare(out: String, pictures dir: String, env: [String: String]) throws {
     guard !shown.isEmpty else { print("no .png pictures in \(dir)"); exit(1) }
     setvbuf(stdout, nil, _IOLBF, 0)
     print("\(shown.count) pictures, \(listed.count) models, thinking: \(efforts.joined(separator: ", ")), detail: \(detail)")
-    var rows: [Row] = [], problems: [String: String] = [:]
+    var rows: [Row] = [], problems: [String: String] = [:], checkTimes: [String: [Double]] = [:]
+    // Each model gets the nearest level it allows, so two levels asked for can be one pass: off and low on a model
+    // with only off and on.
+    let known = ((try? Engine(root: "\(out)/.models", config: Config(lmUrl: "http://127.0.0.1:1234", model: "", embedModel: "", requireAi: false, describe: .never, maxAgeDays: 0, maxBytes: 0,
+        unloadAfterSecs: 0, detail: .brief, customLong: false, customTokens: 900, customChars: 4000, customEdge: 1280), host: ImageHost()).models()) ?? [])
     var passes: [(name: String, key: String, effort: String)] = []
-    for m in listed { for e in efforts { passes.append((efforts.count > 1 ? "\(m) @\(e)" : m, m, e)) } }
+    for m in listed {
+        let allowed = known.first { $0.key == m }?.reasoning ?? []
+        var done: Set<String> = []
+        for e in efforts {
+            let real = thinkingLevel(wanted: e, allowed: allowed) ?? "none"
+            guard done.insert(real).inserted else { continue }
+            passes.append((efforts.count > 1 ? "\(m) @\(real)" : m, m, e))
+        }
+    }
     let models = passes.map(\.name)
     for pass in passes {
         let model = pass.name
@@ -66,18 +78,22 @@ func compare(out: String, pictures dir: String, env: [String: String]) throws {
         defer { engine.shutdown() }
         let began = Date()
         var saved: UInt64 = 0
+        var checks: [Double] = []
         for (i, p) in shown.enumerated() {
             let m = Moment(takenAt: Int64(Date().timeIntervalSince1970 * 1000) + Int64(i), trigger: "manual", display: "Compare", appName: "", bundleId: "compare.test", windowTitle: p.name,
                            url: "", userName: "", fullName: "", host: "", sessions: [], runningApps: [])
             engine.ingest(frame: Frame(rgba: p.bitmap.data, width: UInt32(p.bitmap.width), height: UInt32(p.bitmap.height), stride: UInt32(p.bitmap.stride), lines: p.lines, moment: m, displayKey: "c\(i)"))
             saved += 1
+            let sent = Date()
             let give = Date().addingTimeInterval(perPicture)
             while try engine.stats().count < saved && engine.status().discarded == 0 && Date() < give { Thread.sleep(forTimeInterval: 0.1) }
             if try engine.stats().count < saved {
                 problems[model] = engine.status().discarded > 0 ? "couldn't check a picture: \(engine.status().discardReason)" : "the secret check took over \(Int(perPicture)) s"
                 break
             }
+            checks.append(Date().timeIntervalSince(sent))
         }
+        checkTimes[model] = checks
         if problems[model] != nil { print("\(model): \(problems[model]!)"); continue }
         // Every picture is saved; from here the model only describes, one picture after another.
         var seen: Set<Int64> = [], last = Date()
@@ -116,7 +132,7 @@ func compare(out: String, pictures dir: String, env: [String: String]) throws {
     var table: [Line] = []
     for model in models {
         for variant in variants {
-            var l = Line(label: variants.count > 1 ? "\(model) (\(variant))" : model, of: shown.count, problem: problems[model] ?? "")
+            var l = Line(label: variants.count > 1 ? "\(model) (\(variant))" : model, of: shown.count, check: checkTimes[model] ?? [], problem: problems[model] ?? "")
             for (i, r) in rows.enumerated() where r.model == model && r.variant == variant && !r.text.isEmpty {
                 guard let p = shown.first(where: { $0.name == r.picture }) else { continue }
                 l.done += 1
@@ -133,12 +149,13 @@ func compare(out: String, pictures dir: String, env: [String: String]) throws {
             table.append(l)
         }
     }
-    var report = "# Descriptions compared\n\n\(shown.count) pictures, detail: \(detail). Facts: share of listed facts mentioned. Grounded: share of the names and numbers a description gives that are on the screen. Agreement: with the other models on the same picture (shared words / shared meaning). Leaks: listed secrets repeated.\n\n"
-    report += "| Model | Described | Median s | Characters | Facts | Grounded | Agree (words) | Agree (meaning) | Leaks |\n|---|---|---|---|---|---|---|---|---|\n"
+    var report = "# Descriptions compared\n\n\(shown.count) pictures, detail: \(detail). Facts: share of listed facts mentioned. Grounded: share of the names and numbers a description gives that are on the screen. Agreement: with the other models on the same picture (shared words / shared meaning). Leaks: listed secrets repeated. Check s: median seconds to check a picture for secrets and save it (the first includes loading the model). Describe s: median seconds to describe one.\n\n"
+    report += "| Model | Described | Check s | Describe s | Characters | Facts | Grounded | Agree (words) | Agree (meaning) | Leaks |\n|---|---|---|---|---|---|---|---|---|---|\n"
     for l in table {
+        let check = DescriptionScores.median(l.check).map { String(format: "%.1f", $0) } ?? "-"
         let secs = DescriptionScores.median(l.seconds).map { String(format: "%.1f", $0) } ?? "-"
         let chars = DescriptionScores.median(l.chars).map { String(Int($0)) } ?? "-"
-        report += "| \(l.label) | \(l.done)/\(l.of)\(l.problem.isEmpty ? "" : " (\(l.problem))") | \(secs) | \(chars) | \(mean(l.recall)) | \(mean(l.grounded)) | \(mean(l.words)) | \(mean(l.meaning)) | \(l.leaks) |\n"
+        report += "| \(l.label) | \(l.done)/\(l.of)\(l.problem.isEmpty ? "" : " (\(l.problem))") | \(check) | \(secs) | \(chars) | \(mean(l.recall)) | \(mean(l.grounded)) | \(mean(l.words)) | \(mean(l.meaning)) | \(l.leaks) |\n"
     }
     let enc = JSONEncoder()
     enc.outputFormatting = [.prettyPrinted, .sortedKeys]
