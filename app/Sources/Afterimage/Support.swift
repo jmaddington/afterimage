@@ -59,6 +59,12 @@ enum Words {
         let sameYear = c.isDate(d, equalTo: Date(), toGranularity: .year)
         return d.formatted(sameYear ? .dateTime.weekday(.wide).month(.wide).day() : .dateTime.weekday(.wide).month(.wide).day().year())
     }
+    /// How long nobody had touched the Mac when a picture was taken; nothing under a minute.
+    static func away(_ seconds: UInt32) -> String? {
+        guard seconds >= 60 else { return nil }
+        let m = seconds / 60
+        return m < 60 ? "Nobody at the Mac for \(m) min" : "Nobody at the Mac for \(m / 60) h \(m % 60) min"
+    }
     /// What each choice of description costs and gives.
     static func describeDetail(_ choice: String) -> String {
         switch choice {

@@ -75,6 +75,7 @@ import Testing
         #expect(s.config.idleModel == "big" && s.config.idleReasoning == "off")
         #expect(!AppSettings.leftAlone(idleSeconds: 179, minutes: 3, enabled: true) && AppSettings.leftAlone(idleSeconds: 180, minutes: 3, enabled: true))
         #expect(!AppSettings.leftAlone(idleSeconds: 9999, minutes: 3, enabled: false) && AppSettings.leftAlone(idleSeconds: 60, minutes: 0, enabled: true))
+        #expect(Session.whole(125.9) == 125 && Session.whole(-3) == 0 && Session.whole(.infinity) == 0 && Session.whole(.nan) == 0)
         // Thinking is the same kind of choice.
         #expect(c.reasoning == "off")
         s.reasoning = "medium"

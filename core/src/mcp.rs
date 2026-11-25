@@ -434,6 +434,8 @@ fn get_shot(s: &Shared, a: &Value, off: i32) -> Result<Value, String> {
     if !shot.check_model.is_empty() { v["check_model"] = json!(shot.check_model); }
     if !shot.describe_model.is_empty() { v["describe_model"] = json!(shot.describe_model); }
     if !shot.detail.is_empty() { v["detail"] = json!(shot.detail); }
+    // Nobody had touched the Mac for a minute or more: what is shown may not be what anyone was doing.
+    if shot.moment.idle_secs >= 60 { v["idle_seconds"] = json!(shot.moment.idle_secs); }
     if !shot.detail_model.is_empty() { v["detail_model"] = json!(shot.detail_model); }
     v["kept"] = json!(shot.kept);
     v["signed_in"] = json!({"user": shot.moment.user_name, "name": shot.moment.full_name, "mac": shot.moment.host});

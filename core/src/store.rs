@@ -70,6 +70,10 @@ pub struct Moment {
     #[serde(default)]
     #[uniffi(default = false)]
     pub window_front: bool,
+    /// Seconds since a key or the pointer was last touched when this was taken. 0 on pictures from before it was kept.
+    #[serde(default)]
+    #[uniffi(default = 0)]
+    pub idle_secs: u32,
 }
 
 impl Moment {

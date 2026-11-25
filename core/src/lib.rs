@@ -1299,13 +1299,21 @@ fn index_loop(s: Arc<Shared>) {
 // AIDEV-NOTE: privacy-critical. The model sees the picture; a secret the hiding missed in pixels can come back as words.
 // AIDEV-NOTE: the same matcher as for titles and addresses (`detect::find_secret`), and the same for the developer log.
 fn hide_known(known: &[String], text: &str) -> String {
-    let lines: Vec<TextLine> = detect::mask_text(text)
-        .split('\n')
-        .map(|t| TextLine { text: t.to_owned(), rect: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }, tokens: vec![], code: false })
-        .collect();
+    // Row by row, so the rows that come out are the rows that went in: callers count on line numbers staying put.
+    let lines: Vec<TextLine> = text.split('\n').map(|t| as_line(detect::mask_text(t))).collect();
+    let found = places(known, &lines);
+    lines.iter().zip(&found).map(|(l, r)| detect::mask(&l.text, r)).collect::<Vec<_>>().join("\n")
+}
+
+fn as_line(text: String) -> TextLine {
+    TextLine { text, rect: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }, tokens: vec![], code: false }
+}
+
+/// Where known secrets sit in these rows, by the loose matcher and as written.
+fn places(known: &[String], lines: &[TextLine]) -> Vec<Vec<std::ops::Range<usize>>> {
     let mut found: Vec<Vec<std::ops::Range<usize>>> = vec![vec![]; lines.len()];
     for v in known {
-        for (line, range) in detect::find_secret(&lines, v) {
+        for (line, range) in detect::find_secret(lines, v) {
             found[line].push(range);
         }
         // As written, too, wherever it sits: the loose matcher has its own idea of where a value may start and end.
@@ -1318,7 +1326,7 @@ fn hide_known(known: &[String], text: &str) -> String {
             }
         }
     }
-    lines.iter().zip(&found).map(|(l, r)| detect::mask(&l.text, r)).collect::<Vec<_>>().join("\n")
+    found
 }
 
 /// The secrets lately found on screen, as they stand now.
@@ -1447,13 +1455,15 @@ fn deepen_one(s: &Shared) -> Result<bool, String> {
     l.effort = c.idle_reasoning.clone();
     // AIDEV-NOTE: privacy-critical. The developer log keeps the model's answer. Until the answer has had its secret check
     // AIDEV-NOTE: (`cleared` set, with what the check found), none of its words go into the log.
-    struct Log<'a>(&'a Shared, lm::Tape, i64, std::cell::RefCell<Option<(Vec<String>, std::collections::BTreeSet<usize>)>>);
+    // AIDEV-NOTE: once it has (`cleared`: the answer as it came, and as it was kept), the log gets the kept words
+    // AIDEV-NOTE: themselves, never a second cleaning of the raw ones. Tags from this pass are not kept anywhere.
+    struct Log<'a>(&'a Shared, lm::Tape, i64, std::cell::RefCell<Option<(String, String)>>);
     impl Drop for Log<'_> {
         fn drop(&mut self) {
-            let known = known(self.0);
             let cleared = self.3.borrow();
             self.0.note(devlog::about(take(&self.1), self.2, &|t| match &*cleared {
-                Some((found, whole)) => blank_lines(&hide_known(found, &hide_known(&known, t)), whole),
+                Some((raw, kept)) if t.trim() == raw => kept.clone(),
+                Some(_) => "[not kept]".to_owned(),
                 None => "[not kept: its secret check didn't finish]".to_owned(),
             }));
         }
@@ -1482,7 +1492,9 @@ fn deepen_one(s: &Shared) -> Result<bool, String> {
                 *lock(&s.put_off) = Instant::now() + Duration::from_secs(30);
                 return Ok(false);
             }
-            let text = hide_known(&known(s), &text);
+            let raw = text.trim().to_owned();
+            // hide_known keeps rows as rows, so a row number means the same thing before and after it.
+            let text = hide_known(&known(s), &raw);
             let lines: Vec<&str> = text.split('\n').collect();
             let numbered: Vec<(usize, &str)> = lines.iter().enumerate().filter(|(_, t)| !t.trim().is_empty()).map(|(i, t)| (i, *t)).collect();
             let give_up = |why: String| lock(&s.store).finish_deep(shot.id, None).map(|_| true).map_err(|x| format!("{why}; {x}"));
@@ -1495,21 +1507,29 @@ fn deepen_one(s: &Shared) -> Result<bool, String> {
                 Err(e @ lm::LmError::Offline) => return Err(e.to_string()),
                 Err(e) => return give_up(e.to_string()),
             };
-            // A value is hidden wherever it appears. One too short to search for, or not where the model said, hides its line.
+            // A value is hidden wherever it appears. One too short to search for, or not found on the row the model
+            // named, hides that row and the rows either side of it whole.
             let (mut values, mut whole) = (Vec::new(), std::collections::BTreeSet::new());
             for (line, value, _) in found {
                 let Some(on) = lines.get(line) else { return give_up("the check named a line that isn't there".into()) };
                 let v = value.trim().to_owned();
                 let usable = v.chars().count() >= 4 && !v.contains("[hidden]");
-                if !usable || hide_known(std::slice::from_ref(&v), on) == **on {
-                    whole.insert(line);
+                let placed = usable && !places(std::slice::from_ref(&v), &[as_line((*on).to_owned())])[0].is_empty();
+                if !placed {
+                    whole.extend(line.saturating_sub(1)..=(line + 1).min(lines.len() - 1));
                 }
                 if usable {
                     values.push(v);
                 }
             }
+            // With what is known now as well as what the check found.
+            values.extend(known(s));
             let text = blank_lines(&hide_known(&values, &text), &whole);
-            *log.3.borrow_mut() = Some((values, whole));
+            *log.3.borrow_mut() = Some((raw, text.clone()));
+            if stop() {
+                *lock(&s.put_off) = Instant::now() + Duration::from_secs(30);
+                return Ok(false);
+            }
             if !still_wanted() {
                 return Ok(false);
             }
@@ -2638,7 +2658,9 @@ mod tests {
         assert_eq!(run(DescribeWhen::Never), "");
         let detail = run(DescribeWhen::Always);
         // Hidden where it appears; and the line the model named, where it isn't, is hidden whole.
-        assert_eq!(detail, "[hidden]\nthen a page about [hidden]");
+        assert_eq!(detail, "[hidden]\n[hidden]");
+        // A row's number means the same before and after hiding.
+        assert_eq!(hide_known(&["marmalade-tuba-41".into()], "a\npassword: hunter22\nb marmalade tuba 41\n").split('\n').count(), 4);
     }
 
     #[test]
