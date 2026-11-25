@@ -394,6 +394,15 @@ pub fn scan_text(text: &str, line: usize, hits: &mut Vec<Hit>) {
 fn scan_latin(text: &str, line: usize, hits: &mut Vec<Hit>) {
     use SecretKind::*;
     for m in SSN.find_iter(text) {
+        // Written with spaces inside a longer row of numbers, it is part of that row (a table, a hex dump, a
+        // misread progress bar). Dashes and dots are taken at their word, and so is any line that names it.
+        let spaced = m.as_str().chars().all(|c| c.is_ascii_digit() || c == ' ');
+        let before = text[..m.start()].trim_end_matches(' ');
+        let after = text[m.end()..].trim_start_matches(' ');
+        let in_a_row = (before.len() < m.start() && before.ends_with(|c: char| c.is_ascii_digit())) || (after.len() < text.len() - m.end() && after.starts_with(|c: char| c.is_ascii_digit()));
+        if spaced && in_a_row && !SSN_LABEL.is_match(text) {
+            continue;
+        }
         push(hits, line, m.range(), Ssn, "ssn");
     }
     if SSN_LABEL.is_match(text) {
@@ -1479,6 +1488,17 @@ mod tests {
         for ok in [vec![line("/Users/dana/Library/Application Support/Afterimage/Shots/20416/one.heic", 0.1, 0.1), line("/Users/dana/Library/Application Support/Afterimage/Shots/20416/two.heic", 0.1, 0.2), line("/Users/dana/Library/Application Support/Afterimage/Shots/20416/six.heic", 0.1, 0.3)],
                    vec![line("thequickbrownfoxjumpsoverthelazydogthequickbrownfox", 0.1, 0.1), line("thequickbrownfoxjumpsoverthelazydogthequickbrownfox", 0.1, 0.2), line("thequickbrownfoxjumpsoverthelazydogthequickbrownfox", 0.1, 0.3)]] {
             assert!(hidden(&ok).is_empty(), "{:?}", ok[0].text);
+        }
+    }
+
+    #[test]
+    fn a_row_of_numbers_is_not_a_social_security_number() {
+        // Seen live: a misread line "0000 57 50 4005 50 123 45 6789" frosted part of a terminal.
+        for t in ["0000 57 50 4005 50 123 45 6789", "123 45 6789 22 10", "12 123 45 6789"] {
+            assert_eq!(masked(t), t);
+        }
+        for t in ["219 09 9999", "call me, 219 09 9999 is it", "219-09-9999 22 10", "0000 57 219.09.9999 4", "SSN 12 219 09 9999 4"] {
+            assert!(!masked(t).contains("9999"), "{t}");
         }
     }
 }
