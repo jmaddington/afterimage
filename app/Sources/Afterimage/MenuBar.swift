@@ -8,6 +8,9 @@ struct MenuBarContent: View {
 
     var body: some View {
         Text(model.statusLine)
+        ForEach(model.missingPermissions, id: \.name) { m in
+            Button("Allow \(m.name)…") { m == .screen ? Permissions.openScreenSettings() : Permissions.openAccessibilitySettings() }
+        }
         Divider()
         switch recorder.state {
         case .off, .paused: Button("Resume") { recorder.resume() }

@@ -46,6 +46,17 @@ public actor Capturer {
         var covers: [pid_t: [Cover]] = [:]
     }
 
+    /// The app in front is one that mustn't be photographed, so nothing is. Afterimage itself doesn't count: it is
+    /// always among the hidden, its windows are left out of the picture, and what else is on screen is still wanted.
+    // AIDEV-NOTE: privacy-critical. Leaving Afterimage out relies on ScreenCaptureKit listing it; if it isn't listed,
+    // AIDEV-NOTE: `spoiled` sees a hidden app drawn but not omitted and the picture is dropped.
+    static func offLimits(_ front: pid_t, _ hidden: Set<pid_t>, ours: Bool) -> Bool { !ours && hidden.contains(front) }
+
+    /// Whether a browser is left out on account of its page. `answered`: its extension replied in time.
+    // AIDEV-NOTE: owner's decision 2026-11-25: a silent extension no longer stops capture (it used to: .noAnswer).
+    // AIDEV-NOTE: The browser is then photographed as if the extension weren't installed; rules and the model still check it.
+    static func pageHide(planned: HideReason?, answered: Bool) -> HideReason? { planned }
+
     /// Why a picture taken between these looks can't be kept, or nil.
     static func spoiled(_ before: Look, _ after: Look, during: [Look] = [], omitted: Set<pid_t>) -> CaptureOutcome? {
         let all = [before] + during + [after]
@@ -96,11 +107,12 @@ public actor Capturer {
     private func runWindows(_ trigger: Trigger, allDisplays: Bool, gate: @escaping Gate) async -> CaptureOutcome {
         let front = await MainActor.run { NSWorkspace.shared.frontmostApplication.map { ($0.processIdentifier, $0.localizedName ?? "", $0.bundleIdentifier ?? "") } }
         guard let front else { return .skipped("No app is in front") }
-        if front.0 == getpid() { return .blocked("Afterimage is in front") }
+        // Afterimage in front: its own windows are left out of every picture, and the rest of the screen is taken.
+        let ours = front.0 == getpid()
 
         let exclusions = await gate().exclusions
         var hiddenBefore = await hidden(exclusions)
-        if hiddenBefore.pids.contains(front.0) {
+        if Self.offLimits(front.0, hiddenBefore.pids, ours: ours) {
             lastRefusal = hiddenBefore.reasons[front.0] ?? .app
             return Self.refused(hiddenBefore.reasons[front.0], front.1)
         }
@@ -110,7 +122,7 @@ public actor Capturer {
         } catch { return .failed(error.localizedDescription) }
         // Listing windows can take long enough for the facts to change.
         hiddenBefore = await hidden(exclusions)
-        if hiddenBefore.pids.contains(front.0) {
+        if Self.offLimits(front.0, hiddenBefore.pids, ours: ours) {
             lastRefusal = hiddenBefore.reasons[front.0] ?? .app
             return Self.refused(hiddenBefore.reasons[front.0], front.1)
         }
@@ -303,11 +315,12 @@ public actor Capturer {
 
         let front = await MainActor.run { NSWorkspace.shared.frontmostApplication.map { ($0.processIdentifier, $0.localizedName ?? "", $0.bundleIdentifier ?? "") } }
         guard let front else { return .skipped("No app is in front") }
-        if front.0 == getpid() { return .blocked("Afterimage is in front") }
+        // Afterimage in front: its own windows are left out of every picture, and the rest of the screen is taken.
+        let ours = front.0 == getpid()
 
         let exclusions = await gate().exclusions
         var hiddenBefore = await hidden(exclusions)
-        if hiddenBefore.pids.contains(front.0) {
+        if Self.offLimits(front.0, hiddenBefore.pids, ours: ours) {
             lastRefusal = hiddenBefore.reasons[front.0] ?? .app
             return Self.refused(hiddenBefore.reasons[front.0], front.1)
         }
@@ -319,7 +332,7 @@ public actor Capturer {
         } catch { return .failed(error.localizedDescription) }
         // Listing windows can take long enough for the facts to change.
         hiddenBefore = await hidden(exclusions)
-        if hiddenBefore.pids.contains(front.0) {
+        if Self.offLimits(front.0, hiddenBefore.pids, ours: ours) {
             lastRefusal = hiddenBefore.reasons[front.0] ?? .app
             return Self.refused(hiddenBefore.reasons[front.0], front.1)
         }
@@ -373,7 +386,9 @@ public actor Capturer {
             }
             let m = Moment(
                 takenAt: Int64(at.timeIntervalSince1970 * 1000), trigger: trigger.rawValue, display: await Self.name(d.displayID),
-                appName: front.1, bundleId: front.2, windowTitle: frontWindow?.title ?? "", url: hiddenAfter.focusedURL[front.0] ?? "",
+                appName: front.1, bundleId: front.2,
+                // Afterimage's own title can hold what was being searched for; the picture doesn't show its window anyway.
+                windowTitle: ours ? "" : frontWindow?.title ?? "", url: ours ? "" : hiddenAfter.focusedURL[front.0] ?? "",
                 userName: Session.consoleUser, fullName: NSFullUserName(), host: Session.computerName, sessions: Session.loggedIn, runningApps: apps)
             engine.ingest(frame: Frame(rgba: b.data, width: UInt32(b.width), height: UInt32(b.height), stride: UInt32(b.stride), lines: lines, moment: m, displayKey: key, covers: Self.onDisplay(before.covers.filter { !omitted.contains($0.key) }.values.flatMap { $0 }, d.frame)))
             queued += 1
@@ -412,7 +427,8 @@ public actor Capturer {
                     let areas = reading.pages.map { PageArea(url: $0.url, rect: Rect(x: $0.frame.minX, y: $0.frame.minY, w: $0.frame.width, h: $0.frame.height), scale: scale(at: $0.frame)) }
                     let plan = planPage(ex: ex, hint: engine.pageHint(pid: pid), areas: areas, complete: reading.complete)
                     if !plan.note.isEmpty { engine.noteCapture(trigger: "page", outcome: "Couldn’t place a field: \(plan.note)") }
-                    if let r = plan.hide ?? (answered ? nil : .noAnswer) {
+                    if !answered { engine.noteCapture(trigger: "page", outcome: "A browser’s extension didn’t answer; captured without its help") }
+                    if let r = Self.pageHide(planned: plan.hide, answered: answered) {
                         h.pids.insert(pid)
                         h.reasons[pid] = r
                     } else {

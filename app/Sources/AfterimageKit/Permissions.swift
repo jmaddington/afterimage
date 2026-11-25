@@ -6,6 +6,19 @@ public enum Permissions {
     public static var screen: Bool { CGPreflightScreenCaptureAccess() }
     public static var accessibility: Bool { AXIsProcessTrusted() }
 
+    /// A permission that isn't there, and what its absence is costing.
+    public enum Missing: Sendable, Equatable {
+        case screen, accessibility
+        public var name: String { self == .screen ? "Screen Recording" : "Accessibility" }
+        public var cost: String {
+            self == .screen ? "Screen Recording isn’t allowed, so nothing is being captured" : "Accessibility isn’t allowed, so browsers aren’t being captured"
+        }
+    }
+    /// `needsAddresses`: browsers are left out unless their page address can be read, which takes Accessibility.
+    public static func missing(screen: Bool, accessibility: Bool, needsAddresses: Bool) -> [Missing] {
+        (screen ? [] : [.screen]) + (accessibility || !needsAddresses ? [] : [.accessibility])
+    }
+
     @discardableResult public static func requestScreen() -> Bool { CGRequestScreenCaptureAccess() }
     public static func requestAccessibility() {
         _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
