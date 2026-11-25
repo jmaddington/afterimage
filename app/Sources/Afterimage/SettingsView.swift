@@ -42,7 +42,7 @@ private struct CaptureSettings: View {
                 Picker("Displays", selection: $settings.allDisplays) {
                     Text("The one in use").tag(false)
                     Text("All of them").tag(true)
-                }.disabled(settings.windowsSeparately)
+                }
                 Toggle("Capture windows separately", isOn: $settings.windowsSeparately)
             } footer: {
                 Text(settings.windowsSeparately

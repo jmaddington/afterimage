@@ -17,8 +17,9 @@ public enum WindowShots {
         }
     }
 
-    /// The most pictures one look may queue: the window in front and a few behind it. The engine's queue holds twelve.
-    static let maxQueued = 7
+    /// The most pictures one look may queue: the window in front and a few behind it. The engine's queue holds twelve,
+    /// so two looks fit while the model is busy.
+    static let maxQueued = 5
 
     /// `list` is the window server's, front to back. `shareable`: the windows ScreenCaptureKit offers as on screen.
     static func seen(_ list: [OnScreenWindow], owners: [pid_t: Owner], shareable: Set<CGWindowID>) -> [WindowSeen] {
@@ -31,8 +32,10 @@ public enum WindowShots {
 
     /// The engine's verdict on every listed window. `hidden`: the apps the capture check found off-limits.
     static func plan(_ ex: Exclusions, front: (pid: pid_t, bundleId: String), list: [OnScreenWindow], owners: [pid_t: Owner], shareable: Set<CGWindowID>,
-                     hidden: Set<pid_t>, own: pid_t) -> [WindowChoice] {
-        let scene = WindowScene(ownPid: own, frontPid: front.pid, frontBundleId: front.bundleId, frontWindow: OnScreenWindow.front(of: front.pid, in: list)?.id, hidden: hidden.sorted())
+                     hidden: Set<pid_t>, own: pid_t, desktop: [CGRect]) -> [WindowChoice] {
+        // `desktop`: the displays being captured. A window elsewhere, or parked off all of them, isn't taken.
+        let scene = WindowScene(ownPid: own, frontPid: front.pid, frontBundleId: front.bundleId, frontWindow: OnScreenWindow.front(of: front.pid, in: list)?.id, hidden: hidden.sorted(),
+                                desktop: desktop.map { Rect(x: $0.minX, y: $0.minY, w: $0.width, h: $0.height) })
         return planWindows(ex: ex, scene: scene, windows: seen(list, owners: owners, shareable: shareable))
     }
 
@@ -47,11 +50,13 @@ public enum WindowShots {
     enum Take: Equatable { case take, blank, full, unchanged }
 
     /// What to do with one window's picture. `isNew` records the thumbprint, so it is asked last and only once.
-    static func take(front: Bool, manual: Bool, print: Data, queued: Int, isNew: (Data) -> Bool) -> Take {
+    /// `hadFront`: this window has a picture of it as the window in front, of what it shows now.
+    static func take(front: Bool, manual: Bool, print: Data, queued: Int, hadFront: Bool, isNew: (Data) -> Bool) -> Take {
         if Pixels.isBlank(print) { return .blank }
         if queued >= maxQueued { return .full }
-        // Asked for by hand, the window in front is taken changed or not. One behind it never is.
-        return isNew(print) || (front && manual) ? .take : .unchanged
+        let new = isNew(print)
+        // Asked for by hand, or first seen in front, the window in front is taken changed or not. One behind it never is.
+        return new || (front && (manual || !hadFront)) ? .take : .unchanged
     }
 
     /// The secret fields lying on this window, as fractions of its picture. Nil when there are some and the picture

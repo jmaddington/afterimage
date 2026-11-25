@@ -84,18 +84,28 @@ pub fn plan_windows(ex: &Exclusions, scene: &WindowScene, windows: &[WindowSeen]
     // Whole-display capture takes nothing when something off-limits is in front. Neither does this.
     let private_front = scene.front_pid == scene.own_pid || scene.hidden.contains(&scene.front_pid) || hide_app(ex, &scene.front_bundle_id).is_some();
     let mut background = 0;
+    // Mirrored displays are the same place listed more than once; counted once.
+    let finite = |r: &Rect| [r.x, r.y, r.w, r.h].iter().all(|n| n.is_finite());
+    let inside = |a: &Rect, b: &Rect| a.x >= b.x && a.y >= b.y && a.x + a.w <= b.x + b.w && a.y + a.h <= b.y + b.h;
+    let mut desktop: Vec<Rect> = Vec::new();
+    for d in scene.desktop.iter().filter(|d| finite(d)) {
+        if !desktop.iter().any(|k| inside(d, k)) {
+            desktop.retain(|k| !inside(k, d));
+            desktop.push(*d);
+        }
+    }
     windows
         .iter()
         .map(|w| {
             let front = w.pid == scene.front_pid && scene.front_window == Some(w.id);
             let sized = w.bounds.w.is_finite() && w.bounds.h.is_finite() && w.bounds.w > 160.0 && w.bounds.h > 160.0;
             // AIDEV-NOTE: privacy-critical. "Listed as on screen" isn't "visible": tiling managers park windows past the edge.
-            let on: f64 = scene.desktop.iter().map(|d| {
+            let on: f64 = desktop.iter().map(|d| {
                 let x = (w.bounds.x + w.bounds.w).min(d.x + d.w) - w.bounds.x.max(d.x);
                 let y = (w.bounds.y + w.bounds.h).min(d.y + d.h) - w.bounds.y.max(d.y);
                 if x > 0.0 && y > 0.0 { x * y } else { 0.0 }
             }).sum();
-            let visible = sized && on >= 0.5 * w.bounds.w * w.bounds.h && w.alpha >= 0.5;
+            let visible = sized && finite(&w.bounds) && on >= 0.5 * w.bounds.w * w.bounds.h && w.alpha >= 0.5;
             let skip = if w.pid == scene.own_pid {
                 Some(WindowSkip::Ours)
             } else if scene.hidden.contains(&w.pid) || hide_app(ex, &w.bundle_id).is_some() {
@@ -189,6 +199,14 @@ mod tests {
         let mut f = win(1, 7, "com.editor");
         f.bounds.x = -899.0;
         assert_eq!(plan_windows(&ex(), &s, &[f])[0].skip, Some(WindowSkip::NotShown));
+        // Mirrored displays are one place listed twice: a sliver on it doesn't count double.
+        let mirrored = WindowScene { desktop: vec![Rect { x: 0.0, y: 0.0, w: 1440.0, h: 900.0 }; 3], ..s.clone() };
+        let mut third = win(2, 8, "com.notes");
+        third.bounds.x = -600.0;
+        assert_eq!(plan_windows(&ex(), &mirrored, &[win(1, 7, "com.editor"), third])[1].skip, Some(WindowSkip::NotShown));
+        let mut nowhere = win(2, 8, "com.notes");
+        nowhere.bounds.x = f64::NAN;
+        assert_eq!(plan_windows(&ex(), &s, &[win(1, 7, "com.editor"), nowhere])[1].skip, Some(WindowSkip::NotShown));
         // Nothing known about the displays: nothing can be shown to be on one.
         let blind = WindowScene { desktop: vec![], ..s.clone() };
         assert_eq!(plan_windows(&ex(), &blind, &[win(1, 7, "com.editor")])[0].skip, Some(WindowSkip::NotShown));

@@ -22,7 +22,16 @@ import Observation
     public var hidePrivateWindows: Bool { didSet { save("hidePrivateWindows", hidePrivateWindows) } }
     public var hideTor: Bool { didSet { save("hideTor", hideTor) } }
     public var hideUnreadable: Bool { didSet { save("hideUnreadable", hideUnreadable) } }
-    public var excludedApps: [String] { didSet { save("excludedApps", excludedApps) } }
+    public var excludedApps: [String] {
+        didSet {
+            save("excludedApps", excludedApps)
+            let added = excludedApps.filter { !oldValue.contains($0) }
+            if !added.isEmpty { onAppsExcluded?(added) }
+        }
+    }
+    /// Told which apps were just put off-limits, so pictures of them still waiting can be let go.
+    // AIDEV-NOTE: privacy-critical. The recorder points this at Engine.dropQueued.
+    @ObservationIgnored public var onAppsExcluded: (([String]) -> Void)?
     public var excludedSites: [String] { didSet { save("excludedSites", excludedSites) } }
     public var requireAI: Bool { didSet { save("requireAI", requireAI) } }
     public var model: String { didSet { save("model", model) } }

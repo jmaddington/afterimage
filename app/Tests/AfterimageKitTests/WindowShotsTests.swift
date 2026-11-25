@@ -18,6 +18,20 @@ import Testing
     }
 }
 
+@MainActor @Suite struct ExcludingAnAppTests {
+    /// Pictures of an app still waiting to be checked must go the moment the app is put off-limits.
+    @Test func excludingAnAppAnnouncesOnlyTheNewOnes() {
+        let d = UserDefaults(suiteName: "afterimage-test-\(UUID())")!
+        let s = AppSettings(d)
+        var told: [[String]] = []
+        s.onAppsExcluded = { told.append($0) }
+        s.excludedApps.append("com.chat")
+        s.excludedApps.append("com.notes")
+        s.excludedApps.removeAll { $0 == "com.chat" }
+        #expect(told == [["com.chat"], ["com.notes"]])
+    }
+}
+
 /// The parts of per-window capture that need no screen and no permission.
 @Suite struct WindowShotsTests {
     let ex = Exclusions(apps: ["com.acme.Ledger"], sites: [], passwordManagers: true, privateWindows: true, unreadableBrowsers: true, tor: true)

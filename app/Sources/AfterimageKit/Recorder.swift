@@ -40,6 +40,7 @@ import Observation
         self.settings = settings
         self.engine = engine
         capturer = Capturer(engine: engine)
+        settings.onAppsExcluded = { [engine] in engine.dropQueued(bundleIds: $0) }
     }
 
     public func start() {

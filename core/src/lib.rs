@@ -1056,9 +1056,12 @@ const RECENT_SECRETS: usize = 256;
 const RECENT_PER_FRAME: usize = 64;
 
 /// Newest last. One seen again becomes the newest.
+// AIDEV-NOTE: what the rules would find wherever it stood needs no remembering; leaving it out keeps a window full of
+// AIDEV-NOTE: key-shaped strings from using up the room that label-, model- and field-found secrets need.
 fn remember(r: &mut VecDeque<String>, values: &[String]) {
     let mut added = 0;
-    for v in values {
+    let alone = |v: &str| !detect::scan(&[TextLine { text: v.to_owned(), rect: Rect { x: 0.0, y: 0.0, w: 1.0, h: 0.1 }, tokens: vec![], code: false }]).is_empty();
+    for v in values.iter().filter(|v| !alone(v)) {
         if let Some(i) = r.iter().position(|x| x == v) {
             r.remove(i);
         } else if added >= RECENT_PER_FRAME {
@@ -1488,6 +1491,10 @@ mod tests {
         remember(&mut r, &flood);
         assert_eq!(r.len(), RECENT_SECRETS);
         assert!(r.iter().any(|v| v == "old-0") && r.iter().filter(|v| v.starts_with("new-")).count() == RECENT_PER_FRAME);
+        // What the rules find anywhere by its shape takes up no room.
+        let before = r.clone();
+        remember(&mut r, &["AKIAIOSFODNN7EXAMPLE".into()]);
+        assert_eq!(r, before);
     }
 
     #[test]
