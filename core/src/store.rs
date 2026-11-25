@@ -101,6 +101,9 @@ pub struct Shot {
     /// The model that wrote the description. Empty when there is none yet, or it was written before this was kept.
     #[uniffi(default = "")]
     pub describe_model: String,
+    /// The fuller account kept beside the description, when both were asked for. Empty otherwise.
+    #[uniffi(default = "")]
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Default, uniffi::Record)]
@@ -165,10 +168,10 @@ pub struct Store {
     pub root: PathBuf,
 }
 
-const COLS: &str = "s.id,s.moment,s.path,s.thumb,s.width,s.height,s.bytes,s.regions,s.description,s.tags,s.kept,s.indexed,s.ai_checked,s.check_model,s.describe_model";
+const COLS: &str = "s.id,s.moment,s.path,s.thumb,s.width,s.height,s.bytes,s.regions,s.description,s.tags,s.kept,s.indexed,s.ai_checked,s.check_model,s.describe_model,s.detail";
 
 // AIDEV-NOTE: where a column selected right after COLS lands; keep in step with COLS.
-const LINES_COL: usize = 15;
+const LINES_COL: usize = 16;
 
 fn row_to_shot(root: &Path, r: &Row) -> Res<Shot> {
     let js = |i: usize| -> Res<String> { r.get(i) };
@@ -189,6 +192,7 @@ fn row_to_shot(root: &Path, r: &Row) -> Res<Shot> {
         ai_checked: r.get(12)?,
         check_model: r.get::<_, Option<String>>(13)?.unwrap_or_default(),
         describe_model: r.get::<_, Option<String>>(14)?.unwrap_or_default(),
+        detail: r.get::<_, Option<String>>(15)?.unwrap_or_default(),
     })
 }
 
@@ -263,7 +267,8 @@ impl Store {
             db.execute_batch("ALTER TABLE shots ADD COLUMN embed_model TEXT;")?;
         }
         // AIDEV-NOTE: added in 0.1.6: which model checked each picture and which described it. NULL on older rows.
-        for col in ["check_model", "describe_model"] {
+        // AIDEV-NOTE: `detail` added in 0.1.10: the fuller account beside the description. NULL on older rows.
+        for col in ["check_model", "describe_model", "detail"] {
             let has: bool = db.query_row("SELECT COUNT(*) FROM pragma_table_info('shots') WHERE name=?", [col], |r| r.get::<_, i64>(0))? > 0;
             if !has {
                 db.execute_batch(&format!("ALTER TABLE shots ADD COLUMN {col} TEXT;"))?;
@@ -308,12 +313,14 @@ impl Store {
     }
 
     /// `model`: the embedding model that made `emb`, or that was tried. `by`: the model that wrote the description.
-    pub fn finish_index(&mut self, id: i64, description: &str, tags: &[String], emb: Option<&[f32]>, model: &str, by: &str) -> Res<bool> {
+    /// `detail`: the fuller account kept beside the description, or empty. Searched with it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_index(&mut self, id: i64, description: &str, detail: &str, tags: &[String], emb: Option<&[f32]>, model: &str, by: &str) -> Res<bool> {
         let tx = self.db.transaction()?;
-        let n = tx.execute("UPDATE shots SET description=?,tags=?,embedding=?,embed_model=?,describe_model=?,indexed=1 WHERE id=?",
-            params![description, serde_json::to_string(tags).unwrap_or_default(), Self::blob(emb), model, by, id])?;
+        let n = tx.execute("UPDATE shots SET description=?,detail=?,tags=?,embedding=?,embed_model=?,describe_model=?,indexed=1 WHERE id=?",
+            params![description, detail, serde_json::to_string(tags).unwrap_or_default(), Self::blob(emb), model, by, id])?;
         if n == 1 {
-            tx.execute("UPDATE fts SET description=? WHERE rowid=?", params![format!("{description} {}", tags.join(" ")), id])?;
+            tx.execute("UPDATE fts SET description=? WHERE rowid=?", params![format!("{description} {detail} {}", tags.join(" ")), id])?;
         }
         tx.commit()?;
         Ok(n == 1)
@@ -647,7 +654,7 @@ mod tests {
         let id = s.insert(&shot(d.path(), 1, "words", 5)).unwrap();
         let got = s.get(id).unwrap().unwrap();
         assert_eq!((got.check_model.as_str(), got.describe_model.as_str()), ("checker", ""));
-        s.finish_index(id, "A bill", &[], None, "m", "viewer").unwrap();
+        s.finish_index(id, "A bill", "", &[], None, "m", "viewer").unwrap();
         assert_eq!(s.get(id).unwrap().unwrap().describe_model, "viewer");
     }
 
@@ -690,11 +697,11 @@ mod tests {
         s.insert(&shot(d.path(), 2, "other words", 5)).unwrap();
         let q = |s: &Store, t: &str| s.search(&Filter { text: t.into(), ..Default::default() }, None, 10).unwrap().len();
         assert_eq!((q(&s, "zebraq"), q(&s, "\"invoice zebraquartz\""), q(&s, "plan -zebraquartz")), (1, 0, 1));
-        assert!(s.finish_index(id, "A purplewalrus bill", &["bills".into()], Some(&[1.0, 0.0]), "m", "viewer").unwrap());
+        assert!(s.finish_index(id, "A purplewalrus bill", "", &["bills".into()], Some(&[1.0, 0.0]), "m", "viewer").unwrap());
         assert_eq!((q(&s, "purplewalrus"), q(&s, "zebraquartz"), q(&s, "safari")), (1, 1, 2));
         assert_eq!(s.delete(&[id]).unwrap(), (1, 0));
         assert_eq!(q(&s, "zebraquartz"), 0);
-        assert!(!s.finish_index(id, "ghostcaption", &[], None, "m", "viewer").unwrap());
+        assert!(!s.finish_index(id, "ghostcaption", "", &[], None, "m", "viewer").unwrap());
         assert!(!d.path().join("Shots/1.heic").exists());
         drop(s);
         for f in ["index.sqlite", "index.sqlite-wal"] {
@@ -735,8 +742,8 @@ mod tests {
         let mut s = Store::open(d.path()).unwrap();
         let a = s.insert(&shot(d.path(), 1, "x", 1)).unwrap();
         let b = s.insert(&shot(d.path(), 2, "y", 1)).unwrap();
-        s.finish_index(a, "", &[], Some(&[1.0, 0.0]), "m", "viewer").unwrap();
-        s.finish_index(b, "", &[], Some(&[0.0, 1.0]), "m", "viewer").unwrap();
+        s.finish_index(a, "", "", &[], Some(&[1.0, 0.0]), "m", "viewer").unwrap();
+        s.finish_index(b, "", "", &[], Some(&[0.0, 1.0]), "m", "viewer").unwrap();
         let near = |model: &'static str| Near { vector: &[1.0, 0.0], model, floor: 0.58, band: 0.09 };
         let r = s.search(&Filter { text: "nomatch".into(), ..Default::default() }, Some(&near("m")), 10).unwrap();
         // A question put by another model finds nothing: its numbers mean something else.

@@ -72,7 +72,8 @@ pub struct Encoded {
 #[uniffi::export(with_foreign)]
 pub trait HostServices: Send + Sync {
     fn encode(&self, rgba: Vec<u8>, width: u32, height: u32, stride: u32, path: String, thumb_path: String) -> Result<Encoded, HostError>;
-    fn model_image(&self, path: String) -> Result<Vec<u8>, HostError>;
+    /// The saved picture as a JPEG for the model, its longest edge no more than `max_edge`.
+    fn model_image(&self, path: String, max_edge: u32) -> Result<Vec<u8>, HostError>;
     fn library_changed(&self);
 }
 
@@ -125,6 +126,43 @@ pub struct Config {
     /// Keep a redacted log of calls to LM Studio and of every capture decision.
     #[uniffi(default = false)]
     pub developer: bool,
+    /// How much a description says. The four fields after it count only for `Custom`.
+    pub detail: DescribeDetail,
+    pub custom_long: bool,
+    pub custom_tokens: u32,
+    pub custom_chars: u32,
+    pub custom_edge: u32,
+}
+
+/// How much a description says.
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Enum)]
+pub enum DescribeDetail {
+    /// A few sentences.
+    Brief,
+    /// A full account of the window, in place of the few sentences.
+    Detailed,
+    /// The few sentences, and the full account beside them.
+    Both,
+    /// One description, made the way the custom fields say.
+    Custom,
+}
+
+impl Config {
+    /// The description to write, and the fuller one to keep beside it if any.
+    fn details(&self) -> (lm::Detail, Option<lm::Detail>) {
+        match self.detail {
+            DescribeDetail::Brief => (lm::Detail::BRIEF, None),
+            DescribeDetail::Detailed => (lm::Detail::DETAILED, None),
+            DescribeDetail::Both => (lm::Detail::BRIEF, Some(lm::Detail::DETAILED)),
+            DescribeDetail::Custom => (lm::Detail { long: self.custom_long, answer_tokens: self.custom_tokens, text_chars: self.custom_chars, picture_edge: self.custom_edge }.clamped(), None),
+        }
+    }
+
+    /// The context the chosen model is loaded with: one size for hiding and describing, so it is loaded once.
+    fn context(&self) -> u32 {
+        let (a, b) = self.details();
+        a.context().max(b.map_or(0, lm::Detail::context)).max(CONTEXT)
+    }
 }
 
 #[derive(Debug, Clone, uniffi::Enum, PartialEq)]
@@ -272,9 +310,12 @@ impl Engine {
     pub fn set_config(&self, config: Config) {
         // AIDEV-NOTE: lock order is store, then config. Held together so no entry can slip in between "off" and the clear.
         let store = lock(&self.s.store);
+        let resize;
         let changed = {
             let mut c = lock(&self.s.config);
             let changed = c.model != config.model || c.lm_url != config.lm_url;
+            // AIDEV-NOTE: a model stays loaded at the size it was loaded with; a new size means ours must be loaded again.
+            resize = c.context() != config.context();
             *c = config.clone();
             changed
         };
@@ -287,6 +328,9 @@ impl Engine {
             }
         }
         drop(store);
+        if resize {
+            self.s.unload_ours();
+        }
         self.s.wake.notify_all();
     }
 
@@ -811,7 +855,7 @@ impl Shared {
         let (l, t) = self.taped(c);
         *tape = t;
         let l = l?;
-        self.ensure(&l, &c.model, CONTEXT)?;
+        self.ensure(&l, &c.model, c.context())?;
 
         let mut unsure = HashSet::new();
         let mut at = 0;
@@ -1259,24 +1303,41 @@ fn describe_one(s: &Shared) -> Result<bool, String> {
     }
     let _log = Log(s, tape, shot.id);
     s.describing.store(true, SeqCst);
-    s.ensure(&l, &c.model, CONTEXT).map_err(|e| e.to_string())?;
+    s.ensure(&l, &c.model, c.context()).map_err(|e| e.to_string())?;
     // Reachable model from here on: failures count against this shot so one bad image can't block the rest.
     let fail = |why: String| {
         let _ = lock(&s.store).bump_attempts(shot.id);
         why
     };
-    let img = s.host.model_image(shot.path.clone()).map_err(|e| fail(e.to_string()))?;
-    let (d, tags) = match l.describe(&c.model, &img, &shot.moment.app_name, &shot.moment.window_title, &body) {
+    let (first, second) = c.details();
+    let ask = |how: lm::Detail| -> Result<(String, Vec<String>), lm::LmError> {
+        let img = s.host.model_image(shot.path.clone(), how.picture_edge).map_err(|e| lm::LmError::Model(e.to_string()))?;
+        let r = l.describe(&c.model, &img, &shot.moment.app_name, &shot.moment.window_title, &body, how);
+        *lock(&s.last_lm_use) = Instant::now();
+        r
+    };
+    let (d, tags) = match ask(first) {
         Ok(x) => x,
         Err(e @ lm::LmError::Offline) => return Err(e.to_string()),
         Err(e) => return Err(fail(e.to_string())),
     };
-    *lock(&s.last_lm_use) = Instant::now();
     let d = detect::mask_text(&d);
+    // AIDEV-NOTE: the fuller account is the model's words about the screen too: masked like the description before it is kept.
+    let more = match second.map(ask) {
+        None => String::new(),
+        Some(Ok((m, _))) => detect::mask_text(&m),
+        // Not there to ask: the whole picture waits, so it gets both.
+        Some(Err(e @ lm::LmError::Offline)) => return Err(e.to_string()),
+        // It answered the short question and not the long one: the short one is kept.
+        Some(Err(e)) => {
+            log::warn!("no fuller description: {e} [AIMG-DESCLONG]");
+            String::new()
+        }
+    };
     // The model's tags are its words about the screen too.
     let tags: Vec<String> = tags.iter().map(|t| detect::mask_text(t)).collect();
     let emb = if c.embed_model.is_empty() { None } else { embed_shot(s, &l, &c, &shot, &d, &body).ok() };
-    lock(&s.store).finish_index(shot.id, &d, &tags, emb.as_deref(), &c.embed_model, &c.model).map_err(|e| e.to_string())
+    lock(&s.store).finish_index(shot.id, &d, &more, &tags, emb.as_deref(), &c.embed_model, &c.model).map_err(|e| e.to_string())
 }
 
 /// What a picture is, as one piece of text for the embedding model.
@@ -1325,7 +1386,7 @@ mod tests {
             lock(&self.0).push(rgba);
             Ok(Encoded { width, height, bytes: 100 })
         }
-        fn model_image(&self, _: String) -> Result<Vec<u8>, HostError> {
+        fn model_image(&self, _: String, _: u32) -> Result<Vec<u8>, HostError> {
             Ok(vec![])
         }
         fn library_changed(&self) {}
@@ -1333,7 +1394,7 @@ mod tests {
 
     // Port 9 refuses connections: stands in for LM Studio being off.
     fn config(require_ai: bool) -> Config {
-        Config { lm_url: "http://127.0.0.1:9".into(), model: "m".into(), embed_model: String::new(), require_ai, describe: DescribeWhen::Never, max_age_days: 0, max_bytes: 0, unload_after_secs: 0, developer: false }
+        Config { lm_url: "http://127.0.0.1:9".into(), model: "m".into(), embed_model: String::new(), require_ai, describe: DescribeWhen::Never, max_age_days: 0, max_bytes: 0, unload_after_secs: 0, developer: false, detail: DescribeDetail::Brief, custom_long: false, custom_tokens: 900, custom_chars: 4000, custom_edge: 1280 }
     }
     fn frame(at: i64) -> Frame {
         let l = |t: &str, y: f64| TextLine { text: t.into(), rect: Rect { x: 0.1, y, w: 0.5, h: 0.1 }, tokens: vec![], code: false };
@@ -1824,7 +1885,10 @@ mod tests {
                     } else if asked.fetch_add(1, SeqCst) >= good {
                         (if status == 200 { 400 } else { status }, r#"{"error":{"message":"bad prompt: quartz-otter-9 was in it"}}"#.to_owned())
                     } else {
-                        (200, serde_json::json!({"choices":[{"finish_reason":"stop","message":{"content":answer}}]}).to_string())
+                        // Asked for the full account, it says more, and repeats something it shouldn't.
+                        let long = String::from_utf8_lossy(&buf[head..]).contains("Write a detailed account");
+                        let content = if long { answer.replace(r#""description":""#, r#""description":"In full, password: hunter22\nthen "#) } else { answer.to_owned() };
+                        (200, serde_json::json!({"choices":[{"finish_reason":"stop","message":{"content":content}}]}).to_string())
                     };
                     let _ = write!(s, "HTTP/1.1 {code} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
                 });
@@ -2240,6 +2304,51 @@ mod tests {
         e.set_config(Config { embed_model: String::new(), ..c });
         assert_eq!(e.stats().unwrap().reindexing, 0);
         e.shutdown();
+    }
+
+    #[test]
+    fn a_description_is_as_full_as_the_setting_asks() {
+        let both = r#"{"findings":[],"description":"a page about otters","tags":["otters"]}"#;
+        let described = |detail: DescribeDetail, custom_long: bool| {
+            let d = tempfile::tempdir().unwrap();
+            let c = Config { lm_url: fake_lm(both, 200), describe: DescribeWhen::Always, detail, custom_long, ..config(true) };
+            let e = Engine::new(d.path().to_string_lossy().into(), c, Arc::new(FakeHost(Default::default()))).unwrap();
+            let mut f = frame(1000);
+            f.lines.truncate(1);
+            f.moment.window_title = "t".into();
+            f.moment.url.clear();
+            e.ingest(f);
+            wait(|| e.stats().unwrap().count == 1 && e.stats().unwrap().pending == 0);
+            let shot = e.list(Filter::default(), 5, 0).unwrap().remove(0);
+            // Found by the words of either one.
+            let found = e.search(Filter { text: "full".into(), ..Default::default() }, false, 5).unwrap().len();
+            e.shutdown();
+            (shot.description, shot.detail, found)
+        };
+        assert_eq!(described(DescribeDetail::Brief, false), ("a page about otters".into(), String::new(), 0));
+        // The full account takes the description's place, hidden like any other words of the model's.
+        let (d, more, found) = described(DescribeDetail::Detailed, false);
+        assert!(d.starts_with("In full") && d.ends_with("a page about otters") && !d.contains("hunter22") && more.is_empty() && found == 1, "{d} / {more}");
+        // Both: the short one stays the description, the full one sits beside it.
+        let (d, more, found) = described(DescribeDetail::Both, false);
+        assert!(d == "a page about otters" && more.starts_with("In full") && !more.contains("hunter22") && found == 1, "{d} / {more}");
+        // Custom: one description, in the style chosen.
+        assert_eq!(described(DescribeDetail::Custom, false).0, "a page about otters");
+        assert!(described(DescribeDetail::Custom, true).0.starts_with("In full"));
+    }
+
+    #[test]
+    fn the_model_is_loaded_big_enough_for_the_fullest_description() {
+        let c = |detail| Config { detail, custom_long: true, custom_tokens: 50_000, custom_chars: 3, custom_edge: 9000, ..config(true) };
+        assert_eq!(c(DescribeDetail::Brief).context(), 8192);
+        assert_eq!(c(DescribeDetail::Detailed).context(), 16_384);
+        assert_eq!(c(DescribeDetail::Both).context(), 16_384);
+        // Custom numbers are kept within what a local model can take.
+        let (custom, second) = c(DescribeDetail::Custom).details();
+        assert_eq!((custom, second), (lm::Detail { long: true, answer_tokens: 8192, text_chars: 500, picture_edge: 2880 }, None));
+        assert_eq!(c(DescribeDetail::Custom).context(), 16_384);
+        assert_eq!(lm::Detail { text_chars: 40_000, ..custom }.context(), 32_768);
+        assert_eq!(c(DescribeDetail::Both).details(), (lm::Detail::BRIEF, Some(lm::Detail::DETAILED)));
     }
 
     #[test]

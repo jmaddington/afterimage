@@ -433,6 +433,7 @@ fn get_shot(s: &Shared, a: &Value, off: i32) -> Result<Value, String> {
     v["checked_by_model"] = json!(shot.ai_checked);
     if !shot.check_model.is_empty() { v["check_model"] = json!(shot.check_model); }
     if !shot.describe_model.is_empty() { v["describe_model"] = json!(shot.describe_model); }
+    if !shot.detail.is_empty() { v["detail"] = json!(shot.detail); }
     v["kept"] = json!(shot.kept);
     v["signed_in"] = json!({"user": shot.moment.user_name, "name": shot.moment.full_name, "mac": shot.moment.host});
     v["running_apps"] = json!(shot.moment.running_apps.iter().map(|x| x.name.as_str()).collect::<Vec<_>>());
@@ -443,7 +444,7 @@ fn get_shot(s: &Shared, a: &Value, off: i32) -> Result<Value, String> {
 fn get_image(s: &Shared, a: &Value) -> Result<Value, String> {
     use base64::Engine;
     let shot = one(s, a)?;
-    let jpeg = s.host.model_image(shot.path).map_err(|e| e.to_string())?;
+    let jpeg = s.host.model_image(shot.path, 1280).map_err(|e| e.to_string())?;
     Ok(json!({"content": [{"type": "text", "text": UNTRUSTED}, {"type": "image", "mimeType": "image/jpeg", "data": base64::engine::general_purpose::STANDARD.encode(jpeg)}]}))
 }
 
@@ -454,7 +455,7 @@ mod tests {
     fn shot(id: i64, at: i64, bundle: &str, title: &str, key: &str, front: bool) -> Shot {
         let moment = crate::store::Moment { taken_at: at, app_name: bundle.into(), bundle_id: bundle.into(), window_title: title.into(), window_key: key.into(), window_front: front, ..Default::default() };
         Shot { id, moment, path: String::new(), thumb_path: String::new(), width: 1, height: 1, bytes: 1, regions: vec![], description: String::new(), tags: vec![],
-               kept: false, indexed: false, ai_checked: true, check_model: String::new(), describe_model: String::new() }
+               kept: false, indexed: false, ai_checked: true, check_model: String::new(), describe_model: String::new(), detail: String::new() }
     }
 
     #[test]
