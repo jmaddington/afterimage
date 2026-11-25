@@ -209,6 +209,22 @@ private struct IntelligenceSettings: View {
                 Toggle("Developer mode", isOn: $settings.developer)
                 Button("Show Log") { openWindow(id: "devlog") }
                 if settings.developer {
+                    Picker("Descriptions", selection: $settings.describeDetail) {
+                        Text("Brief").tag("brief")
+                        Text("Detailed").tag("detailed")
+                        Text("Both").tag("both")
+                        Text("Custom").tag("custom")
+                    }
+                    if settings.describeDetail == "custom" {
+                        Picker("Style", selection: $settings.customLong) {
+                            Text("A few sentences").tag(false)
+                            Text("Full account").tag(true)
+                        }
+                        Stepper("Answer up to \(settings.customTokens) tokens", value: $settings.customTokens, in: 200...8192, step: 100)
+                        Stepper("Text given: \(settings.customChars) characters", value: $settings.customChars, in: 500...40000, step: 500)
+                        Stepper("Picture up to \(settings.customEdge) pixels wide", value: $settings.customEdge, in: 640...2880, step: 160)
+                    }
+                    Text(Words.describeDetail(settings.describeDetail)).font(.callout).foregroundStyle(.secondary)
                     Toggle("Let an AI agent read the library", isOn: $settings.agentAccess)
                     if settings.agentAccess {
                         if let port = model.agentPort {

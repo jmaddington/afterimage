@@ -11,9 +11,12 @@ if args[1] == "ocr" {
     exit(0)
 }
 let fixtures = args.count > 3 ? args[3] : "fixtures"
-let live = ProcessInfo.processInfo.environment["AFTERIMAGE_LIVE"] != nil
-let config = Config(lmUrl: live ? "http://127.0.0.1:1234" : "http://127.0.0.1:9", model: "gemma-4-26b-a4b-it-qat-mlx", embedModel: live ? "text-embedding-nomic-embed-text-v1.5" : "",
-                    requireAi: live, describe: live ? .always : .never, maxAgeDays: 0, maxBytes: 0, unloadAfterSecs: 0)
+let env = ProcessInfo.processInfo.environment
+let live = env["AFTERIMAGE_LIVE"] != nil
+// AFTERIMAGE_MODEL, AFTERIMAGE_DETAIL (brief, detailed, both) and AFTERIMAGE_ROUNDS shape a live run.
+let detail = AppSettings.detail(env["AFTERIMAGE_DETAIL"] ?? "brief", developer: true)
+let config = Config(lmUrl: live ? "http://127.0.0.1:1234" : "http://127.0.0.1:9", model: env["AFTERIMAGE_MODEL"] ?? "google/gemma-4-26b-a4b-qat", embedModel: live ? "text-embedding-nomic-embed-text-v1.5" : "",
+                    requireAi: live, describe: live ? .always : .never, maxAgeDays: 0, maxBytes: 0, unloadAfterSecs: 0, detail: detail, customLong: false, customTokens: 900, customChars: 4000, customEdge: 1280)
 let engine = try Engine(root: args[2], config: config, host: ImageHost())
 let cast: [(String, String, String, String)] = [
     ("onboarding", "Numbers", "com.apple.Numbers", "Employee record"), ("terminal", "Terminal", "com.apple.Terminal", "deploy — zsh"),
@@ -23,7 +26,7 @@ let running = cast.map { AppRef(name: $0.1, bundleId: $0.2) }
 let triggers = ["app", "window", "tab", "interval", "launch"]
 let start = Date()
 var n: UInt64 = 0
-for round in 0..<4 {
+for round in 0..<(Int(env["AFTERIMAGE_ROUNDS"] ?? "") ?? 4) {
     for (i, c) in cast.enumerated() {
         guard let img = Pixels.load("\(fixtures)/\(c.0).png"), let b = Pixels.bitmap(img) else { continue }
         let at = start.addingTimeInterval(-Double(round * 5 + i) * 3700 - Double(round) * 30000)
@@ -36,5 +39,10 @@ for round in 0..<4 {
     }
 }
 if live { while try engine.stats().pending > 0 { Thread.sleep(forTimeInterval: 0.5) } }
+if live {
+    for shot in try engine.list(filter: Filter(text: "", bundleId: nil, from: nil, to: nil, onlyKept: false, onlyHidden: false), limit: 50, offset: 0) {
+        print("--- \(shot.moment.windowTitle) [\(shot.describeModel)]\n\(shot.description)\(shot.detail.isEmpty ? "" : "\n  IN FULL (\(shot.detail.count) characters):\n\(shot.detail)")")
+    }
+}
 engine.shutdown()
 print("seeded \(n) pictures")

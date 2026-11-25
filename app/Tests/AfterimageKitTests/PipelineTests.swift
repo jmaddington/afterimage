@@ -7,7 +7,7 @@ import Testing
 let fixtures = URL(fileURLWithPath: #filePath).deletingLastPathComponent().appending(path: "../../../fixtures").standardizedFileURL
 
 func rulesOnly() -> Config {
-    Config(lmUrl: "http://127.0.0.1:9", model: "none", embedModel: "", requireAi: false, describe: .never, maxAgeDays: 0, maxBytes: 0, unloadAfterSecs: 0, developer: false)
+    Config(lmUrl: "http://127.0.0.1:9", model: "none", embedModel: "", requireAi: false, describe: .never, maxAgeDays: 0, maxBytes: 0, unloadAfterSecs: 0, developer: false, detail: .brief, customLong: false, customTokens: 900, customChars: 4000, customEdge: 1280)
 }
 
 /// Runs a fixture through the real pipeline and returns the saved shot plus what OCR can still read from the saved file.
@@ -111,7 +111,7 @@ func saveAndReread(_ name: String, config: Config = rulesOnly()) async throws ->
 
 /// Needs LM Studio: AFTERIMAGE_LIVE=1 swift test --filter LiveModel
 @Suite(.serialized, .enabled(if: ProcessInfo.processInfo.environment["AFTERIMAGE_LIVE"] != nil)) struct LiveModelTests {
-    let config = Config(lmUrl: "http://127.0.0.1:1234", model: ProcessInfo.processInfo.environment["AFTERIMAGE_MODEL"] ?? "gemma-4-26b-a4b-it-qat-mlx", embedModel: "text-embedding-nomic-embed-text-v1.5", requireAi: true, describe: .never, maxAgeDays: 0, maxBytes: 0, unloadAfterSecs: 0, developer: false)
+    let config = Config(lmUrl: "http://127.0.0.1:1234", model: ProcessInfo.processInfo.environment["AFTERIMAGE_MODEL"] ?? "gemma-4-26b-a4b-it-qat-mlx", embedModel: "text-embedding-nomic-embed-text-v1.5", requireAi: true, describe: .never, maxAgeDays: 0, maxBytes: 0, unloadAfterSecs: 0, developer: false, detail: .brief, customLong: false, customTokens: 900, customChars: 4000, customEdge: 1280)
 
     @Test func unlabelledSecretsAreHiddenByTheModel() async throws {
         let r = try await saveAndReread("notes", config: config)

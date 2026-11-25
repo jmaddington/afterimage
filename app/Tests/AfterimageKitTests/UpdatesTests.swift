@@ -50,6 +50,27 @@ import Testing
         #expect(s.config.lmUrl == "http://studio.local:4321")
     }
 
+    @Test func descriptionDetailIsADeveloperChoice() throws {
+        let name = "afterimage.tests.\(UUID())"
+        let d = try #require(UserDefaults(suiteName: name))
+        defer { d.removePersistentDomain(forName: name) }
+        let s = AppSettings(d)
+        #expect(s.describeDetail == "brief" && s.config.detail == .brief)
+        s.describeDetail = "both"
+        // Out of sight, out of force: the choice counts only while developer mode shows it.
+        #expect(s.config.detail == .brief)
+        s.developer = true
+        #expect(s.config.detail == .both && AppSettings(d).describeDetail == "both")
+        s.describeDetail = "custom"
+        s.customLong = false
+        s.customTokens = 1500
+        s.customChars = 6000
+        s.customEdge = 2000
+        let c = s.config
+        #expect(c.detail == .custom && !c.customLong && c.customTokens == 1500 && c.customChars == 6000 && c.customEdge == 2000)
+        #expect(AppSettings.detail("detailed", developer: true) == .detailed && AppSettings.detail("nonsense", developer: true) == .brief)
+    }
+
     @Test func whateverIsTypedBecomesAPlainAddress() {
         #expect(AppSettings.lmURL(host: "", port: 1234) == "http://127.0.0.1:1234")
         #expect(AppSettings.lmURL(host: "10.0.0.4", port: 1234) == "http://10.0.0.4:1234")
