@@ -44,6 +44,14 @@ private struct CaptureSettings: View {
                     Text("All of them").tag(true)
                 }
                 Toggle("Capture windows separately", isOn: $settings.windowsSeparately)
+                if settings.windowsSeparately {
+                    Picker("Whole screen as well", selection: $settings.overviewSeconds) {
+                        Text("Never").tag(0)
+                        Text("Every minute").tag(60)
+                        Text("Every 5 minutes").tag(300)
+                        Text("Every 15 minutes").tag(900)
+                    }
+                }
             } footer: {
                 Text(settings.windowsSeparately
                      ? "Each window is its own picture, including windows behind others, and a window behind is photographed only when it has changed. A browser is photographed only while it is the window in front. Minimised windows and windows on another desktop are skipped. Identical pictures are never saved twice."

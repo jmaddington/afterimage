@@ -47,16 +47,36 @@ public enum WindowShots {
         return String(format: "%08x", UInt32.random(in: .min ... .max, using: &g))
     }
 
-    enum Take: Equatable { case take, blank, full, unchanged }
+    /// Whether it is time to save a picture of the whole screen as well. `every`: seconds between them; 0 is never.
+    static func overviewDue(last: Date?, now: Date, every: Int) -> Bool {
+        guard every > 0 else { return false }
+        guard let last, last <= now else { return true }
+        return now.timeIntervalSince(last) >= Double(every)
+    }
 
-    /// What to do with one window's picture. `isNew` records the thumbprint, so it is asked last and only once.
+    enum Take: Equatable {
+        case take, blank, full, unchanged
+        /// A few cells differ (a cursor blinked, a button changed shade): save it only if it reads differently.
+        case ifWordsChanged
+    }
+
+    /// What to do with one window's picture. `howNew` records the thumbprint, so it is asked last and only once.
     /// `hadFront`: this window has a picture of it as the window in front, of what it shows now.
-    static func take(front: Bool, manual: Bool, print: Data, queued: Int, hadFront: Bool, isNew: (Data) -> Bool) -> Take {
+    static func take(front: Bool, manual: Bool, print: Data, queued: Int, hadFront: Bool, howNew: (Data) -> Newness) -> Take {
         if Pixels.isBlank(print) { return .blank }
         if queued >= maxQueued { return .full }
-        let new = isNew(print)
+        let new = howNew(print)
         // Asked for by hand, or first seen in front, the window in front is taken changed or not. One behind it never is.
-        return new || (front && (manual || !hadFront)) ? .take : .unchanged
+        if new == .changed || (front && (manual || !hadFront)) { return .take }
+        return new == .slight ? .ifWordsChanged : .unchanged
+    }
+
+    /// What a window says, as one number to compare with the last picture saved of it. Spacing doesn't count, nor
+    /// does the upright stroke OCR sometimes makes of a text cursor.
+    static func words(_ lines: [TextLine]) -> Int {
+        var h = Hasher()
+        for l in lines { h.combine(l.text.filter { !$0.isWhitespace && $0 != "|" }) }
+        return h.finalize()
     }
 
     /// The secret fields lying on this window, as fractions of its picture. Nil when there are some and the picture

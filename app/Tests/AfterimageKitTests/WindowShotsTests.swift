@@ -11,6 +11,9 @@ import Testing
         defer { d.removePersistentDomain(forName: name) }
         let s = AppSettings(d)
         #expect(!s.windowsSeparately)
+        #expect(s.overviewSeconds == 60)
+        s.overviewSeconds = 300
+        #expect(AppSettings(d).overviewSeconds == 300)
         s.windowsSeparately = true
         #expect(AppSettings(d).windowsSeparately)
         // Nothing about what is off-limits depends on it.
@@ -59,14 +62,45 @@ import Testing
 
     /// A window photographed while it was behind something is photographed again when the person goes to it,
     /// changed or not: otherwise nothing would say they were ever in it.
+    /// A blinking cursor changes a few cells and no words. Such a picture is saved only if its words differ from the
+    /// last one saved of that window.
+    @Test func aSlightChangeIsSavedOnlyIfTheWordsChanged() {
+        let busy = Data((0..<64).map { UInt8($0 * 3) })
+        #expect(WindowShots.take(front: true, manual: false, print: busy, queued: 0, hadFront: true, howNew: { _ in .slight }) == .ifWordsChanged)
+        #expect(WindowShots.take(front: false, manual: false, print: busy, queued: 0, hadFront: false, howNew: { _ in .slight }) == .ifWordsChanged)
+        // Asked for by hand, or never yet seen in front: taken whatever the words say.
+        #expect(WindowShots.take(front: true, manual: true, print: busy, queued: 0, hadFront: true, howNew: { _ in .slight }) == .take)
+        #expect(WindowShots.take(front: true, manual: false, print: busy, queued: 0, hadFront: false, howNew: { _ in .slight }) == .take)
+        func l(_ t: String) -> TextLine { TextLine(text: t, rect: Rect(x: 0, y: 0, w: 1, h: 0.1), tokens: []) }
+        let a = WindowShots.words([l("Server notes"), l("renew the certificate")])
+        // Spacing and a stray cursor mark read by OCR don't make new words; a typed letter does.
+        #expect(a == WindowShots.words([l("Server  notes"), l("|renew the certificate ")]))
+        #expect(a != WindowShots.words([l("Server notes"), l("renew the certificates")]))
+        #expect(WindowShots.words([]) != a)
+    }
+
+    /// With windows photographed on their own, a picture of the whole screen is still saved now and then, so there
+    /// is something that shows how it all sat together.
+    @Test func theWholeScreenIsStillSavedNowAndThen() {
+        let now = Date(timeIntervalSince1970: 10_000)
+        #expect(WindowShots.overviewDue(last: nil, now: now, every: 60))
+        #expect(!WindowShots.overviewDue(last: now.addingTimeInterval(-59), now: now, every: 60))
+        #expect(WindowShots.overviewDue(last: now.addingTimeInterval(-60), now: now, every: 60))
+        // Never, when asked for never.
+        #expect(!WindowShots.overviewDue(last: nil, now: now, every: 0))
+        #expect(!WindowShots.overviewDue(last: now.addingTimeInterval(-9999), now: now, every: -5))
+        // A clock set back doesn't stop it for good.
+        #expect(WindowShots.overviewDue(last: now.addingTimeInterval(500), now: now, every: 60))
+    }
+
     @Test func aWindowComingToTheFrontGetsAPictureAsTheFrontWindow() {
         let busy = Data((0..<64).map { UInt8($0 * 3) })
-        #expect(WindowShots.take(front: true, manual: false, print: busy, queued: 0, hadFront: false, isNew: { _ in false }) == .take)
-        #expect(WindowShots.take(front: true, manual: false, print: busy, queued: 0, hadFront: true, isNew: { _ in false }) == .unchanged)
-        #expect(WindowShots.take(front: false, manual: false, print: busy, queued: 0, hadFront: false, isNew: { _ in false }) == .unchanged)
+        #expect(WindowShots.take(front: true, manual: false, print: busy, queued: 0, hadFront: false, howNew: { _ in .same }) == .take)
+        #expect(WindowShots.take(front: true, manual: false, print: busy, queued: 0, hadFront: true, howNew: { _ in .same }) == .unchanged)
+        #expect(WindowShots.take(front: false, manual: false, print: busy, queued: 0, hadFront: false, howNew: { _ in .same }) == .unchanged)
         // The thumbprint is recorded either way, exactly once.
         var asked = 0
-        _ = WindowShots.take(front: true, manual: true, print: busy, queued: 0, hadFront: false) { _ in asked += 1; return true }
+        _ = WindowShots.take(front: true, manual: true, print: busy, queued: 0, hadFront: false) { _ in asked += 1; return .changed }
         #expect(asked == 1)
         // One look never fills the engine's queue of twelve by itself, twice over.
         #expect(WindowShots.maxQueued * 2 <= 12)
@@ -142,20 +176,20 @@ import Testing
     @Test func whatToDoWithOnePicture() {
         let busy = Data((0..<64).map { UInt8($0 * 3) }), flat = Data(repeating: 40, count: 64)
         var asked = 0
-        func new(_ answer: Bool) -> (Data) -> Bool { { _ in asked += 1; return answer } }
-        #expect(WindowShots.take(front: true, manual: false, print: busy, queued: 0, hadFront: true, isNew: new(true)) == .take)
-        #expect(WindowShots.take(front: false, manual: false, print: busy, queued: 3, hadFront: true, isNew: new(true)) == .take)
+        func new(_ answer: Bool) -> (Data) -> Newness { { _ in asked += 1; return answer ? .changed : .same } }
+        #expect(WindowShots.take(front: true, manual: false, print: busy, queued: 0, hadFront: true, howNew: new(true)) == .take)
+        #expect(WindowShots.take(front: false, manual: false, print: busy, queued: 3, hadFront: true, howNew: new(true)) == .take)
         // A background window is its own picture only when it changed, even when asked for by hand.
-        #expect(WindowShots.take(front: false, manual: false, print: busy, queued: 0, hadFront: true, isNew: new(false)) == .unchanged)
-        #expect(WindowShots.take(front: false, manual: true, print: busy, queued: 0, hadFront: true, isNew: new(false)) == .unchanged)
-        #expect(WindowShots.take(front: true, manual: false, print: busy, queued: 0, hadFront: true, isNew: new(false)) == .unchanged)
-        #expect(WindowShots.take(front: true, manual: true, print: busy, queued: 0, hadFront: true, isNew: new(false)) == .take)
+        #expect(WindowShots.take(front: false, manual: false, print: busy, queued: 0, hadFront: true, howNew: new(false)) == .unchanged)
+        #expect(WindowShots.take(front: false, manual: true, print: busy, queued: 0, hadFront: true, howNew: new(false)) == .unchanged)
+        #expect(WindowShots.take(front: true, manual: false, print: busy, queued: 0, hadFront: true, howNew: new(false)) == .unchanged)
+        #expect(WindowShots.take(front: true, manual: true, print: busy, queued: 0, hadFront: true, howNew: new(false)) == .take)
         #expect(asked == 6)
         // A window that gave nothing isn't a picture, and isn't remembered as one.
-        #expect(WindowShots.take(front: true, manual: true, print: flat, queued: 0, hadFront: true, isNew: new(true)) == .blank)
-        #expect(WindowShots.take(front: false, manual: false, print: Data(), queued: 0, hadFront: true, isNew: new(true)) == .blank)
+        #expect(WindowShots.take(front: true, manual: true, print: flat, queued: 0, hadFront: true, howNew: new(true)) == .blank)
+        #expect(WindowShots.take(front: false, manual: false, print: Data(), queued: 0, hadFront: true, howNew: new(true)) == .blank)
         // The queue is never flooded, and what was left out is looked at afresh next time.
-        #expect(WindowShots.take(front: false, manual: false, print: busy, queued: WindowShots.maxQueued, hadFront: true, isNew: new(true)) == .full)
+        #expect(WindowShots.take(front: false, manual: false, print: busy, queued: WindowShots.maxQueued, hadFront: true, howNew: new(true)) == .full)
         #expect(asked == 6)
         #expect(WindowShots.maxQueued < 12)
     }

@@ -17,6 +17,8 @@ import Observation
     public var allDisplays: Bool { didSet { save("allDisplays", allDisplays) } }
     /// Photograph each window on its own, covered or not, instead of the whole display. Off unless chosen.
     public var windowsSeparately: Bool { didSet { save("windowsSeparately", windowsSeparately) } }
+    /// With windows photographed on their own: how often, in seconds, the whole screen is saved as well. 0: never.
+    public var overviewSeconds: Int { didSet { save("overviewSeconds", overviewSeconds) } }
     public var skipSecureInput: Bool { didSet { save("skipSecureInput", skipSecureInput) } }
     public var hidePasswordManagers: Bool { didSet { save("hidePasswordManagers", hidePasswordManagers) } }
     public var hidePrivateWindows: Bool { didSet { save("hidePrivateWindows", hidePrivateWindows) } }
@@ -61,6 +63,7 @@ import Observation
         trackActivity = get("trackActivity", true)
         allDisplays = get("allDisplays", false)
         windowsSeparately = get("windowsSeparately", false)
+        overviewSeconds = get("overviewSeconds", 60)
         skipSecureInput = get("skipSecureInput", true)
         hidePasswordManagers = get("hidePasswordManagers", true)
         hidePrivateWindows = get("hidePrivateWindows", true)

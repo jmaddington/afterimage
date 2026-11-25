@@ -95,6 +95,15 @@ pub struct Frame {
     pub context: Vec<TextLine>,
 }
 
+/// How a display or window compares with the last look at it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum Newness {
+    Same,
+    /// A few cells differ: a cursor blinked, a button changed shade.
+    Slight,
+    Changed,
+}
+
 #[derive(Debug, Clone, PartialEq, uniffi::Enum)]
 pub enum DescribeWhen {
     Never,
@@ -336,20 +345,35 @@ impl Engine {
     /// Cheap pre-check on a small greyscale thumbprint. False means "same screen as last time". The key names a
     /// display, or a single window ("win:" and its number) when windows are photographed on their own.
     pub fn is_new(&self, display_key: String, luma: Vec<u8>) -> bool {
+        self.how_new(display_key, luma) != Newness::Same
+    }
+
+    /// The same check, saying how much changed. `Slight` is a few cells and nothing more: worth a look at the words
+    /// before the picture is saved again.
+    pub fn how_new(&self, display_key: String, luma: Vec<u8>) -> Newness {
         let mut p = lock(&self.s.prints);
-        let fresh = match p.get(&display_key) {
+        let how = match p.get(&display_key) {
             Some(old) if old.len() == luma.len() && !luma.is_empty() => {
                 let mut total = 0u64;
-                let mut peak = 0u8;
+                let mut cells = 0usize;
                 for (a, b) in old.iter().zip(&luma) {
                     let d = a.abs_diff(*b);
                     total += d as u64;
-                    peak = peak.max(d);
+                    cells += usize::from(d >= 8);
                 }
-                peak >= 8 || total as f64 / luma.len() as f64 >= 0.6
+                let mean = total as f64 / luma.len() as f64;
+                // AIDEV-NOTE: half a percent of the cells: a text cursor, a title bar's buttons going grey.
+                if cells == 0 && mean < 0.6 {
+                    Newness::Same
+                } else if mean < 0.6 && cells * 200 <= luma.len() {
+                    Newness::Slight
+                } else {
+                    Newness::Changed
+                }
             }
-            _ => true,
+            _ => Newness::Changed,
         };
+        let fresh = how != Newness::Same;
         if fresh {
             // Windows come and go and their numbers aren't reused. Forgetting costs one repeated picture each, no more.
             if p.len() >= PRINTS_CAP && !p.contains_key(&display_key) {
@@ -357,7 +381,7 @@ impl Engine {
             }
             p.insert(display_key, luma);
         }
-        fresh
+        how
     }
 
     /// A frame that passed `is_new` never arrived; the next look at that display counts as new.
@@ -1559,6 +1583,35 @@ mod tests {
         let mut p = Recent::default();
         remember(&mut p, &["see AKIAIOSFODNN7EXAMPLE and marmalade-tuba".into()]);
         assert!(p.shaped.is_empty() && p.plain.len() == 1);
+    }
+
+    /// A blinking text cursor or a title bar going grey is a change in a handful of cells. It is told apart from a
+    /// real change so that whoever asks can look at the words before saving the same picture again.
+    #[test]
+    fn a_handful_of_cells_changing_is_only_a_slight_change() {
+        let d = tempfile::tempdir().unwrap();
+        let e = Engine::new(d.path().to_string_lossy().into(), config(true), Arc::new(FakeHost(Default::default()))).unwrap();
+        let base = vec![200u8; 128 * 80];
+        assert_eq!(e.how_new("win:1".into(), base.clone()), Newness::Changed);
+        assert_eq!(e.how_new("win:1".into(), base.clone()), Newness::Same);
+        // A cursor: a few cells go dark.
+        let mut cursor = base.clone();
+        for c in cursor.iter_mut().skip(700).take(5) { *c = 40; }
+        assert_eq!(e.how_new("win:1".into(), cursor.clone()), Newness::Slight);
+        // And back again.
+        assert_eq!(e.how_new("win:1".into(), base.clone()), Newness::Slight);
+        // A line of text typed: many cells.
+        let mut typed = base.clone();
+        for c in typed.iter_mut().skip(2000).take(120) { *c = 60; }
+        assert_eq!(e.how_new("win:1".into(), typed), Newness::Changed);
+        // Everything a little different (a fade, a scroll of pale text): changed, however faint each cell.
+        assert_eq!(e.how_new("win:1".into(), vec![197u8; 128 * 80]), Newness::Changed);
+        // is_new says the same thing in one word.
+        assert!(!e.is_new("win:1".into(), vec![197u8; 128 * 80]));
+        let mut c2 = vec![197u8; 128 * 80];
+        c2[5] = 0;
+        assert!(e.is_new("win:1".into(), c2));
+        e.shutdown();
     }
 
     #[test]
