@@ -99,7 +99,7 @@ re!(DIGIT_RUN, r"\d(?:[\s\-\u{2010}-\u{2015}\u{2212}.]{0,2}\d){11,}");
 re!(CARD_PREFIX, r"^(?:3[47]\d{13}|(?:4\d|5[1-5]|2[2-7]|35|6[025])\d{14}|64[4-9]\d{13})$");
 re!(CARD_GROUPS, r"\b\d{4}[\s\-.]{1,2}\d{4}[\s\-.]{1,2}\d{4}[\s\-.]{1,2}\d{1,7}\b|\b3[47]\d{2}[\s\-.]{1,2}\d{6}[\s\-.]{1,2}\d{5}\b");
 re!(IBAN, r"\b[A-Z]{2}\d{2}(?:\s?[A-Z0-9]{4}){2,7}(?:\s?[A-Z0-9]{1,4})?\b");
-re!(SSN_HINT, r"\bssns?\b|\bss\s*(?:#|no\b|num)|\bsoc(?:ial)?\s+sec(?:urity)?|\btax(?:payer)?\s*(?:id|no\b|num)|\bitin\b|\btin\b|\bsocial\b");
+re!(SSN_HINT, r"ssn|\bss\s*(?:#|no\b|num)|soc(?:ial)?\s*sec|tax\s*(?:payer)?\s*(?:id|no\b|num)|\bitin\b|\btin\b|\bsocial\b");
 re!(SSN_LABEL, r"(?i)\b(?:ssn|social\s+security|tax(?:payer)?\s*id|itin|tin)\b");
 re!(FIN_LABEL, r"(?i)\b(?:routing|aba|account|acct|a/c|iban|sort\s*code|swift|bic|card|debit|credit)(?:\s*(?:number|num|no\.?|nbr|code|#))?(?:\s*\(?(?:required|optional)\)?)?\s*[:#]?");
 re!(FIN_VALUE, r"[0-9Xx*•](?:[\s\-.]?[0-9Xx*•]){4,24}");
@@ -596,19 +596,24 @@ pub fn scan(lines: &[TextLine]) -> Vec<Hit> {
     // Looser than the label rule on purpose: any hint anywhere keeps the number hidden. Names run together
     // ("employee_ssn", "SocialSecurityNumber") and headers split over two lines count.
     let ssn_named = {
-        let mut screen = String::new();
+        // Three readings of the screen, any of which may say so: as written, lowered and stripped to letters and
+        // digits, and the same with capitals starting new words. The gate can only get stricter.
+        let (mut plain, mut split) = (String::new(), String::new());
         for t in &latin {
             let mut prev = ' ';
             for c in t.chars() {
                 if c.is_uppercase() && prev.is_lowercase() {
-                    screen.push(' ');
+                    split.push(' ');
                 }
-                screen.push(if c.is_alphanumeric() || c == '#' { c.to_ascii_lowercase() } else { ' ' });
+                let k = if c.is_alphanumeric() || c == '#' { c.to_ascii_lowercase() } else { ' ' };
+                plain.push(k);
+                split.push(k);
                 prev = c;
             }
-            screen.push(' ');
+            plain.push(' ');
+            split.push(' ');
         }
-        SSN_HINT.is_match(&screen)
+        latin.iter().any(|t| SSN_LABEL.is_match(t)) || SSN_HINT.is_match(&plain) || SSN_HINT.is_match(&split)
     };
     let number_row = |t: &str| {
         let t = t.trim();
@@ -1528,7 +1533,7 @@ mod tests {
         let row = "12 40 219 09 9999 22 10 7";
         assert!(ssn(&[line("Dept  Code  SSN  Grade", 0.1, 0.1), line(row, 0.1, 0.2)]) >= 1);
         assert!(ssn(&[line(row, 0.1, 0.2), line("ok", 0.1, 0.3), line("Payroll: social security export", -10.0, -10.0)]) >= 1);
-        for header in ["employee_ssn", "SSNs", "SocialSecurityNumber", "SS# list", "TaxpayerId", "soc sec"] {
+        for header in ["employee_ssn", "SSNs", "SocialSecurityNumber", "SS# list", "TaxpayerId", "soc sec", "TaxPayer ID", "sSN", "SSNField", "socialsecuritynumber", "Tax ID"] {
             assert!(ssn(&[line(header, 0.1, 0.1), line(row, 0.1, 0.2)]) >= 1, "{header}");
         }
         assert!(ssn(&[line("Social", 0.1, 0.1), line("Security", 0.1, 0.15), line(row, 0.1, 0.2)]) >= 1);
