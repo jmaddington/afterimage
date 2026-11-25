@@ -48,6 +48,7 @@ func compare(out: String, pictures dir: String, env: [String: String]) throws {
                              facts: notes.filter { !$0.hasPrefix("!") }, secrets: notes.filter { $0.hasPrefix("!") }.map { String($0.dropFirst()) }))
     }
     guard !shown.isEmpty else { print("no .png pictures in \(dir)"); exit(1) }
+    setvbuf(stdout, nil, _IOLBF, 0)
     print("\(shown.count) pictures, \(models.count) models, detail: \(detail)")
     var rows: [Row] = [], problems: [String: String] = [:]
     for model in models {
@@ -76,8 +77,10 @@ func compare(out: String, pictures dir: String, env: [String: String]) throws {
         var seen: Set<Int64> = [], last = Date()
         let all = Filter(text: "", bundleId: nil, from: nil, to: nil, onlyKept: false, onlyHidden: false)
         let give = Date().addingTimeInterval(perPicture * Double(shown.count) * (detail == .both ? 2 : 1))
+        // A picture the model failed on three times is given up; pending counts only those still to be tried.
         while seen.count < shown.count && Date() < give {
             Thread.sleep(forTimeInterval: 0.1)
+            let left = try engine.stats().pending
             for shot in try engine.list(filter: all, limit: 500, offset: 0) where shot.indexed && !seen.contains(shot.id) {
                 seen.insert(shot.id)
                 let took = Date().timeIntervalSince(last)
@@ -91,8 +94,12 @@ func compare(out: String, pictures dir: String, env: [String: String]) throws {
                     rows.append(Row(model: model, variant: detail == .detailed ? "full" : "brief", picture: shot.moment.windowTitle, seconds: took, text: shot.description))
                 }
             }
+            let now = try engine.stats().pending
+            if left == 0 && now == 0 { break }
         }
         print("\(model): \(rows.filter { $0.model == model && $0.seconds != nil }.count)/\(shown.count) described in \(Int(Date().timeIntervalSince(began))) s")
+        // Kept as it goes: a long run that is stopped still leaves what it had.
+        try? JSONEncoder().encode(rows).write(to: URL(fileURLWithPath: "\(out)/descriptions.json"))
     }
 
     // Scores. Agreement is with every other model's description of the same picture, same variant.
