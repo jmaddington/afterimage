@@ -895,7 +895,7 @@ impl Shared {
             return Ok(None);
         }
         let title = (activity::key(&m.bundle_id, &f.moment.window_title), m.window_title.clone());
-        let new = NewShot { moment: m, path: path.clone(), thumb_path: thumb_path.clone(), width: e.width, height: e.height, bytes: e.bytes, regions, lines, ai_checked };
+        let new = NewShot { moment: m, path: path.clone(), thumb_path: thumb_path.clone(), width: e.width, height: e.height, bytes: e.bytes, regions, lines, ai_checked, check_model: if ai_checked { c.model.clone() } else { String::new() } };
         let inserted = store.insert(&new);
         if inserted.is_ok() {
             // This window's title has now been through everything the picture went through. Under the store lock,
@@ -1099,7 +1099,7 @@ fn describe_one(s: &Shared) -> Result<bool, String> {
     // The model's tags are its words about the screen too.
     let tags: Vec<String> = tags.iter().map(|t| detect::mask_text(t)).collect();
     let emb = if c.embed_model.is_empty() { None } else { embed_shot(s, &l, &c, &shot, &d, &body).ok() };
-    lock(&s.store).finish_index(shot.id, &d, &tags, emb.as_deref(), &c.embed_model).map_err(|e| e.to_string())
+    lock(&s.store).finish_index(shot.id, &d, &tags, emb.as_deref(), &c.embed_model, &c.model).map_err(|e| e.to_string())
 }
 
 /// What a picture is, as one piece of text for the embedding model.
@@ -1197,6 +1197,7 @@ mod tests {
         wait(|| e.stats().unwrap().count == 1);
         let s = e.list(Filter::default(), 10, 0).unwrap().remove(0);
         assert!(!s.ai_checked && s.regions.len() >= 2);
+        assert_eq!(s.check_model, "");
         let all = format!("{:?}{:?}", s, e.lines(s.id).unwrap());
         assert!(!all.contains("hunter22"), "{all}");
         let px = &lock(&h.0)[0];
@@ -1418,6 +1419,7 @@ mod tests {
         }
         // And each hidden place says what hid it.
         let shot = e.list(Filter::default(), 1, 0).unwrap().remove(0);
+        assert_eq!(shot.check_model, "m");
         let mut why: Vec<_> = shot.regions.iter().map(|r| r.why.as_str()).collect();
         why.sort_unstable();
         assert_eq!(why, vec!["assignment", "model"]);

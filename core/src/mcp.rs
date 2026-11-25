@@ -415,6 +415,8 @@ fn get_shot(s: &Shared, a: &Value, off: i32) -> Result<Value, String> {
     v["display"] = json!(shot.moment.display);
     v["hidden"] = json!(shot.regions.iter().map(|r| json!({"kind": r.kind, "found_by": r.why})).collect::<Vec<_>>());
     v["checked_by_model"] = json!(shot.ai_checked);
+    if !shot.check_model.is_empty() { v["check_model"] = json!(shot.check_model); }
+    if !shot.describe_model.is_empty() { v["describe_model"] = json!(shot.describe_model); }
     v["kept"] = json!(shot.kept);
     v["signed_in"] = json!({"user": shot.moment.user_name, "name": shot.moment.full_name, "mac": shot.moment.host});
     v["running_apps"] = json!(shot.moment.running_apps.iter().map(|x| x.name.as_str()).collect::<Vec<_>>());
