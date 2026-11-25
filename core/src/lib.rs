@@ -201,7 +201,7 @@ struct Shared {
     now_doing: Mutex<Option<Doing>>,
     /// Secrets found in windows photographed on their own, newest last, so the next window hides them too.
     // AIDEV-NOTE: RAM only, bounded, only ever adds hiding, so nothing empties it. Taken alone, never with another lock.
-    recent_secrets: Mutex<VecDeque<String>>,
+    recent_secrets: Mutex<Recent>,
     /// Apps that became off-limits: (bundle id, the last frame number that had arrived by then, when it was asked).
     dropped: Mutex<Vec<(String, u64, i64)>>,
     /// Window key -> its title as a saved picture left it. In memory only.
@@ -1058,24 +1058,47 @@ const RECENT_SECRETS: usize = 512;
 const RECENT_PER_FRAME: usize = 64;
 
 /// Newest last. One seen again becomes the newest.
-// AIDEV-NOTE: values the rules can't find by themselves go first, so a picture full of key-shaped strings can't
-// AIDEV-NOTE: use up the room before the label-, model- and field-found ones that only this memory can catch.
-fn remember(r: &mut VecDeque<String>, values: &[String]) {
-    let mut added = 0;
-    let alone = |v: &str| !detect::scan(&[TextLine { text: v.to_owned(), rect: Rect { x: 0.0, y: 0.0, w: 1.0, h: 0.1 }, tokens: vec![], code: false }]).is_empty();
-    let (shaped, plain): (Vec<&String>, Vec<&String>) = values.iter().partition(|v| alone(v));
-    for v in plain.into_iter().chain(shaped) {
-        if let Some(i) = r.iter().position(|x| x == v) {
-            r.remove(i);
-        } else if added >= RECENT_PER_FRAME {
+/// Secrets found in windows photographed on their own. Two lists, each bounded by itself, newest last.
+// AIDEV-NOTE: kept apart so neither kind can crowd out the other: `shaped` is what the rules find whole wherever it
+// AIDEV-NOTE: stands (a flood of key-shaped strings lands here); `plain` is what only a label, the model or a field gave away.
+#[derive(Default)]
+struct Recent {
+    plain: VecDeque<String>,
+    shaped: VecDeque<String>,
+}
+impl Recent {
+    fn iter(&self) -> impl Iterator<Item = &String> {
+        self.plain.iter().chain(&self.shaped)
+    }
+    fn clear(&mut self) {
+        self.plain.clear();
+        self.shaped.clear();
+    }
+}
+
+/// One seen again becomes the newest of its list. Each list takes at most RECENT_PER_FRAME new values per call.
+fn remember(r: &mut Recent, values: &[String]) {
+    // Found whole, by itself: anything less and the rules can't be counted on to find it elsewhere.
+    let whole = |v: &str| {
+        let hits = detect::scan(&[TextLine { text: v.to_owned(), rect: Rect { x: 0.0, y: 0.0, w: 1.0, h: 0.1 }, tokens: vec![], code: false }]);
+        hits.iter().any(|h| h.range.start == 0 && h.range.end >= v.len())
+    };
+    let (mut plain, mut shaped) = (0, 0);
+    for v in values {
+        let (list, added) = if whole(v) { (&mut r.shaped, &mut shaped) } else { (&mut r.plain, &mut plain) };
+        if let Some(i) = list.iter().position(|x| x == v) {
+            list.remove(i);
+        } else if *added >= RECENT_PER_FRAME {
             continue;
         } else {
-            added += 1;
+            *added += 1;
         }
-        r.push_back(v.clone());
+        list.push_back(v.clone());
     }
-    let extra = r.len().saturating_sub(RECENT_SECRETS);
-    r.drain(..extra);
+    for list in [&mut r.plain, &mut r.shaped] {
+        let extra = list.len().saturating_sub(RECENT_SECRETS);
+        list.drain(..extra);
+    }
 }
 
 fn secret_values(lines: &[TextLine], hits: &[Hit]) -> Vec<String> {
@@ -1488,23 +1511,30 @@ mod tests {
 
     #[test]
     fn remembered_secrets_stay_fresh_and_one_window_cannot_push_the_rest_out() {
-        let mut r: VecDeque<String> = (0..RECENT_SECRETS).map(|i| format!("old-{i}")).collect();
+        let mut r = Recent::default();
+        r.plain = (0..RECENT_SECRETS).map(|i| format!("old-{i}")).collect();
         remember(&mut r, &["old-0".into()]);
         // Seen again: it is the newest now, and the next to go is the one after it.
-        assert_eq!(r.back().map(String::as_str), Some("old-0"));
+        assert_eq!(r.plain.back().map(String::as_str), Some("old-0"));
         let flood: Vec<String> = (0..1000).map(|i| format!("new-{i}")).collect();
         remember(&mut r, &flood);
-        assert_eq!(r.len(), RECENT_SECRETS);
+        assert_eq!(r.plain.len(), RECENT_SECRETS);
         assert!(r.iter().any(|v| v == "old-0") && r.iter().filter(|v| v.starts_with("new-")).count() == RECENT_PER_FRAME);
-        // In one picture's worth, what only memory can catch goes in before what the rules know by shape.
-        let mut q: VecDeque<String> = VecDeque::new();
-        let mut mixed: Vec<String> = (0..RECENT_PER_FRAME).map(|i| format!("AKIAIOSFODNN7EXAMP{i:02}")).collect();
-        mixed.push("only-memory-knows-this".into());
+        // What the rules know by shape and what only memory can catch are kept apart: neither crowds the other out,
+        // whichever there is more of and whichever came first.
+        let keys: Vec<String> = (0..1000).map(|i| format!("AKIAIOSFODNN7EXA{i:04}")).collect();
+        remember(&mut r, &keys);
+        assert_eq!(r.plain.len(), RECENT_SECRETS);
+        assert!(r.iter().any(|v| v == "old-0") && r.shaped.len() == RECENT_PER_FRAME);
+        let mut q = Recent::default();
+        let mut mixed = flood.clone();
+        mixed.push("AKIAIOSFODNN7EXAMPLE".into());
         remember(&mut q, &mixed);
-        assert!(q.iter().any(|v| v == "only-memory-knows-this"));
-        // Even what the rules can find by its shape is remembered: found elsewhere it may be wrapped or cut short.
-        remember(&mut r, &["AKIAIOSFODNN7EXAMPLE".into()]);
-        assert_eq!(r.back().map(String::as_str), Some("AKIAIOSFODNN7EXAMPLE"));
+        assert!(q.iter().any(|v| v == "AKIAIOSFODNN7EXAMPLE") && q.plain.len() == RECENT_PER_FRAME);
+        // A value the rules catch only part of isn't one they catch: it is kept with the plain ones.
+        let mut p = Recent::default();
+        remember(&mut p, &["see AKIAIOSFODNN7EXAMPLE and marmalade-tuba".into()]);
+        assert!(p.shaped.is_empty() && p.plain.len() == 1);
     }
 
     #[test]
