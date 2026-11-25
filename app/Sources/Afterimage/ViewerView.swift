@@ -175,6 +175,7 @@ struct Details: View {
                 if !shot.moment.windowTitle.isEmpty { row("Window", shot.moment.windowTitle) }
                 if !shot.moment.url.isEmpty { row("Page", shot.moment.url) }
                 row("Display", shot.moment.display)
+                if !shot.moment.windowKey.isEmpty { row("Picture of", Words.windowRole(front: shot.moment.windowFront)) }
             }
             Section("Privacy") {
                 if shot.regions.isEmpty {

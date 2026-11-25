@@ -19,6 +19,10 @@ public actor Capturer {
     private var busy = false
     /// Why the last capture was refused on privacy grounds, for a log that mustn't name the app.
     private var lastRefusal: HideReason?
+    /// Part of every window's name, new each time the app starts.
+    private let session = WindowShots.newSession()
+    /// Windows that have a picture of them in front showing what they show now. Bounded; forgetting costs a repeat.
+    private var frontTaken: Set<CGWindowID> = []
     public init(engine: Engine) { self.engine = engine }
 
     /// Asked of the recorder each time: why not to look right now (nil to go ahead), and what is off-limits.
@@ -73,14 +77,226 @@ public actor Capturer {
     }
 
     /// The outcome, and when it was a privacy refusal, which kind (for a log that mustn't name the app).
-    public func capture(_ trigger: Trigger, allDisplays: Bool, gate: @escaping Gate) async -> (outcome: CaptureOutcome, refusal: HideReason?) {
+    /// `windows`: photograph each window on its own instead of the display ("Capture windows separately").
+    public func capture(_ trigger: Trigger, allDisplays: Bool, windows: Bool = false, gate: @escaping Gate) async -> (outcome: CaptureOutcome, refusal: HideReason?) {
         // Actors are re-entrant across awaits; without this two cycles could mix one's pixels with the other's facts.
         guard !busy else { return (.blocked("Busy"), nil) }
         busy = true
         defer { busy = false }
         lastRefusal = nil
-        let outcome = await run(trigger, allDisplays: allDisplays, gate: gate)
+        let outcome = windows ? await runWindows(trigger, allDisplays: allDisplays, gate: gate) : await run(trigger, allDisplays: allDisplays, gate: gate)
         return (outcome, lastRefusal)
+    }
+
+    /// Each window as its own picture, covered or not. Same order as `run`: decide, look, photograph, look again.
+    /// AIDEV-NOTE: privacy-critical. Which windows is decided by WindowShots.plan (rules in core/src/windows.rs), before
+    /// AIDEV-NOTE: and after; a picture is kept only if both agree. Two brackets: the window in front (with a picture of
+    /// AIDEV-NOTE: the displays, read for context only and never saved) in one short one; the windows behind in a second,
+    /// AIDEV-NOTE: with a look after every picture. Trouble in the second costs only the windows behind.
+    private func runWindows(_ trigger: Trigger, allDisplays: Bool, gate: @escaping Gate) async -> CaptureOutcome {
+        let front = await MainActor.run { NSWorkspace.shared.frontmostApplication.map { ($0.processIdentifier, $0.localizedName ?? "", $0.bundleIdentifier ?? "") } }
+        guard let front else { return .skipped("No app is in front") }
+        if front.0 == getpid() { return .blocked("Afterimage is in front") }
+
+        let exclusions = await gate().exclusions
+        var hiddenBefore = await hidden(exclusions)
+        if hiddenBefore.pids.contains(front.0) {
+            lastRefusal = hiddenBefore.reasons[front.0] ?? .app
+            return Self.refused(hiddenBefore.reasons[front.0], front.1)
+        }
+        let content: SCShareableContent
+        do {
+            content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        } catch { return .failed(error.localizedDescription) }
+        // Listing windows can take long enough for the facts to change.
+        hiddenBefore = await hidden(exclusions)
+        if hiddenBefore.pids.contains(front.0) {
+            lastRefusal = hiddenBefore.reasons[front.0] ?? .app
+            return Self.refused(hiddenBefore.reasons[front.0], front.1)
+        }
+        // "Displays: the one in use" holds here too: only windows on the displays a whole-display picture would show.
+        let screens = pick(content.displays, front: OnScreenWindow.front(of: front.0, in: OnScreenWindow.all())?.bounds, all: allDisplays)
+        guard !screens.isEmpty else { return .failed("No display is available") }
+        let desktop = screens.map(\.frame)
+        // Minimised windows and windows on another desktop are listed too; they aren't on screen.
+        let handles = Dictionary(content.windows.filter(\.isOnScreen).map { ($0.windowID, $0) }, uniquingKeysWith: { a, _ in a })
+        let shareable = Set(handles.keys)
+        // Who owns what is read at the same instant as the list it is judged with, and the picture is labelled from it.
+        func plan(_ hidden: Set<pid_t>) async -> (choices: [WindowChoice], list: [OnScreenWindow], owners: [pid_t: WindowShots.Owner], names: [pid_t: String]) {
+            let running = await MainActor.run {
+                NSWorkspace.shared.runningApplications.map { ($0.processIdentifier, $0.bundleIdentifier ?? "", $0.activationPolicy == .regular, $0.localizedName ?? "") }
+            }
+            let owners = Dictionary(running.map { ($0.0, WindowShots.Owner(bundleId: $0.1, regular: $0.2)) }, uniquingKeysWith: { a, _ in a })
+            let list = OnScreenWindow.all()
+            let choices = WindowShots.plan(exclusions, front: (front.0, front.2), list: list, owners: owners, shareable: shareable, hidden: hidden, own: getpid(), desktop: desktop)
+            return (choices, list, owners, Dictionary(running.map { ($0.0, $0.3) }, uniquingKeysWith: { a, _ in a }))
+        }
+        let planned = await plan(hiddenBefore.pids)
+        let wanted = planned.choices.filter { $0.skip == nil }
+        guard !wanted.isEmpty else { return .blocked("No window could be photographed") }
+        // Nothing hidden is ever chosen, so nothing hidden beforehand can be in a window's picture.
+        let omit = content.applications.filter { hiddenBefore.pids.contains($0.processID) }
+        let omitted = hiddenBefore.pids
+        // The first bracket also photographs the displays, where only apps ScreenCaptureKit lists can be left out:
+        // a hidden app that is drawn but not listed spoils that look, as it does for whole-display capture.
+        let leftOut = Set(omit.map(\.processID))
+
+        struct Shot { let choice: WindowChoice; let image: CGImage; let at: Date; let content: CGSize? }
+        func grab(_ c: WindowChoice) async -> Shot? {
+            // The handle must be for the app the verdict was about.
+            guard let w = handles[c.id], w.owningApplication?.processID == c.pid else { return nil }
+            let filter = SCContentFilter(desktopIndependentWindow: w)
+            let cfg = SCStreamConfiguration()
+            // What the picture covers, when ScreenCaptureKit says; otherwise the window as it listed it.
+            let said = filter.contentRect.isEmpty ? nil : filter.contentRect.size
+            guard let size = WindowShots.pixels(said ?? w.frame.size, scale: Double(filter.pointPixelScale)) else { return nil }
+            cfg.width = size.width
+            cfg.height = size.height
+            cfg.showsCursor = false
+            cfg.ignoreShadowsSingleWindow = true
+            cfg.captureResolution = .best
+            // AIDEV-NOTE: stamped before the pixels exist, so "forget the last minutes" can never miss them.
+            let at = Date()
+            // A window that closed a moment ago gives an error; that is one window less, not a failure.
+            do { return Shot(choice: c, image: try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg), at: at, content: said) }
+            catch {
+                NSLog("a window couldn't be photographed: %@ [AIMG-WIN02]", error.localizedDescription)
+                return nil
+            }
+        }
+
+        // First bracket: the window in front, and the displays as whole-display capture would have seen them.
+        let before = await look(exclusions, hiddenBefore, gate)
+        if let why = Self.spoiled(before, before, omitted: leftOut) { return why }
+        guard before.front == front.0, before.exclusions == exclusions else { return .skipped("The app changed mid-capture") }
+        let frontChoice = wanted.first(where: \.front)
+        var frontShot: Shot?
+        if let frontChoice { frontShot = await grab(frontChoice) }
+        // AIDEV-NOTE: privacy-critical. These pictures are read for their text and dropped. Whole-display capture hides a
+        // AIDEV-NOTE: secret wherever it shows once it is found anywhere on screen; a window alone must hide no less.
+        var around: [CGImage] = []
+        for d in screens {
+            let filter = SCContentFilter(display: d, excludingApplications: omit, exceptingWindows: [])
+            let cfg = SCStreamConfiguration()
+            let scale = Double(filter.pointPixelScale)
+            cfg.width = Int(Double(d.width) * scale)
+            cfg.height = Int(Double(d.height) * scale)
+            cfg.showsCursor = false
+            cfg.captureResolution = .best
+            do { around.append(try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg)) }
+            catch { return .failed(error.localizedDescription) }
+        }
+        let quick = await look(exclusions, hiddenBefore, gate)
+        let hiddenAfter = await hidden(exclusions)
+        let after = await look(exclusions, hiddenAfter, gate)
+        if let why = Self.spoiled(before, after, during: [quick], omitted: leftOut) { return why }
+        var everHidden = hiddenBefore.pids.union(hiddenAfter.pids)
+        let kept = Set(keepWindows(before: planned.choices, after: await plan(everHidden).choices))
+        if let f = frontChoice {
+            // The window in front is what this look was for. Changed or not photographed, the look is taken again.
+            guard kept.contains(f.id) else { return .skipped("The window changed mid-capture") }
+            guard frontShot != nil else { return .skipped("The window in front couldn’t be photographed") }
+            // Its address is the one the check vouched for only if it was the same before and after.
+            guard hiddenBefore.focusedURL[f.pid] == hiddenAfter.focusedURL[f.pid] else { return .skipped("The page changed mid-capture") }
+        }
+
+        let apps = await MainActor.run {
+            NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular }
+                .map { AppRef(name: $0.localizedName ?? "", bundleId: $0.bundleIdentifier ?? "") }
+        }.filter { hideApp(ex: exclusions, bundleId: $0.bundleId) == nil }
+        let listed = Dictionary(planned.list.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        let displays = content.displays.map { (id: $0.displayID, frame: $0.frame) }
+        // Read once, when the first picture needs it.
+        var context: [TextLine]?
+        func surroundings() -> [TextLine]? {
+            if let context { return context }
+            var all: [TextLine] = []
+            for i in around {
+                guard let l = try? Recognizer.lines(in: i) else { return nil }
+                all += l
+            }
+            around = []
+            context = all
+            return all
+        }
+        var queued = 0
+        /// Read one picture and hand it over. False when it couldn't be, and its thumbprint has been let go.
+        func send(_ s: Shot, covers: [Cover], url: String) async -> Bool {
+            guard let w = listed[s.choice.id], let owner = planned.owners[w.pid] else { return false }
+            let key = "win:\(w.id)"
+            // Without what else was on screen the picture would hide less than a whole-display one: not taken.
+            guard let lines = try? Recognizer.lines(in: s.image), let around = surroundings(), let b = Pixels.bitmap(s.image) else {
+                engine.lost(displayKey: key)
+                return false
+            }
+            let display = Self.displays(displays, front: w.bounds, all: false, main: CGMainDisplayID()).first
+            let m = Moment(
+                takenAt: Int64(s.at.timeIntervalSince1970 * 1000), trigger: trigger.rawValue, display: await Self.name(display ?? CGMainDisplayID()),
+                appName: planned.names[w.pid] ?? "", bundleId: owner.bundleId, windowTitle: w.title, url: url,
+                userName: Session.consoleUser, fullName: NSFullUserName(), host: Session.computerName, sessions: Session.loggedIn, runningApps: apps,
+                windowKey: WindowShots.key(session: session, id: w.id), windowFront: s.choice.front)
+            engine.ingest(frame: Frame(rgba: b.data, width: UInt32(b.width), height: UInt32(b.height), stride: UInt32(b.stride), lines: lines, moment: m, displayKey: key, covers: covers, context: around))
+            queued += 1
+            return true
+        }
+        /// The secret fields on a window, or nil when one can't be placed and the window must be left out.
+        func fields(_ s: Shot) -> [Cover]? {
+            guard let w = listed[s.choice.id], w.pid == s.choice.pid,
+                  let covers = WindowShots.covers(before.covers[w.pid] ?? [], window: w.bounds, content: s.content) else {
+                engine.noteCapture(trigger: "window", outcome: "A window was left out: a secret field couldn’t be placed on it")
+                NSLog("a window was left out: a secret field couldn't be placed on it [AIMG-WIN01]")
+                return nil
+            }
+            return covers
+        }
+
+        if let s = frontShot {
+            frontShot = nil
+            guard let covers = fields(s) else { return .skipped("A secret field couldn’t be placed on the window in front") }
+            let id = s.choice.id
+            let verdict = WindowShots.take(front: true, manual: trigger == .manual, print: Pixels.thumbprint(s.image, skipBar: false), queued: queued, hadFront: frontTaken.contains(id)) {
+                engine.isNew(displayKey: "win:\(id)", luma: $0)
+            }
+            if verdict == .take {
+                guard await send(s, covers: covers, url: hiddenAfter.focusedURL[s.choice.pid] ?? "") else { return .failed("The screen couldn't be read, so it wasn't saved") }
+                if frontTaken.count >= 512 { frontTaken.removeAll() }
+                frontTaken.insert(id)
+            }
+        }
+
+        // Second bracket: the windows behind, one at a time, with a look after each. Only changed ones are held on to.
+        var behind: [Shot] = []
+        var looks: [Look] = []
+        for c in wanted where !c.front && kept.contains(c.id) {
+            guard queued + behind.count < WindowShots.maxQueued else { break }
+            guard let s = await grab(c) else { continue }
+            looks.append(await look(exclusions, hiddenAfter, gate))
+            let id = c.id
+            let verdict = WindowShots.take(front: false, manual: false, print: Pixels.thumbprint(s.image, skipBar: false), queued: queued + behind.count, hadFront: false) {
+                engine.isNew(displayKey: "win:\(id)", luma: $0)
+            }
+            guard verdict == .take else { continue }
+            // What it shows has changed since any picture of it in front.
+            frontTaken.remove(id)
+            behind.append(s)
+        }
+        if !behind.isEmpty {
+            let hiddenLast = await hidden(exclusions)
+            let last = await look(exclusions, hiddenLast, gate)
+            everHidden.formUnion(hiddenLast.pids)
+            let still = Set(keepWindows(before: planned.choices, after: await plan(everHidden).choices))
+            let spoiled = Self.spoiled(after, last, during: looks, omitted: omitted) != nil
+            for s in behind {
+                let key = "win:\(s.choice.id)"
+                guard !spoiled, still.contains(s.choice.id), let covers = fields(s) else {
+                    engine.lost(displayKey: key)
+                    continue
+                }
+                // One window that can't be read is one window less, not a failed look.
+                _ = await send(s, covers: covers, url: "")
+            }
+        }
+        return queued == 0 ? .unchanged : .queued(queued)
     }
 
     private func run(_ trigger: Trigger, allDisplays: Bool, gate: @escaping Gate) async -> CaptureOutcome {
