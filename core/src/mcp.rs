@@ -434,6 +434,7 @@ fn get_shot(s: &Shared, a: &Value, off: i32) -> Result<Value, String> {
     if !shot.check_model.is_empty() { v["check_model"] = json!(shot.check_model); }
     if !shot.describe_model.is_empty() { v["describe_model"] = json!(shot.describe_model); }
     if !shot.detail.is_empty() { v["detail"] = json!(shot.detail); }
+    if !shot.detail_model.is_empty() { v["detail_model"] = json!(shot.detail_model); }
     v["kept"] = json!(shot.kept);
     v["signed_in"] = json!({"user": shot.moment.user_name, "name": shot.moment.full_name, "mac": shot.moment.host});
     v["running_apps"] = json!(shot.moment.running_apps.iter().map(|x| x.name.as_str()).collect::<Vec<_>>());
@@ -455,7 +456,7 @@ mod tests {
     fn shot(id: i64, at: i64, bundle: &str, title: &str, key: &str, front: bool) -> Shot {
         let moment = crate::store::Moment { taken_at: at, app_name: bundle.into(), bundle_id: bundle.into(), window_title: title.into(), window_key: key.into(), window_front: front, ..Default::default() };
         Shot { id, moment, path: String::new(), thumb_path: String::new(), width: 1, height: 1, bytes: 1, regions: vec![], description: String::new(), tags: vec![],
-               kept: false, indexed: false, ai_checked: true, check_model: String::new(), describe_model: String::new(), detail: String::new() }
+               kept: false, indexed: false, ai_checked: true, check_model: String::new(), describe_model: String::new(), detail: String::new(), detail_model: String::new() }
     }
 
     #[test]

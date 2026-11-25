@@ -135,6 +135,12 @@ pub struct Config {
     /// How much the model thinks before answering: "off", "low", "medium" or "high". Each model gets the nearest it allows.
     #[uniffi(default = "off")]
     pub reasoning: String,
+    /// The idle pass: a second model that writes a fuller account of saved pictures while nobody is at the Mac. Empty: none.
+    #[uniffi(default = "")]
+    pub idle_model: String,
+    /// How much the idle model thinks.
+    #[uniffi(default = "off")]
+    pub idle_reasoning: String,
 }
 
 /// How much a description says.
@@ -240,6 +246,8 @@ struct Shared {
     reason: Mutex<String>,
     busy: AtomicBool,
     describing: AtomicBool,
+    /// Nobody is at the Mac: the slow pass may run.
+    idle: AtomicBool,
     /// A description gave way to a waiting picture: none is started again before this.
     put_off: Mutex<Instant>,
     on_power: AtomicBool,
@@ -303,7 +311,7 @@ impl Engine {
             hasher: RandomState::new(), forgotten: Default::default(), loaded_by_us: Default::default(),
             last_lm_use: Mutex::new(Instant::now()), lm_state: Mutex::new(LmState::Unknown), links: Default::default(),
             discarded: AtomicU64::new(0), reason: Default::default(), busy: AtomicBool::new(false),
-            describing: AtomicBool::new(false), put_off: Mutex::new(Instant::now()), on_power: AtomicBool::new(true), calm: AtomicBool::new(true), pages: Default::default(), outlets: Default::default(), question: AtomicU64::new(now_ms() as u64), mcp: Default::default(), now_doing: Default::default(), recent_secrets: Default::default(), dropped: Default::default(), cleared: Default::default(),
+            describing: AtomicBool::new(false), idle: AtomicBool::new(false), put_off: Mutex::new(Instant::now()), on_power: AtomicBool::new(true), calm: AtomicBool::new(true), pages: Default::default(), outlets: Default::default(), question: AtomicU64::new(now_ms() as u64), mcp: Default::default(), now_doing: Default::default(), recent_secrets: Default::default(), dropped: Default::default(), cleared: Default::default(),
         });
         for (name, f) in [("afterimage-save", save_loop as fn(Arc<Shared>)), ("afterimage-index", index_loop)] {
             let s = s.clone();
@@ -380,6 +388,13 @@ impl Engine {
     }
 
     /// `calm`: thermal state is fine and Low Power Mode is off.
+    /// Whether nobody has been at the Mac for a while: the time for the slow pass.
+    pub fn set_idle(&self, idle: bool) {
+        if self.s.idle.swap(idle, SeqCst) != idle {
+            self.s.wake.notify_all();
+        }
+    }
+
     pub fn set_conditions(&self, on_power: bool, calm: bool) {
         self.s.on_power.store(on_power, SeqCst);
         self.s.calm.store(calm, SeqCst);
@@ -1262,7 +1277,7 @@ fn index_loop(s: Arc<Shared>) {
             }
         }
         // New pictures first; then any whose search data an earlier model made.
-        let did = describe_one(&s).and_then(|did| if did { Ok(true) } else { reembed_one(&s) });
+        let did = describe_one(&s).and_then(|did| if did { Ok(true) } else { reembed_one(&s) }).and_then(|did| if did { Ok(true) } else { deepen_one(&s) });
         s.describing.store(false, SeqCst);
         let nap = match did {
             Ok(true) => {
@@ -1399,6 +1414,62 @@ fn describe_one(s: &Shared) -> Result<bool, String> {
     lock(&s.store).finish_index(shot.id, &d, &more, &tags, emb.as_deref(), &c.embed_model, &c.model).map_err(|e| e.to_string())
 }
 
+/// The idle pass: while nobody is at the Mac, a second model writes a fuller account of one saved picture.
+// AIDEV-NOTE: privacy-critical in the same ways as describe_one: it sees only what was saved (already hidden), gives
+// AIDEV-NOTE: way to a picture waiting to be checked, and its words pass hide_known before disk and the dev log.
+fn deepen_one(s: &Shared) -> Result<bool, String> {
+    let c = lock(&s.config).clone();
+    if c.idle_model.is_empty() {
+        return Ok(false);
+    }
+    let away = s.idle.load(SeqCst) && s.on_power.load(SeqCst) && s.calm.load(SeqCst);
+    if !away {
+        // Somebody is back: the second model's memory is theirs again.
+        if c.idle_model != c.model && lock(&s.loaded_by_us).remove(&c.idle_model) {
+            if let Ok(l) = s.lm(&c) {
+                let _ = l.unload(&c.idle_model);
+            }
+        }
+        return Ok(false);
+    }
+    if s.busy.load(SeqCst) || !lock(&s.queue).frames.is_empty() || Instant::now() < *lock(&s.put_off) {
+        return Ok(false);
+    }
+    let Some((shot, body)) = lock(&s.store).next_shallow().map_err(|e| e.to_string())? else { return Ok(false) };
+    let (l, tape) = s.taped(&c);
+    let mut l = l.map_err(|e| e.to_string())?;
+    l.effort = c.idle_reasoning.clone();
+    struct Log<'a>(&'a Shared, lm::Tape, i64);
+    impl Drop for Log<'_> {
+        fn drop(&mut self) {
+            let known = known(self.0);
+            self.0.note(devlog::about(take(&self.1), self.2, &|t| hide_known(&known, t)));
+        }
+    }
+    let _log = Log(s, tape, shot.id);
+    s.describing.store(true, SeqCst);
+    let how = lm::Detail::DETAILED;
+    s.ensure(&l, &c.idle_model, how.context()).map_err(|e| e.to_string())?;
+    // Gives way to a picture waiting to be checked, and to the person coming back.
+    let stop = || s.busy.load(SeqCst) || !lock(&s.queue).frames.is_empty() || !s.idle.load(SeqCst);
+    let answer = s.host.model_image(shot.path.clone(), how.picture_edge).map_err(|e| lm::LmError::Model(e.to_string()))
+        .and_then(|img| l.describe(&c.idle_model, &img, &shot.moment.app_name, &shot.moment.window_title, &body, how, &stop));
+    *lock(&s.last_lm_use) = Instant::now();
+    match answer {
+        Ok((text, _)) => {
+            let text = hide_known(&known(s), &text);
+            lock(&s.store).finish_deep(shot.id, Some((&text, &c.idle_model))).map(|_| true).map_err(|e| e.to_string())
+        }
+        Err(lm::LmError::Yielded) => {
+            *lock(&s.put_off) = Instant::now() + Duration::from_secs(30);
+            Ok(false)
+        }
+        Err(e @ lm::LmError::Offline) => Err(e.to_string()),
+        // It answered and had nothing usable for this one: on to the next.
+        Err(e) => lock(&s.store).finish_deep(shot.id, None).map(|_| true).map_err(|x| format!("{e}; {x}")),
+    }
+}
+
 /// What a picture is, as one piece of text for the embedding model.
 fn embed_shot(s: &Shared, l: &lm::Lm, c: &Config, shot: &Shot, description: &str, body: &str) -> Result<Vec<f32>, lm::LmError> {
     let style = lm::embed_style(&c.embed_model);
@@ -1455,7 +1526,7 @@ mod tests {
 
     // Port 9 refuses connections: stands in for LM Studio being off.
     fn config(require_ai: bool) -> Config {
-        Config { lm_url: "http://127.0.0.1:9".into(), model: "m".into(), embed_model: String::new(), require_ai, describe: DescribeWhen::Never, max_age_days: 0, max_bytes: 0, unload_after_secs: 0, developer: false, detail: DescribeDetail::Brief, custom_long: false, custom_tokens: 900, custom_chars: 4000, custom_edge: 1280, reasoning: "off".into() }
+        Config { lm_url: "http://127.0.0.1:9".into(), model: "m".into(), embed_model: String::new(), require_ai, describe: DescribeWhen::Never, max_age_days: 0, max_bytes: 0, unload_after_secs: 0, developer: false, detail: DescribeDetail::Brief, custom_long: false, custom_tokens: 900, custom_chars: 4000, custom_edge: 1280, reasoning: "off".into(), idle_model: String::new(), idle_reasoning: "off".into() }
     }
     fn frame(at: i64) -> Frame {
         let l = |t: &str, y: f64| TextLine { text: t.into(), rect: Rect { x: 0.1, y, w: 0.5, h: 0.1 }, tokens: vec![], code: false };
@@ -2453,6 +2524,32 @@ mod tests {
         s.finish_index(shot.id, "short", "long", &[], None, "", "m").unwrap();
         s.keep_brief(shot.id, "changed", &[]).unwrap();
         assert_eq!(s.list(&Filter::default(), 5, 0).unwrap()[0].description, "short");
+    }
+
+    #[test]
+    fn a_second_model_writes_a_fuller_account_only_while_nobody_is_at_the_mac() {
+        let d = tempfile::tempdir().unwrap();
+        let both = r#"{"findings":[],"description":"a page about otters","tags":["otters"]}"#;
+        let c = Config { lm_url: fake_lm(both, 200), describe: DescribeWhen::Always, idle_model: "m".into(), ..config(true) };
+        let e = Engine::new(d.path().to_string_lossy().into(), c, Arc::new(FakeHost(Default::default()))).unwrap();
+        let mut f = frame(1000);
+        f.lines.truncate(1);
+        f.moment.window_title = "t".into();
+        f.moment.url.clear();
+        e.ingest(f);
+        wait(|| e.stats().unwrap().count == 1 && e.stats().unwrap().pending == 0);
+        let shot = || e.list(Filter::default(), 5, 0).unwrap().remove(0);
+        // Somebody is at the Mac: the short description is all there is, however long we wait.
+        std::thread::sleep(Duration::from_millis(2500));
+        assert_eq!((shot().description.as_str(), shot().detail.as_str()), ("a page about otters", ""));
+        e.set_idle(true);
+        wait(|| !shot().detail.is_empty());
+        let s = shot();
+        assert!(s.description == "a page about otters" && s.detail.starts_with("In full") && !s.detail.contains("hunter22") && s.detail_model == "m", "{s:?}");
+        // Found by the fuller account's words, and done once.
+        assert_eq!(e.search(Filter { text: "full".into(), ..Default::default() }, false, 5).unwrap().len(), 1);
+        assert!(lock(&e.s.store).next_shallow().unwrap().is_none());
+        e.shutdown();
     }
 
     #[test]
