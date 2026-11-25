@@ -394,15 +394,6 @@ pub fn scan_text(text: &str, line: usize, hits: &mut Vec<Hit>) {
 fn scan_latin(text: &str, line: usize, hits: &mut Vec<Hit>) {
     use SecretKind::*;
     for m in SSN.find_iter(text) {
-        // Written with spaces inside a longer row of numbers, it is part of that row (a table, a hex dump, a
-        // misread progress bar). Dashes and dots are taken at their word, and so is any line that names it.
-        let spaced = m.as_str().chars().all(|c| c.is_ascii_digit() || c == ' ');
-        let before = text[..m.start()].trim_end_matches(' ');
-        let after = text[m.end()..].trim_start_matches(' ');
-        let in_a_row = (before.len() < m.start() && before.ends_with(|c: char| c.is_ascii_digit())) || (after.len() < text.len() - m.end() && after.starts_with(|c: char| c.is_ascii_digit()));
-        if spaced && in_a_row && !SSN_LABEL.is_match(text) {
-            continue;
-        }
         push(hits, line, m.range(), Ssn, "ssn");
     }
     if SSN_LABEL.is_match(text) {
@@ -598,6 +589,15 @@ pub fn scan(lines: &[TextLine]) -> Vec<Hit> {
     // The kind of block that is open. Only an END of the same kind closes it.
     let mut in_pem: Option<String> = None;
     let latin: Vec<String> = lines.iter().map(|l| latinised(&l.text, false).0).collect();
+    // AIDEV-NOTE: privacy-critical, narrow on purpose. A spaced SSN shape is let go only when its whole line is one
+    // AIDEV-NOTE: long row of bare numbers (six or more groups, single spaces, nothing else), holds a single such
+    // AIDEV-NOTE: shape, and nothing anywhere on the screen or in the title names an SSN. Seen live: a misread line.
+    let ssn_named = latin.iter().any(|t| SSN_LABEL.is_match(t));
+    let number_row = |t: &str| {
+        let t = t.trim();
+        let groups = t.split(' ').count();
+        groups >= 6 && t.chars().all(|c| c.is_ascii_digit() || c == ' ') && !t.contains("  ") && SSN.find_iter(t).count() == 1
+    };
     // Three or more block lines in a row are key material whether or not a header is in view.
     let mut i = 0;
     while i < lines.len() {
@@ -632,6 +632,9 @@ pub fn scan(lines: &[TextLine]) -> Vec<Hit> {
             }
         }
         scan_text(&l.text, i, &mut hits);
+        if !ssn_named && number_row(t) {
+            hits.retain(|h| !(h.line == i && h.why == "ssn"));
+        }
 
         if PASS_LABEL.is_match(t) {
             for j in neighbours(lines, i) {
@@ -1493,12 +1496,22 @@ mod tests {
 
     #[test]
     fn a_row_of_numbers_is_not_a_social_security_number() {
-        // Seen live: a misread line "0000 57 50 4005 50 123 45 6789" frosted part of a terminal.
-        for t in ["0000 57 50 4005 50 123 45 6789", "123 45 6789 22 10", "12 123 45 6789"] {
-            assert_eq!(masked(t), t);
+        let ssn = |l: &[TextLine]| scan(l).iter().filter(|h| h.why == "ssn").count();
+        let one = |t: &str| ssn(&[line(t, 0.1, 0.1)]);
+        // Seen live: a misread line of digit groups frosted part of a terminal.
+        for t in ["0000 57 50 4005 50 123 45 6789", "12 40 123 45 6789 22 10 7"] {
+            assert_eq!(one(t), 0, "{t}");
         }
-        for t in ["219 09 9999", "call me, 219 09 9999 is it", "219-09-9999 22 10", "0000 57 219.09.9999 4", "SSN 12 219 09 9999 4"] {
-            assert!(!masked(t).contains("9999"), "{t}");
+        // Anything short of a long bare row is still hidden.
+        for t in ["219 09 9999", "1 219 09 9999", "1042 219 09 9999 52000", "call me, 219 09 9999 is it", "219-09-9999 22 10 4 5 6", "0000 57 219.09.9999 4 5 6",
+                  "12 40 219 09 9999 22  10 7", "id 12 40 219 09 9999 22 10 7", "219 09 9999 123 45 6789"] {
+            assert!(one(t) >= 1, "{t}");
         }
+        // And so is a long row when anything on the screen names it: a column header, or the window's title.
+        let row = "12 40 219 09 9999 22 10 7";
+        assert!(ssn(&[line("Dept  Code  SSN  Grade", 0.1, 0.1), line(row, 0.1, 0.2)]) >= 1);
+        assert!(ssn(&[line(row, 0.1, 0.2), line("ok", 0.1, 0.3), line("Payroll: social security export", -10.0, -10.0)]) >= 1);
+        // A single piece of text on its own (a title, a caption) is never given the benefit of the doubt.
+        assert!(!masked(row).contains("9999"));
     }
 }
