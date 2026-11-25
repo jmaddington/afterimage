@@ -82,6 +82,12 @@ Releases: `docs/agents/release.md`. Cargo `strip` must stay off (macOS 27 reject
   `WindowShots.swift`; the ScreenCaptureKit part is `Capturer.runWindows`. A browser window is taken only when in front;
   in the background never. A shot's `moment.window_key` / `window_front` say which window it was (empty: whole display).
 
+- Description detail (developer setting `describeDetail`: brief, detailed, both, custom): `lm::Detail` says how long the answer,
+  how much text and how big a picture; `Config::context()` sizes the model load for the fullest. "Both" keeps the full account in
+  `shots.detail`. Descriptions are streamed and give way (`LmError::Yielded`) once a picture is waiting to be checked; the model is loaded
+  again if it is loaded too small. The model's words pass `hide_known` (rules plus secrets lately found) before disk or the dev log.
+  Try it live: `AFTERIMAGE_LIVE=1 AFTERIMAGE_DETAIL=both AFTERIMAGE_ROUNDS=1 swift run afterimage-checks seed <dir> ../fixtures`.
+
 ## Conventions & Patterns
 
 - Privacy is the product: when unsure, don't capture. A new signal may only add hiding, never remove it.

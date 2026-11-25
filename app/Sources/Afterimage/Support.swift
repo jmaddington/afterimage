@@ -59,6 +59,15 @@ enum Words {
         let sameYear = c.isDate(d, equalTo: Date(), toGranularity: .year)
         return d.formatted(sameYear ? .dateTime.weekday(.wide).month(.wide).day() : .dateTime.weekday(.wide).month(.wide).day().year())
     }
+    /// What each choice of description costs and gives.
+    static func describeDetail(_ choice: String) -> String {
+        switch choice {
+        case "detailed": "A full account of each picture in place of the few sentences. Several times slower. Pictures already described keep what they have."
+        case "both": "The few sentences, and a full account beside them. Two requests a picture, so the slowest. Pictures already described keep what they have."
+        case "custom": "One description made with these numbers. The model is loaded again with room for them."
+        default: "Three to five sentences a picture."
+        }
+    }
     static func trigger(_ t: String) -> String {
         switch t {
         case "manual": "Captured by you"

@@ -50,6 +50,13 @@ import Observation
     /// Made the first time access is switched on; changing it cuts off whoever had the old one.
     public var agentToken: String { didSet { save("agentToken", agentToken) } }
     public var developer: Bool { didSet { save("developer", developer) } }
+    /// How much a description says: "brief", "detailed", "both" or "custom". Only honoured in developer mode.
+    public var describeDetail: String { didSet { save("describeDetail", describeDetail) } }
+    /// The custom description: a full account or a few sentences, and the numbers it is made with.
+    public var customLong: Bool { didSet { save("customLong", customLong) } }
+    public var customTokens: Int { didSet { save("customTokens", customTokens) } }
+    public var customChars: Int { didSet { save("customChars", customChars) } }
+    public var customEdge: Int { didSet { save("customEdge", customEdge) } }
     public var onboarded: Bool { didSet { save("onboarded", onboarded) } }
     public var recording: Bool { didSet { save("recording", recording) } }
 
@@ -83,6 +90,11 @@ import Observation
         agentPort = get("agentPort", 4319)
         agentToken = get("agentToken", "")
         developer = get("developer", false)
+        describeDetail = get("describeDetail", "brief")
+        customLong = get("customLong", true)
+        customTokens = get("customTokens", 2000)
+        customChars = get("customChars", 8000)
+        customEdge = get("customEdge", 1600)
         onboarded = get("onboarded", false)
         recording = get("recording", true)
     }
@@ -153,9 +165,21 @@ import Observation
     }
     /// LM Studio is on another machine: what it is asked crosses the network.
     public var modelIsElsewhere: Bool { !isThisMac(base: Self.lmURL(host: lmHost, port: port)) }
+    /// The detail a description is made with. Outside developer mode the choice is out of sight, so it doesn't count.
+    public nonisolated static func detail(_ choice: String, developer: Bool) -> DescribeDetail {
+        guard developer else { return .brief }
+        return switch choice {
+        case "detailed": .detailed
+        case "both": .both
+        case "custom": .custom
+        default: .brief
+        }
+    }
     public var config: Config {
         Config(lmUrl: Self.lmURL(host: lmHost, port: port), model: model, embedModel: embedModel, requireAi: requireAI,
                describe: describe == "always" ? .always : describe == "never" ? .never : .pluggedIn,
-               maxAgeDays: UInt32(max(0, keepDays)), maxBytes: UInt64(max(0, keepGB)) * 1_000_000_000, unloadAfterSecs: 300, developer: developer)
+               maxAgeDays: UInt32(max(0, keepDays)), maxBytes: UInt64(max(0, keepGB)) * 1_000_000_000, unloadAfterSecs: 300, developer: developer,
+               detail: Self.detail(describeDetail, developer: developer), customLong: customLong,
+               customTokens: UInt32(clamping: customTokens), customChars: UInt32(clamping: customChars), customEdge: UInt32(clamping: customEdge))
     }
 }

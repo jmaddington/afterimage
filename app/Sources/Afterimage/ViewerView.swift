@@ -164,6 +164,11 @@ struct Details: View {
                     } else {
                         Text(shot.description).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
                     }
+                    if !shot.detail.isEmpty {
+                        DisclosureGroup("In full") {
+                            Text(shot.detail).textSelection(.enabled).fixedSize(horizontal: false, vertical: true).frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
                     if !shot.tags.isEmpty { Text(shot.tags.joined(separator: " · ")).font(.callout).foregroundStyle(.secondary) }
                     if !shot.describeModel.isEmpty { Text("Described by \(shot.describeModel)").font(.caption).foregroundStyle(.tertiary).textSelection(.enabled) }
                 }

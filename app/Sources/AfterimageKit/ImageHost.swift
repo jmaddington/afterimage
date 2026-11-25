@@ -20,8 +20,8 @@ public final class ImageHost: HostServices, @unchecked Sendable {
         }
     }
 
-    public func modelImage(path: String) throws -> Data {
-        guard let i = Pixels.load(path, maxEdge: 1280) else { throw HostError.Failed(reason: "unreadable picture") }
+    public func modelImage(path: String, maxEdge: UInt32) throws -> Data {
+        guard let i = Pixels.load(path, maxEdge: Int(maxEdge)) else { throw HostError.Failed(reason: "unreadable picture") }
         let d = NSMutableData()
         try write(i, into: CGImageDestinationCreateWithData(d, UTType.jpeg.identifier as CFString, 1, nil), quality: 0.8)
         return d as Data
