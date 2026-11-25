@@ -165,7 +165,7 @@ struct Details: View {
                         Text(shot.description).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
                     }
                     if !shot.detail.isEmpty {
-                        DisclosureGroup("In full") {
+                        DisclosureGroup(shot.detailModel.isEmpty ? "In full" : "In full, by \(shot.detailModel)") {
                             Text(shot.detail).textSelection(.enabled).fixedSize(horizontal: false, vertical: true).frame(maxWidth: .infinity, alignment: .leading)
                         }
                     }

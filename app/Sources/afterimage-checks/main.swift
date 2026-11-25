@@ -21,7 +21,7 @@ let live = env["AFTERIMAGE_LIVE"] != nil
 // AFTERIMAGE_MODEL, AFTERIMAGE_DETAIL (brief, detailed, both) and AFTERIMAGE_ROUNDS shape a live run.
 let detail = AppSettings.detail(env["AFTERIMAGE_DETAIL"] ?? "brief", developer: true)
 let config = Config(lmUrl: live ? "http://127.0.0.1:1234" : "http://127.0.0.1:9", model: env["AFTERIMAGE_MODEL"] ?? "google/gemma-4-26b-a4b-qat", embedModel: live ? "text-embedding-nomic-embed-text-v1.5" : "",
-                    requireAi: live, describe: live ? .always : .never, maxAgeDays: 0, maxBytes: 0, unloadAfterSecs: 0, detail: detail, customLong: false, customTokens: 900, customChars: 4000, customEdge: 1280)
+                    requireAi: live, describe: live ? .always : .never, maxAgeDays: 0, maxBytes: 0, unloadAfterSecs: 0, detail: detail, customLong: false, customTokens: 900, customChars: 4000, customEdge: 1280, reasoning: env["AFTERIMAGE_REASONING"] ?? "off", idleModel: env["AFTERIMAGE_IDLE_MODEL"] ?? "", idleReasoning: env["AFTERIMAGE_IDLE_REASONING"] ?? "off")
 let engine = try Engine(root: args[2], config: config, host: ImageHost())
 let cast: [(String, String, String, String)] = [
     ("onboarding", "Numbers", "com.apple.Numbers", "Employee record"), ("terminal", "Terminal", "com.apple.Terminal", "deploy — zsh"),
@@ -44,9 +44,18 @@ for round in 0..<(Int(env["AFTERIMAGE_ROUNDS"] ?? "") ?? 4) {
     }
 }
 if live { while try engine.stats().pending > 0 { Thread.sleep(forTimeInterval: 0.5) } }
+// AFTERIMAGE_IDLE_MODEL: then pretend nobody is at the Mac and let the second pass go over every picture.
+if live, env["AFTERIMAGE_IDLE_MODEL"] != nil {
+    engine.setIdle(idle: true)
+    let all = Filter(text: "", bundleId: nil, from: nil, to: nil, onlyKept: false, onlyHidden: false)
+    let give = Date().addingTimeInterval(1200)
+    while try engine.list(filter: all, limit: 50, offset: 0).contains(where: { $0.detail.isEmpty }) && Date() < give { Thread.sleep(forTimeInterval: 0.5) }
+    engine.setIdle(idle: false)
+    Thread.sleep(forTimeInterval: 4)
+}
 if live {
     for shot in try engine.list(filter: Filter(text: "", bundleId: nil, from: nil, to: nil, onlyKept: false, onlyHidden: false), limit: 50, offset: 0) {
-        print("--- \(shot.moment.windowTitle) [\(shot.describeModel)]\n\(shot.description)\(shot.detail.isEmpty ? "" : "\n  IN FULL (\(shot.detail.count) characters):\n\(shot.detail)")")
+        print("--- \(shot.moment.windowTitle) [\(shot.describeModel)\(shot.detailModel.isEmpty ? "" : "; in full by \(shot.detailModel)")]\n\(shot.description)\(shot.detail.isEmpty ? "" : "\n  IN FULL (\(shot.detail.count) characters):\n\(shot.detail)")")
     }
 }
 engine.shutdown()

@@ -92,6 +92,10 @@ Releases: `docs/agents/release.md`. Cargo `strip` must stay off (macOS 27 reject
   model; the API spells them none/minimal/low/medium/high). Thinking gets room in answer length, time limit and context.
   A model without vision describes from the words alone. Compare models: `afterimage-checks compare` (see Compare.swift).
 
+- Labs (Settings section "🧪 Labs"): experiments. Second pass when idle (`idlePass`, `idleModel`): `deepen_one` in the
+  background loop writes `shots.detail` with a second model while `Engine::set_idle(true)` (the app says so every 5 s from
+  `Session.idleSeconds`), on power; `shots.deep` marks done (1) or given up (2). Live: `AFTERIMAGE_IDLE_MODEL=<key>` with seed.
+
 ## Conventions & Patterns
 
 - Privacy is the product: when unsure, don't capture. A new signal may only add hiding, never remove it.
