@@ -1280,6 +1280,22 @@ fn index_loop(s: Arc<Shared>) {
     }
 }
 
+/// The model's own words, made safe to keep: what the rules catch, and any secret lately found on screen, in any case.
+// AIDEV-NOTE: privacy-critical. The model sees the picture; a secret the hiding missed in pixels can come back as words.
+fn hide_known(s: &Shared, text: &str) -> String {
+    let mut out = detect::mask_text(text);
+    for v in lock(&s.recent_secrets).iter() {
+        let v = v.to_ascii_lowercase();
+        let mut from = 0;
+        // ASCII lowering keeps every byte where it was, so places found in one are places in the other.
+        while let Some(i) = out.to_ascii_lowercase()[from..].find(&v) {
+            out.replace_range(from + i..from + i + v.len(), "[hidden]");
+            from += i + "[hidden]".len();
+        }
+    }
+    out
+}
+
 fn describe_one(s: &Shared) -> Result<bool, String> {
     let c = lock(&s.config).clone();
     let allowed = match c.describe {
@@ -1310,23 +1326,28 @@ fn describe_one(s: &Shared) -> Result<bool, String> {
         why
     };
     let (first, second) = c.details();
+    // AIDEV-NOTE: privacy-critical. A picture waiting to be checked comes before any description, even one half written.
+    let waiting = || s.busy.load(SeqCst) || !lock(&s.queue).frames.is_empty();
     let ask = |how: lm::Detail| -> Result<(String, Vec<String>), lm::LmError> {
         let img = s.host.model_image(shot.path.clone(), how.picture_edge).map_err(|e| lm::LmError::Model(e.to_string()))?;
-        let r = l.describe(&c.model, &img, &shot.moment.app_name, &shot.moment.window_title, &body, how);
+        let r = l.describe(&c.model, &img, &shot.moment.app_name, &shot.moment.window_title, &body, how, &waiting);
         *lock(&s.last_lm_use) = Instant::now();
         r
     };
     let (d, tags) = match ask(first) {
         Ok(x) => x,
+        // Gave way: nothing is wrong with the picture, so it isn't counted against it.
+        Err(lm::LmError::Yielded) => return Ok(false),
         Err(e @ lm::LmError::Offline) => return Err(e.to_string()),
         Err(e) => return Err(fail(e.to_string())),
     };
-    let d = detect::mask_text(&d);
+    let d = hide_known(s, &d);
     // AIDEV-NOTE: the fuller account is the model's words about the screen too: masked like the description before it is kept.
     let more = match second.map(ask) {
         None => String::new(),
-        Some(Ok((m, _))) => detect::mask_text(&m),
+        Some(Ok((m, _))) => hide_known(s, &m),
         // Not there to ask: the whole picture waits, so it gets both.
+        Some(Err(lm::LmError::Yielded)) => return Ok(false),
         Some(Err(e @ lm::LmError::Offline)) => return Err(e.to_string()),
         // It answered the short question and not the long one: the short one is kept.
         Some(Err(e)) => {
@@ -1335,7 +1356,7 @@ fn describe_one(s: &Shared) -> Result<bool, String> {
         }
     };
     // The model's tags are its words about the screen too.
-    let tags: Vec<String> = tags.iter().map(|t| detect::mask_text(t)).collect();
+    let tags: Vec<String> = tags.iter().map(|t| hide_known(s, t)).collect();
     let emb = if c.embed_model.is_empty() { None } else { embed_shot(s, &l, &c, &shot, &d, &body).ok() };
     lock(&s.store).finish_index(shot.id, &d, &more, &tags, emb.as_deref(), &c.embed_model, &c.model).map_err(|e| e.to_string())
 }
@@ -2335,6 +2356,24 @@ mod tests {
         // Custom: one description, in the style chosen.
         assert_eq!(described(DescribeDetail::Custom, false).0, "a page about otters");
         assert!(described(DescribeDetail::Custom, true).0.starts_with("In full"));
+    }
+
+    #[test]
+    fn a_description_never_repeats_a_secret_found_on_screen() {
+        // The model finds a secret no rule would, then (reading the picture) says it again in its description.
+        let d = tempfile::tempdir().unwrap();
+        let said = r#"{"findings":[{"line":0,"value":"quartz-otter-9","kind":"password"}],"description":"The door code quartz-otter-9 is on a note","tags":["quartz-otter-9"]}"#;
+        let c = Config { lm_url: fake_lm(said, 200), describe: DescribeWhen::Always, ..config(true) };
+        let e = Engine::new(d.path().to_string_lossy().into(), c, Arc::new(FakeHost(Default::default()))).unwrap();
+        // A window's picture: what is found in it is remembered for the others, and for what is said about it.
+        let mut f = secretive(1000);
+        f.moment.window_key = "win:7".into();
+        e.ingest(f);
+        wait(|| e.stats().unwrap().count == 1 && e.stats().unwrap().pending == 0);
+        let shot = e.list(Filter::default(), 5, 0).unwrap().remove(0);
+        assert_eq!(shot.description, "The door code [hidden] is on a note");
+        assert_eq!(shot.tags, vec!["[hidden]".to_owned()]);
+        e.shutdown();
     }
 
     #[test]
