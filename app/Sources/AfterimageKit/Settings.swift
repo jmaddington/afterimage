@@ -57,6 +57,8 @@ import Observation
     public var customTokens: Int { didSet { save("customTokens", customTokens) } }
     public var customChars: Int { didSet { save("customChars", customChars) } }
     public var customEdge: Int { didSet { save("customEdge", customEdge) } }
+    /// How much the model thinks before it answers: "off", "low", "medium" or "high". Only honoured in developer mode.
+    public var reasoning: String { didSet { save("reasoning", reasoning) } }
     public var onboarded: Bool { didSet { save("onboarded", onboarded) } }
     public var recording: Bool { didSet { save("recording", recording) } }
 
@@ -95,6 +97,7 @@ import Observation
         customTokens = get("customTokens", 2000)
         customChars = get("customChars", 8000)
         customEdge = get("customEdge", 1600)
+        reasoning = get("reasoning", "off")
         onboarded = get("onboarded", false)
         recording = get("recording", true)
     }
@@ -180,6 +183,7 @@ import Observation
                describe: describe == "always" ? .always : describe == "never" ? .never : .pluggedIn,
                maxAgeDays: UInt32(max(0, keepDays)), maxBytes: UInt64(max(0, keepGB)) * 1_000_000_000, unloadAfterSecs: 300, developer: developer,
                detail: Self.detail(describeDetail, developer: developer), customLong: customLong,
-               customTokens: UInt32(clamping: customTokens), customChars: UInt32(clamping: customChars), customEdge: UInt32(clamping: customEdge))
+               customTokens: UInt32(clamping: customTokens), customChars: UInt32(clamping: customChars), customEdge: UInt32(clamping: customEdge),
+               reasoning: developer ? reasoning : "off")
     }
 }

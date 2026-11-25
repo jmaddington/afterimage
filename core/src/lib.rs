@@ -132,6 +132,9 @@ pub struct Config {
     pub custom_tokens: u32,
     pub custom_chars: u32,
     pub custom_edge: u32,
+    /// How much the model thinks before answering: "off", "low", "medium" or "high". Each model gets the nearest it allows.
+    #[uniffi(default = "off")]
+    pub reasoning: String,
 }
 
 /// How much a description says.
@@ -768,7 +771,10 @@ impl Shared {
     }
 
     fn lm(&self, c: &Config) -> Result<lm::Lm, lm::LmError> {
-        lm::Lm::new(&c.lm_url)
+        lm::Lm::new(&c.lm_url).map(|mut l| {
+            l.effort = c.reasoning.clone();
+            l
+        })
     }
 
     fn ensure(&self, l: &lm::Lm, key: &str, ctx: u32) -> Result<(), lm::LmError> {
@@ -1449,7 +1455,7 @@ mod tests {
 
     // Port 9 refuses connections: stands in for LM Studio being off.
     fn config(require_ai: bool) -> Config {
-        Config { lm_url: "http://127.0.0.1:9".into(), model: "m".into(), embed_model: String::new(), require_ai, describe: DescribeWhen::Never, max_age_days: 0, max_bytes: 0, unload_after_secs: 0, developer: false, detail: DescribeDetail::Brief, custom_long: false, custom_tokens: 900, custom_chars: 4000, custom_edge: 1280 }
+        Config { lm_url: "http://127.0.0.1:9".into(), model: "m".into(), embed_model: String::new(), require_ai, describe: DescribeWhen::Never, max_age_days: 0, max_bytes: 0, unload_after_secs: 0, developer: false, detail: DescribeDetail::Brief, custom_long: false, custom_tokens: 900, custom_chars: 4000, custom_edge: 1280, reasoning: "off".into() }
     }
     fn frame(at: i64) -> Frame {
         let l = |t: &str, y: f64| TextLine { text: t.into(), rect: Rect { x: 0.1, y, w: 0.5, h: 0.1 }, tokens: vec![], code: false };

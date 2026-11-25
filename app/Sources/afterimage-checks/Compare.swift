@@ -31,8 +31,10 @@ func embed(_ text: String, model: String) -> [Double]? {
 func mean(_ v: [Double]) -> String { v.isEmpty ? "-" : String(format: "%.0f%%", 100 * v.reduce(0, +) / Double(v.count)) }
 
 func compare(out: String, pictures dir: String, env: [String: String]) throws {
-    let models = (env["AFTERIMAGE_MODELS"] ?? "").split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-    guard !models.isEmpty else { print("set AFTERIMAGE_MODELS to a comma-separated list of LM Studio model keys"); exit(2) }
+    let listed = (env["AFTERIMAGE_MODELS"] ?? "").split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    guard !listed.isEmpty else { print("set AFTERIMAGE_MODELS to a comma-separated list of LM Studio model keys"); exit(2) }
+    // AFTERIMAGE_REASONING: thinking levels to try, e.g. "off,low,high". Each is a pass of its own for every model.
+    let efforts = (env["AFTERIMAGE_REASONING"] ?? "off").split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
     let detail = AppSettings.detail(env["AFTERIMAGE_DETAIL"] ?? "brief", developer: true)
     let embedModel = env["AFTERIMAGE_EMBED"] ?? "text-embedding-nomic-embed-text-v1.5"
     let perPicture = Double(env["AFTERIMAGE_PATIENCE"] ?? "") ?? 300
@@ -49,13 +51,17 @@ func compare(out: String, pictures dir: String, env: [String: String]) throws {
     }
     guard !shown.isEmpty else { print("no .png pictures in \(dir)"); exit(1) }
     setvbuf(stdout, nil, _IOLBF, 0)
-    print("\(shown.count) pictures, \(models.count) models, detail: \(detail)")
+    print("\(shown.count) pictures, \(listed.count) models, thinking: \(efforts.joined(separator: ", ")), detail: \(detail)")
     var rows: [Row] = [], problems: [String: String] = [:]
-    for model in models {
-        let root = "\(out)/\(model.replacingOccurrences(of: "/", with: "_"))"
+    var passes: [(name: String, key: String, effort: String)] = []
+    for m in listed { for e in efforts { passes.append((efforts.count > 1 ? "\(m) @\(e)" : m, m, e)) } }
+    let models = passes.map(\.name)
+    for pass in passes {
+        let model = pass.name
+        let root = "\(out)/\(model.replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: " @", with: "_"))"
         try? fm.removeItem(atPath: root)
-        let config = Config(lmUrl: "http://127.0.0.1:1234", model: model, embedModel: "", requireAi: true, describe: .always, maxAgeDays: 0, maxBytes: 0,
-                            unloadAfterSecs: 0, detail: detail, customLong: false, customTokens: 900, customChars: 4000, customEdge: 1280)
+        let config = Config(lmUrl: "http://127.0.0.1:1234", model: pass.key, embedModel: "", requireAi: true, describe: .always, maxAgeDays: 0, maxBytes: 0,
+                            unloadAfterSecs: 0, detail: detail, customLong: false, customTokens: 900, customChars: 4000, customEdge: 1280, reasoning: pass.effort)
         let engine = try Engine(root: root, config: config, host: ImageHost())
         defer { engine.shutdown() }
         let began = Date()

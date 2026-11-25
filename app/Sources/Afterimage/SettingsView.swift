@@ -225,6 +225,13 @@ private struct IntelligenceSettings: View {
                         Stepper("Picture up to \(settings.customEdge) pixels wide", value: $settings.customEdge, in: 640...2880, step: 160)
                     }
                     Text(Words.describeDetail(settings.describeDetail)).font(.callout).foregroundStyle(.secondary)
+                    Picker("Thinking", selection: $settings.reasoning) {
+                        Text("As little as the model allows").tag("off")
+                        Text("Low").tag("low")
+                        Text("Medium").tag("medium")
+                        Text("High").tag("high")
+                    }
+                    Text("How long the model reasons before it checks or describes a picture. More is slower, often many times. Each model gets the nearest level it has; some can’t be switched off.").font(.callout).foregroundStyle(.secondary)
                     Toggle("Let an AI agent read the library", isOn: $settings.agentAccess)
                     if settings.agentAccess {
                         if let port = model.agentPort {

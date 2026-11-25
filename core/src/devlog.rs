@@ -93,7 +93,10 @@ pub fn about(calls: Vec<Call>, shot: i64, clean: &dyn Fn(&str) -> String) -> Vec
             let mut req = c.request.clone();
             match e.kind.as_str() {
                 "describe" => {
-                    req["messages"][0]["content"][1] = json!({"type": "image_url", "image_url": format!("[picture {shot}]")});
+                    // (A model that can't see was sent no picture.)
+                    if let Some(picture) = req["messages"][0]["content"].get_mut(1) {
+                        *picture = json!({"type": "image_url", "image_url": format!("[picture {shot}]")});
+                    }
                     let v = c.result.unwrap_or_default();
                     let text = v["choices"][0]["message"]["content"].as_str().unwrap_or_default();
                     // Decoded first: a rule can't see a key hiding behind a JSON escape.
