@@ -42,8 +42,13 @@ private struct CaptureSettings: View {
                 Picker("Displays", selection: $settings.allDisplays) {
                     Text("The one in use").tag(false)
                     Text("All of them").tag(true)
-                }
-            } footer: { Text("Identical pictures are never saved twice.").foregroundStyle(.secondary) }
+                }.disabled(settings.windowsSeparately)
+                Toggle("Capture windows separately", isOn: $settings.windowsSeparately)
+            } footer: {
+                Text(settings.windowsSeparately
+                     ? "Each window is its own picture, including windows behind others, and a window behind is photographed only when it has changed. A browser is photographed only while it is the window in front. Minimised windows and windows on another desktop are skipped. Identical pictures are never saved twice."
+                     : "Identical pictures are never saved twice.").foregroundStyle(.secondary)
+            }
             Section {
                 Toggle("Keep a log of the window in front", isOn: $settings.trackActivity)
             } footer: {
