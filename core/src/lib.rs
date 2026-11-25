@@ -1287,6 +1287,15 @@ fn hide_known(known: &[String], text: &str) -> String {
         for (line, range) in detect::find_secret(&lines, v) {
             found[line].push(range);
         }
+        // As written, too, wherever it sits: the loose matcher has its own idea of where a value may start and end.
+        // (Short ones only as whole words, above: a year or a total mustn't be chewed up.)
+        let low = v.to_ascii_lowercase();
+        if low.len() >= 6 {
+            for (line, l) in lines.iter().enumerate() {
+                // ASCII lowering keeps every byte where it was.
+                found[line].extend(l.text.to_ascii_lowercase().match_indices(&low).map(|(i, m)| i..i + m.len()));
+            }
+        }
     }
     lines.iter().zip(&found).map(|(l, r)| detect::mask(&l.text, r)).collect::<Vec<_>>().join("\n")
 }
@@ -1375,6 +1384,11 @@ fn describe_one(s: &Shared) -> Result<bool, String> {
             String::new()
         }
     };
+    // AIDEV-NOTE: once more, all together, with what is known now: a short description kept from an earlier try was made
+    // AIDEV-NOTE: safe against what was known then.
+    let known = known(s);
+    let (d, more) = (hide_known(&known, &d), hide_known(&known, &more));
+    let tags: Vec<String> = tags.iter().map(|t| hide_known(&known, t)).collect();
     let emb = if c.embed_model.is_empty() { None } else { embed_shot(s, &l, &c, &shot, &d, &body).ok() };
     lock(&s.store).finish_index(shot.id, &d, &more, &tags, emb.as_deref(), &c.embed_model, &c.model).map_err(|e| e.to_string())
 }
@@ -2408,6 +2422,10 @@ mod tests {
         // A short one only as a word of its own: a year or a total isn't chewed up.
         assert_eq!(hide_known(&known, "code 7725, total 177250"), "code [hidden], total 177250");
         assert_eq!(hide_known(&[], "nothing known\nsecond line"), "nothing known\nsecond line");
+        // Inside a longer run of letters, where the loose matcher wouldn't begin: still hidden. And made safe twice is the same.
+        let glued = hide_known(&known, "xmarmalade-tuba-41x");
+        assert!(!glued.contains("tuba"), "{glued}");
+        assert_eq!(hide_known(&known, &glued), glued);
     }
 
     #[test]
