@@ -1058,9 +1058,13 @@ const RECENT_SECRETS: usize = 512;
 const RECENT_PER_FRAME: usize = 64;
 
 /// Newest last. One seen again becomes the newest.
+// AIDEV-NOTE: values the rules can't find by themselves go first, so a picture full of key-shaped strings can't
+// AIDEV-NOTE: use up the room before the label-, model- and field-found ones that only this memory can catch.
 fn remember(r: &mut VecDeque<String>, values: &[String]) {
     let mut added = 0;
-    for v in values {
+    let alone = |v: &str| !detect::scan(&[TextLine { text: v.to_owned(), rect: Rect { x: 0.0, y: 0.0, w: 1.0, h: 0.1 }, tokens: vec![], code: false }]).is_empty();
+    let (shaped, plain): (Vec<&String>, Vec<&String>) = values.iter().partition(|v| alone(v));
+    for v in plain.into_iter().chain(shaped) {
         if let Some(i) = r.iter().position(|x| x == v) {
             r.remove(i);
         } else if added >= RECENT_PER_FRAME {
@@ -1492,6 +1496,12 @@ mod tests {
         remember(&mut r, &flood);
         assert_eq!(r.len(), RECENT_SECRETS);
         assert!(r.iter().any(|v| v == "old-0") && r.iter().filter(|v| v.starts_with("new-")).count() == RECENT_PER_FRAME);
+        // In one picture's worth, what only memory can catch goes in before what the rules know by shape.
+        let mut q: VecDeque<String> = VecDeque::new();
+        let mut mixed: Vec<String> = (0..RECENT_PER_FRAME).map(|i| format!("AKIAIOSFODNN7EXAMP{i:02}")).collect();
+        mixed.push("only-memory-knows-this".into());
+        remember(&mut q, &mixed);
+        assert!(q.iter().any(|v| v == "only-memory-knows-this"));
         // Even what the rules can find by its shape is remembered: found elsewhere it may be wrapped or cut short.
         remember(&mut r, &["AKIAIOSFODNN7EXAMPLE".into()]);
         assert_eq!(r.back().map(String::as_str), Some("AKIAIOSFODNN7EXAMPLE"));
