@@ -1,0 +1,29 @@
+<!doctype html><meta charset="utf-8"><link rel="stylesheet" href="style.css"><div class="menubar"><b>Xcode</b><span>File</span><span>Edit</span><span>View</span><span>Window</span><span>Help</span></div><div class="win" style="left:30px;top:50px;width:1380px;height:820px"><div class="bar"><i class="dot"></i><i class="dot"></i><i class="dot"></i>&nbsp; afterimage — detect_test.py</div><div class="body code"><span class="c"># tests/test_rules.py</span>
+<span class="k">import</span> pytest
+<span class="k">from</span> rules <span class="k">import</span> is_password_label, mask
+
+CASES = [
+    (<span class="s">"Tests pass: 150 Rust, 57 Swift"</span>, False),
+    (<span class="s">"All checks pass: 12 of 12"</span>, False),
+    (<span class="s">"token_count = 4096"</span>, False),
+    (<span class="s">"password_hash_rounds = 12"</span>, False),
+]
+
+
+@pytest.mark.parametrize(<span class="s">"text, expected"</span>, CASES)
+<span class="k">def</span> test_labels(text, expected):
+    <span class="k">assert</span> is_password_label(text) <span class="k">is</span> expected
+
+
+<span class="k">def</span> test_mask_keeps_paths():
+    path = <span class="s">"/Users/dana/Library/Application Support/Afterimage/index.sqlite"</span>
+    <span class="k">assert</span> mask(path) == path
+
+
+<span class="k">def</span> test_commit_ids_are_left_alone():
+    <span class="k">assert</span> mask(<span class="s">"merged 8c4c1a5 into main"</span>) == <span class="s">"merged 8c4c1a5 into main"</span>
+    <span class="k">assert</span> mask(<span class="s">"sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"</span>).startswith(<span class="s">"sha256"</span>)
+
+
+<span class="c"># Reviewed by Priya Raman, 24 November 2026. Ticket SHOP-1490.</span>
+</div></div>

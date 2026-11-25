@@ -1,0 +1,34 @@
+<!doctype html><meta charset="utf-8"><link rel="stylesheet" href="style.css"><div class="menubar"><b>Xcode</b><span>File</span><span>Edit</span><span>View</span><span>Window</span><span>Help</span></div><div class="win" style="left:30px;top:50px;width:1380px;height:820px"><div class="bar"><i class="dot"></i><i class="dot"></i><i class="dot"></i>&nbsp; billing — client.py</div><div class="body code"><span class="c"># billing/client.py</span>
+<span class="k">import</span> os
+<span class="k">import</span> requests
+<span class="k">from</span> dataclasses <span class="k">import</span> dataclass
+
+API_BASE = <span class="s">"https://api.payments.example/v2"</span>
+DEFAULT_TIMEOUT = 15
+
+
+<span class="k">def</span> load_token():
+    <span class="c"># Prefer the environment; fall back to the keychain helper.</span>
+    token = os.environ.get(<span class="s">"PAYMENTS_API_TOKEN"</span>)
+    <span class="k">if</span> token <span class="k">is</span> None:
+        token = keychain.get_password(<span class="s">"payments"</span>, <span class="s">"api_token"</span>)
+    <span class="k">return</span> token
+
+
+@dataclass
+<span class="k">class</span> Client:
+    api_key: str
+    secret_key: str = <span class="s">"YOUR_SECRET_KEY"</span>
+    password: str = <span class="s">""</span>
+
+    <span class="k">def</span> headers(self):
+        <span class="k">return</span> {<span class="s">"Authorization"</span>: f<span class="s">"Bearer {self.api_key}"</span>, <span class="s">"X-Request-Id"</span>: new_request_id()}
+
+    <span class="k">def</span> charge(self, customer_id, amount_cents):
+        <span class="k">return</span> requests.post(f<span class="s">"{API_BASE}/charges"</span>, json={<span class="s">"customer"</span>: customer_id, <span class="s">"amount"</span>: amount_cents}, headers=self.headers(), timeout=DEFAULT_TIMEOUT)
+
+
+<span class="c"># TODO(dana): remove before merging, only here to reproduce ticket SHOP-1482</span>
+debug_client = Client(api_key=<span class="s">"<span id="c1"></span><script>document.getElementById("c1").textContent="pk9x"+"Rv2mLq7"+"TzW4nHs"+"8dKb3Yf"+"6cJg1Pe"+"5uA0"</script>"</span>)
+legacy = connect(<span class="s">"reports.internal.example"</span>, user=<span class="s">"svc_reports"</span>, passwd=<span class="s">"gale-Orchard-5527"</span>)
+</div></div>

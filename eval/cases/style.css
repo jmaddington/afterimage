@@ -1,0 +1,14 @@
+/* Shared look for eval screens: a Retina desktop with one or two app windows. */
+*{box-sizing:border-box}html,body{margin:0;height:100%;font:13px -apple-system,"SF Pro Text",Helvetica,sans-serif;background:#2b3a55;color:#1d1d1f}
+.menubar{height:24px;background:#e9e9ecdd;display:flex;gap:16px;align-items:center;padding:0 12px;font-size:13px}.menubar b{font-weight:600}
+.win{position:absolute;background:#fff;border-radius:10px;box-shadow:0 12px 40px #0007;overflow:hidden;display:flex;flex-direction:column}
+.bar{height:30px;background:#ececec;display:flex;align-items:center;padding:0 12px;gap:8px;font-size:12px;color:#444;flex:none}
+.dot{width:12px;height:12px;border-radius:50%;background:#ff5f57}.dot+.dot{background:#febc2e}.dot+.dot+.dot{background:#28c840}
+.body{padding:14px 18px;overflow:hidden;flex:1}
+.term{background:#161821;color:#d6d8e0;font:12px "SF Mono",Menlo,monospace;line-height:1.45;white-space:pre-wrap}
+.code{background:#fbfbfd;font:12px "SF Mono",Menlo,monospace;line-height:1.5;white-space:pre}
+.k{color:#a626a4}.s{color:#50a14f}.c{color:#9aa0a6}.g{color:#7ec699}.y{color:#e5c07b}
+table{border-collapse:collapse;width:100%}td,th{border:1px solid #d8d8dc;padding:5px 8px;text-align:left;font-size:12px}th{background:#f3f3f6}
+.msg{margin:0 0 12px}.msg b{display:inline-block;margin-right:8px}.msg span{color:#888;font-size:11px}
+h1{font-size:20px;margin:0 0 10px}h2{font-size:15px;margin:14px 0 6px}p{margin:0 0 8px;line-height:1.5}
+.side{width:210px;background:#f4f4f7;padding:12px;font-size:12px;line-height:1.9;flex:none}.row{display:flex;flex:1;min-height:0}

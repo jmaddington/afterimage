@@ -1,0 +1,206 @@
+{
+ "terminal-env": {
+  "hide": [
+   "plum-Harbor",
+   "7MNB2LKPD9",
+   "Er5TyUi0Op",
+   "R2vXpL8dWn"
+  ],
+  "keep": [
+   "git status",
+   "LOG_LEVEL",
+   "Tests pass: 212",
+   "Priya Raman",
+   "Marcus Oyelaran",
+   "555-0188",
+   "production.yml"
+  ],
+  "note": "Env file in a terminal: database password in a URL, AWS pair, Stripe key. Names, a phone number, paths and a test count must stay."
+ },
+ "chat-wifi": {
+  "hide": [
+   "copper-lantern-4482",
+   "7 3 1 9"
+  ],
+  "keep": [
+   "Priya Raman",
+   "Tomasz Wieczorek",
+   "Marcus Oyelaran",
+   "555-0142",
+   "88213",
+   "$412.50",
+   "dana.whitfield@northwind.example",
+   "electrician"
+  ],
+  "note": "Chat with an unlabelled wifi password and a door code in prose. People, phone, email, invoice and price must stay."
+ },
+ "email-temp-password": {
+  "hide": [
+   "wren-Mosaic",
+   "604 113"
+  ],
+  "keep": [
+   "Helen Abernathy",
+   "helen.abernathy@brightwater.example",
+   "PO-2291-B",
+   "$640",
+   "555-0167",
+   "December timesheets"
+  ],
+  "note": "Email with a temporary password and a one-time code, neither labelled with the word password. Sender, recipient, PO, rate and phone must stay."
+ },
+ "code-literal-key": {
+  "hide": [
+   "Rv2mLq7TzW4nHs",
+   "gale-Orchard-5527"
+  ],
+  "keep": [
+   "PAYMENTS_API_TOKEN",
+   "YOUR_SECRET_KEY",
+   "keychain.get_password",
+   "secret_key: str",
+   "def load_token",
+   "SHOP-1482",
+   "api_token"
+  ],
+  "note": "Python that handles secrets (must stay readable) with two literal credentials near the bottom."
+ },
+ "key-block-no-header": {
+  "hide": [
+   "MIIEvQIBADANBgkq",
+   "MzEfYyjiWA4R4",
+   "NMoSfm76oqFvAp8",
+   "qgtzJ6GR3eqoYSW9",
+   "VIuhjOIMF2Lst0d"
+  ],
+  "keep": [
+   "deploy_key.pub",
+   "known_hosts",
+   "ssh-keygen",
+   "drwx------"
+  ],
+  "note": "The tail of a private key in a terminal with the BEGIN line scrolled off. The file listing must stay."
+ },
+ "bank": {
+  "hide": [
+   "2280 9931",
+   "2280 6650",
+   "021000021",
+   "1111 1111 1111",
+   "737"
+  ],
+  "keep": [
+   "Dana Whitfield",
+   "Greenleaf Market",
+   "Marcus Oyelaran",
+   "$8,214.07",
+   "Payroll Northwind",
+   "Harbor Lane Hardware"
+  ],
+  "note": "Bank page: account, routing and card numbers must go; names, payees and amounts stay."
+ },
+ "notes-codes": {
+  "hide": [
+   "4 8 1 5",
+   "2-7-1-9",
+   "candle maple fringe",
+   "Sparrow!Quartz"
+  ],
+  "keep": [
+   "Ivo Petrenko",
+   "Tuesday at 10",
+   "Timeless",
+   "Amara Nwosu",
+   "555-0199",
+   "Recycling"
+  ],
+  "note": "Personal notes: alarm and padlock codes, a recovery phrase and a router password among ordinary reminders."
+ },
+ "hr-sheet": {
+  "hide": [
+   "219-09-9999",
+   "078-05-1120",
+   "457-55-5462",
+   "321-44-8765",
+   "532-18-9044"
+  ],
+  "keep": [
+   "Priya Raman",
+   "Engineering",
+   "555-0188",
+   "2017-11-02",
+   "Helen Abernathy"
+  ],
+  "note": "A staff table: every SSN must go, names, phones and dates stay."
+ },
+ "dense-log": {
+  "hide": [
+   "JzdmNfYmF0",
+   "9QxLp2Rt7V"
+  ],
+  "keep": [
+   "worker-2 processed batch 4410",
+   "processed batch 4405",
+   "push ok",
+   "retrying push"
+  ],
+  "note": "Forty dense log lines at small size with a bearer token and a GitHub token buried in them."
+ },
+ "clean-code": {
+  "hide": [],
+  "keep": [
+   "Tests pass: 150",
+   "All checks pass: 12",
+   "token_count = 4096",
+   "password_hash_rounds",
+   "index.sqlite",
+   "8c4c1a5",
+   "Priya Raman",
+   "SHOP-1490"
+  ],
+  "note": "Code about secrets with none in it. Nothing should be hidden."
+ },
+ "contacts": {
+  "hide": [],
+  "keep": [
+   "Priya Raman",
+   "marcus.oyelaran@northwind.example",
+   "555-0121",
+   "Helen Abernathy",
+   "12 Harbor Lane",
+   "555-0100",
+   "Amara Nwosu"
+  ],
+  "note": "A directory of names, emails and phone numbers. Nothing should be hidden."
+ },
+ "web-wikipedia": {
+  "hide": [],
+  "keep": [],
+  "url": "https://en.wikipedia.org/wiki/Lighthouse",
+  "note": "A real public page. Nothing should be hidden."
+ },
+ "web-rust-book": {
+  "hide": [],
+  "keep": [],
+  "url": "https://doc.rust-lang.org/book/ch04-01-what-is-ownership.html",
+  "note": "A real public page. Nothing should be hidden."
+ },
+ "web-python-docs": {
+  "hide": [],
+  "keep": [],
+  "url": "https://docs.python.org/3/library/json.html",
+  "note": "A real public page. Nothing should be hidden."
+ },
+ "web-mdn": {
+  "hide": [],
+  "keep": [],
+  "url": "https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Authorization",
+  "note": "A real public page. Nothing should be hidden."
+ },
+ "web-hn": {
+  "hide": [],
+  "keep": [],
+  "url": "https://news.ycombinator.com/",
+  "note": "A real public page. Nothing should be hidden."
+ }
+}
