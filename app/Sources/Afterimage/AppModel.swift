@@ -119,6 +119,10 @@ extension Shot {
             MainActor.assumeIsolated { self?.registerWebApps() }
         }
         if settings.onboarded { recorder.start() }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(3))
+            self?.warnAboutPermissions()
+        }
         #if DEBUG
         stage(ProcessInfo.processInfo.environment["AFTERIMAGE_STAGE"] ?? "")
         #endif
@@ -382,10 +386,29 @@ extension Shot {
 
     var menuSymbol: String {
         switch recorder.state {
-        case .watching: lmTrouble == nil ? "circle.circle.fill" : "exclamationmark.circle"
+        case .watching: lmTrouble == nil && missingPermissions.isEmpty ? "circle.circle.fill" : "exclamationmark.circle"
         case .off, .paused: "pause.circle"
         case .needsPermission: "exclamationmark.circle"
         case .waiting: "circle.circle"
+        }
+    }
+    /// Permissions that were never given or didn't survive an update. Asked afresh each time it is read.
+    var missingPermissions: [Permissions.Missing] {
+        Permissions.missing(screen: Permissions.screen, accessibility: Permissions.accessibility, needsAddresses: settings.hideUnreadable)
+    }
+    /// Said once per launch, in a window nobody can miss: a quiet line in a menu was easy to overlook.
+    func warnAboutPermissions() {
+        let missing = missingPermissions
+        guard settings.onboarded, !missing.isEmpty else { return }
+        let a = NSAlert()
+        a.alertStyle = .warning
+        a.messageText = missing.count == 1 ? "Afterimage is missing a permission" : "Afterimage is missing permissions"
+        a.informativeText = missing.map { "\($0.cost)." }.joined(separator: "\n") + "\n\nmacOS sometimes drops these after an update. Turn Afterimage back on in System Settings; if it is already on, turn it off and on again."
+        a.addButton(withTitle: "Open System Settings")
+        a.addButton(withTitle: "Later")
+        NSApp.activate()
+        if a.runModal() == .alertFirstButtonReturn {
+            if missing.contains(.screen) { Permissions.openScreenSettings() } else { Permissions.openAccessibilitySettings() }
         }
     }
     /// Non-nil when pictures can't be checked, and so aren't being saved.
@@ -405,6 +428,7 @@ extension Shot {
         case .paused(let d): return d.map { "Paused until \($0.formatted(date: .omitted, time: .shortened))" } ?? "Paused"
         case .waiting(let why): return why
         case .watching:
+            if let m = missingPermissions.first { return m.cost }
             if let t = lmTrouble { return settings.requireAI ? "\(t), so nothing is being saved" : "\(t), using built-in rules" }
             if status?.busy == true { return "Checking for secrets" }
             if !recorder.lastNote.isEmpty { return recorder.lastNote }

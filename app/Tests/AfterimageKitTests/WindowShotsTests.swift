@@ -103,7 +103,8 @@ import Testing
     @Test func somethingPrivateInFrontMeansNothingIsTaken() {
         let list = [w(5, 12), w(7, 10), w(8, 11)]
         #expect(taken(plan(front: 12, "com.acme.Ledger", list)).isEmpty)
-        #expect(taken(plan(front: me, "com.jmaddington.afterimage", [w(2, me), w(7, 10)])).isEmpty)
+        // Afterimage in front is not that: its own window is left out and the rest is taken.
+        #expect(taken(plan(front: me, "com.jmaddington.afterimage", [w(2, me), w(7, 10)])) == [7])
         #expect(taken(plan(front: 10, xcode, [w(7, 10), w(8, 11)], hidden: [1, 10])).isEmpty)
     }
 

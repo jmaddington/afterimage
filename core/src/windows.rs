@@ -82,7 +82,9 @@ pub struct WindowChoice {
 #[uniffi::export]
 pub fn plan_windows(ex: &Exclusions, scene: &WindowScene, windows: &[WindowSeen]) -> Vec<WindowChoice> {
     // Whole-display capture takes nothing when something off-limits is in front. Neither does this.
-    let private_front = scene.front_pid == scene.own_pid || scene.hidden.contains(&scene.front_pid) || hide_app(ex, &scene.front_bundle_id).is_some();
+    // AIDEV-NOTE: Afterimage in front isn't "something off-limits in front": its own windows are refused one by one
+    // AIDEV-NOTE: (Ours) and everything else is judged as usual. It is always in `hidden`, hence the explicit test.
+    let private_front = scene.front_pid != scene.own_pid && (scene.hidden.contains(&scene.front_pid) || hide_app(ex, &scene.front_bundle_id).is_some());
     let mut background = 0;
     // Mirrored displays are the same place listed more than once; counted once.
     let finite = |r: &Rect| [r.x, r.y, r.w, r.h].iter().all(|n| n.is_finite());
@@ -273,15 +275,20 @@ mod tests {
     fn afterimage_itself_is_never_photographed() {
         let w = [win(5, ME, "com.jmaddington.afterimage"), win(7, 10, XCODE)];
         assert_eq!(verdicts(&scene(10, XCODE, Some(7)), &w)[0], (5, false, Some(WindowSkip::Ours)));
-        // In front, it stops everything.
-        assert!(plan_windows(&ex(), &scene(ME, "com.jmaddington.afterimage", Some(5)), &w).iter().all(|c| c.skip.is_some()));
+        // In front, it is left out and the rest is taken as usual: with several displays most of what is on screen
+        // has nothing to do with it. Nothing is "the window in front" then.
+        assert_eq!(verdicts(&scene(ME, "com.jmaddington.afterimage", Some(5)), &w), vec![(5, true, Some(WindowSkip::Ours)), (7, false, None)]);
+        // What is off-limits stays off-limits behind it.
+        let behind = [win(5, ME, "com.jmaddington.afterimage"), win(7, 12, "com.acme.Ledger"), win(8, 14, CHROME)];
+        assert_eq!(verdicts(&scene(ME, "com.jmaddington.afterimage", Some(5)), &behind).iter().map(|v| v.2).collect::<Vec<_>>(),
+            vec![Some(WindowSkip::Ours), Some(WindowSkip::Hidden), Some(WindowSkip::BackgroundPages)]);
         // Even if the list of hidden apps came without it.
         let mut s = scene(10, XCODE, Some(7));
         s.hidden = vec![];
         assert_eq!(verdicts(&s, &w)[0].2, Some(WindowSkip::Ours));
         let mut s = scene(ME, "com.jmaddington.afterimage", Some(5));
         s.hidden = vec![];
-        assert_eq!(verdicts(&s, &w), vec![(5, true, Some(WindowSkip::Ours)), (7, false, Some(WindowSkip::PrivateInFront))]);
+        assert_eq!(verdicts(&s, &w), vec![(5, true, Some(WindowSkip::Ours)), (7, false, None)]);
     }
 
     #[test]

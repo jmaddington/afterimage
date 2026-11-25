@@ -152,6 +152,35 @@ final class FakeElement: ScreenElement {
         f(&l)
         return l
     }
+    @Test func afterimageInFrontDoesNotStopThePictureButAnOffLimitsAppDoes() {
+        #expect(Capturer.offLimits(9, [1, 9], ours: false))
+        #expect(!Capturer.offLimits(7, [1, 9], ours: false))
+        // Afterimage is always among the hidden; in front, it is left out rather than stopping everything.
+        #expect(!Capturer.offLimits(1, [1, 9], ours: true))
+        // Left out of the picture or the picture isn't kept: drawn, hidden and not omitted spoils it.
+        #expect(Capturer.spoiled(look { $0.front = 1; $0.hidden = [1]; $0.drawn = [1, 7] }, look { $0.front = 1; $0.hidden = [1]; $0.drawn = [1, 7] }, omitted: []) != nil)
+        #expect(Capturer.spoiled(look { $0.front = 1; $0.hidden = [1]; $0.drawn = [1, 7] }, look { $0.front = 1; $0.hidden = [1]; $0.drawn = [1, 7] }, omitted: [1]) == nil)
+    }
+    /// The extension adds hiding where it can. Its silence is no reason to photograph nothing: without it installed
+    /// the same browser would have been photographed.
+    @Test func aSilentExtensionDoesNotStopThePicture() {
+        #expect(Capturer.pageHide(planned: nil, answered: false) == nil)
+        #expect(Capturer.pageHide(planned: nil, answered: true) == nil)
+        // What the page itself calls for still holds, answered or not.
+        #expect(Capturer.pageHide(planned: .site, answered: false) == .site)
+        #expect(Capturer.pageHide(planned: .unreadable, answered: true) == .unreadable)
+    }
+
+    @Test func aMissingPermissionIsNamedWithWhatItCosts() {
+        #expect(Permissions.missing(screen: true, accessibility: true, needsAddresses: true).isEmpty)
+        #expect(Permissions.missing(screen: false, accessibility: true, needsAddresses: true) == [.screen])
+        #expect(Permissions.missing(screen: true, accessibility: false, needsAddresses: true) == [.accessibility])
+        // Addresses aren't needed when browsers are captured unread: nothing is lost, nothing to shout about.
+        #expect(Permissions.missing(screen: true, accessibility: false, needsAddresses: false).isEmpty)
+        #expect(Permissions.missing(screen: false, accessibility: false, needsAddresses: true) == [.screen, .accessibility])
+        #expect(Permissions.Missing.screen.cost.contains("nothing is being captured") && Permissions.Missing.accessibility.cost.contains("browsers"))
+    }
+
     @Test func nothingChangedIsFine() { #expect(Capturer.spoiled(look(), look(), omitted: [9]) == nil) }
     @Test func anythingThatChangedSpoilsIt() {
         #expect(Capturer.spoiled(look(), look { $0.blocked = "A password is being typed" }, omitted: [9]) == .blocked("A password is being typed"))
