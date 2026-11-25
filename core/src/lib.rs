@@ -1417,6 +1417,11 @@ fn describe_one(s: &Shared) -> Result<bool, String> {
 /// The idle pass: while nobody is at the Mac, a second model writes a fuller account of one saved picture.
 // AIDEV-NOTE: privacy-critical in the same ways as describe_one: it sees only what was saved (already hidden), gives
 // AIDEV-NOTE: way to a picture waiting to be checked, and its words pass hide_known before disk and the dev log.
+/// The text with the numbered lines replaced whole.
+fn blank_lines(text: &str, lines: &std::collections::BTreeSet<usize>) -> String {
+    text.split('\n').enumerate().map(|(i, t)| if lines.contains(&i) { "[hidden]" } else { t }).collect::<Vec<_>>().join("\n")
+}
+
 fn deepen_one(s: &Shared) -> Result<bool, String> {
     let c = lock(&s.config).clone();
     // "Never describe" means no model writes about a picture, in any pass.
@@ -1440,14 +1445,20 @@ fn deepen_one(s: &Shared) -> Result<bool, String> {
     let (l, tape) = s.taped(&c);
     let mut l = l.map_err(|e| e.to_string())?;
     l.effort = c.idle_reasoning.clone();
-    struct Log<'a>(&'a Shared, lm::Tape, i64);
+    // AIDEV-NOTE: privacy-critical. The developer log keeps the model's answer. Until the answer has had its secret check
+    // AIDEV-NOTE: (`cleared` set, with what the check found), none of its words go into the log.
+    struct Log<'a>(&'a Shared, lm::Tape, i64, std::cell::RefCell<Option<(Vec<String>, std::collections::BTreeSet<usize>)>>);
     impl Drop for Log<'_> {
         fn drop(&mut self) {
             let known = known(self.0);
-            self.0.note(devlog::about(take(&self.1), self.2, &|t| hide_known(&known, t)));
+            let cleared = self.3.borrow();
+            self.0.note(devlog::about(take(&self.1), self.2, &|t| match &*cleared {
+                Some((found, whole)) => blank_lines(&hide_known(found, &hide_known(&known, t)), whole),
+                None => "[not kept: its secret check didn't finish]".to_owned(),
+            }));
         }
     }
-    let _log = Log(s, tape, shot.id);
+    let log = Log(s, tape, shot.id, Default::default());
     s.describing.store(true, SeqCst);
     let how = lm::Detail::DETAILED;
     s.ensure(&l, &c.idle_model, how.context()).map_err(|e| e.to_string())?;
@@ -1465,16 +1476,40 @@ fn deepen_one(s: &Shared) -> Result<bool, String> {
         Ok((text, _)) => {
             // AIDEV-NOTE: privacy-critical. An old picture's secrets are no longer remembered, and a long account says
             // AIDEV-NOTE: more of the screen than anything before it. So its words get a secret check of their own, by
-            // AIDEV-NOTE: the model, and are kept only if that check could run.
+            // AIDEV-NOTE: the model, and are kept only if that check could run. The check itself is not taped: what it
+            // AIDEV-NOTE: is sent is the account before hiding.
+            if stop() {
+                *lock(&s.put_off) = Instant::now() + Duration::from_secs(30);
+                return Ok(false);
+            }
             let text = hide_known(&known(s), &text);
             let lines: Vec<&str> = text.split('\n').collect();
             let numbered: Vec<(usize, &str)> = lines.iter().enumerate().filter(|(_, t)| !t.trim().is_empty()).map(|(i, t)| (i, *t)).collect();
-            let found = match l.find_secrets(&c.idle_model, &numbered) {
-                Ok(f) => f.into_iter().map(|(_, value, _)| value).filter(|v| v.trim().chars().count() >= 4).collect::<Vec<String>>(),
+            let give_up = |why: String| lock(&s.store).finish_deep(shot.id, None).map(|_| true).map_err(|x| format!("{why}; {x}"));
+            let checker = s.lm(&c).map(|mut l| {
+                l.effort = "off".into();
+                l
+            });
+            let found = match checker.and_then(|l| l.find_secrets(&c.idle_model, &numbered)) {
+                Ok(f) => f,
                 Err(e @ lm::LmError::Offline) => return Err(e.to_string()),
-                Err(e) => return lock(&s.store).finish_deep(shot.id, None).map(|_| true).map_err(|x| format!("{e}; {x}")),
+                Err(e) => return give_up(e.to_string()),
             };
-            let text = hide_known(&found, &text);
+            // A value is hidden wherever it appears. One too short to search for, or not where the model said, hides its line.
+            let (mut values, mut whole) = (Vec::new(), std::collections::BTreeSet::new());
+            for (line, value, _) in found {
+                let Some(on) = lines.get(line) else { return give_up("the check named a line that isn't there".into()) };
+                let v = value.trim().to_owned();
+                let usable = v.chars().count() >= 4 && !v.contains("[hidden]");
+                if !usable || hide_known(std::slice::from_ref(&v), on) == **on {
+                    whole.insert(line);
+                }
+                if usable {
+                    values.push(v);
+                }
+            }
+            let text = blank_lines(&hide_known(&values, &text), &whole);
+            *log.3.borrow_mut() = Some((values, whole));
             if !still_wanted() {
                 return Ok(false);
             }
@@ -2602,7 +2637,8 @@ mod tests {
         };
         assert_eq!(run(DescribeWhen::Never), "");
         let detail = run(DescribeWhen::Always);
-        assert!(detail.starts_with("In full") && !detail.contains("otters") && detail.contains("a page about [hidden]"), "{detail}");
+        // Hidden where it appears; and the line the model named, where it isn't, is hidden whole.
+        assert_eq!(detail, "[hidden]\nthen a page about [hidden]");
     }
 
     #[test]
