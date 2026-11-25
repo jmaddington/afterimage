@@ -237,6 +237,8 @@ struct Shared {
     reason: Mutex<String>,
     busy: AtomicBool,
     describing: AtomicBool,
+    /// A description gave way to a waiting picture: none is started again before this.
+    put_off: Mutex<Instant>,
     on_power: AtomicBool,
     calm: AtomicBool,
     pages: Mutex<pages::Pages>,
@@ -298,7 +300,7 @@ impl Engine {
             hasher: RandomState::new(), forgotten: Default::default(), loaded_by_us: Default::default(),
             last_lm_use: Mutex::new(Instant::now()), lm_state: Mutex::new(LmState::Unknown), links: Default::default(),
             discarded: AtomicU64::new(0), reason: Default::default(), busy: AtomicBool::new(false),
-            describing: AtomicBool::new(false), on_power: AtomicBool::new(true), calm: AtomicBool::new(true), pages: Default::default(), outlets: Default::default(), question: AtomicU64::new(now_ms() as u64), mcp: Default::default(), now_doing: Default::default(), recent_secrets: Default::default(), dropped: Default::default(), cleared: Default::default(),
+            describing: AtomicBool::new(false), put_off: Mutex::new(Instant::now()), on_power: AtomicBool::new(true), calm: AtomicBool::new(true), pages: Default::default(), outlets: Default::default(), question: AtomicU64::new(now_ms() as u64), mcp: Default::default(), now_doing: Default::default(), recent_secrets: Default::default(), dropped: Default::default(), cleared: Default::default(),
         });
         for (name, f) in [("afterimage-save", save_loop as fn(Arc<Shared>)), ("afterimage-index", index_loop)] {
             let s = s.clone();
@@ -310,12 +312,9 @@ impl Engine {
     pub fn set_config(&self, config: Config) {
         // AIDEV-NOTE: lock order is store, then config. Held together so no entry can slip in between "off" and the clear.
         let store = lock(&self.s.store);
-        let resize;
         let changed = {
             let mut c = lock(&self.s.config);
             let changed = c.model != config.model || c.lm_url != config.lm_url;
-            // AIDEV-NOTE: a model stays loaded at the size it was loaded with; a new size means ours must be loaded again.
-            resize = c.context() != config.context();
             *c = config.clone();
             changed
         };
@@ -328,9 +327,6 @@ impl Engine {
             }
         }
         drop(store);
-        if resize {
-            self.s.unload_ours();
-        }
         self.s.wake.notify_all();
     }
 
@@ -979,10 +975,9 @@ impl Shared {
                 }
             }
         }
-        if windowed {
-            // Before any way out: what was found counts for the other windows even if this picture isn't saved.
-            remember(&mut lock(&self.recent_secrets), &secret_values(&all, &hits));
-        }
+        // Before any way out: what was found counts for the other windows even if this picture isn't saved.
+        // AIDEV-NOTE: remembered for every picture, windowed or not: what the model says about it later is searched for them.
+        remember(&mut lock(&self.recent_secrets), &secret_values(&all, &hits));
         let ai_checked = match checked {
             Ok(()) => true,
             Err(e) if require_ai => return Err(e.to_string()),
@@ -1006,9 +1001,7 @@ impl Shared {
         redact::frost(&mut f.rgba, f.width as usize, f.height as usize, f.stride as usize, &rects);
 
         let values: Vec<String> = secret_values(&all, &hits);
-        if windowed {
-            remember(&mut lock(&self.recent_secrets), &values);
-        }
+        remember(&mut lock(&self.recent_secrets), &values);
         // Nothing of the other windows leaves this function.
         hits.retain(|h| h.line < own);
         let all = all[..own].to_vec();
@@ -1280,20 +1273,27 @@ fn index_loop(s: Arc<Shared>) {
     }
 }
 
-/// The model's own words, made safe to keep: what the rules catch, and any secret lately found on screen, in any case.
+/// The model's own words, made safe to keep: what the rules catch, and any secret lately found on screen, however
+/// it is spaced, cased or broken across rows.
 // AIDEV-NOTE: privacy-critical. The model sees the picture; a secret the hiding missed in pixels can come back as words.
-fn hide_known(s: &Shared, text: &str) -> String {
-    let mut out = detect::mask_text(text);
-    for v in lock(&s.recent_secrets).iter() {
-        let v = v.to_ascii_lowercase();
-        let mut from = 0;
-        // ASCII lowering keeps every byte where it was, so places found in one are places in the other.
-        while let Some(i) = out.to_ascii_lowercase()[from..].find(&v) {
-            out.replace_range(from + i..from + i + v.len(), "[hidden]");
-            from += i + "[hidden]".len();
+// AIDEV-NOTE: the same matcher as for titles and addresses (`detect::find_secret`), and the same for the developer log.
+fn hide_known(known: &[String], text: &str) -> String {
+    let lines: Vec<TextLine> = detect::mask_text(text)
+        .split('\n')
+        .map(|t| TextLine { text: t.to_owned(), rect: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }, tokens: vec![], code: false })
+        .collect();
+    let mut found: Vec<Vec<std::ops::Range<usize>>> = vec![vec![]; lines.len()];
+    for v in known {
+        for (line, range) in detect::find_secret(&lines, v) {
+            found[line].push(range);
         }
     }
-    out
+    lines.iter().zip(&found).map(|(l, r)| detect::mask(&l.text, r)).collect::<Vec<_>>().join("\n")
+}
+
+/// The secrets lately found on screen, as they stand now.
+fn known(s: &Shared) -> Vec<String> {
+    lock(&s.recent_secrets).iter().cloned().collect()
 }
 
 fn describe_one(s: &Shared) -> Result<bool, String> {
@@ -1307,6 +1307,10 @@ fn describe_one(s: &Shared) -> Result<bool, String> {
     if !allowed || s.busy.load(SeqCst) || !lock(&s.queue).frames.is_empty() {
         return Ok(false);
     }
+    // One that gave way isn't started again at once: each start costs the model the whole prompt.
+    if Instant::now() < *lock(&s.put_off) {
+        return Ok(false);
+    }
     let Some((shot, body)) = lock(&s.store).next_pending().map_err(|e| e.to_string())? else { return Ok(false) };
     let (l, tape) = s.taped(&c);
     let l = l.map_err(|e| e.to_string())?;
@@ -1314,7 +1318,8 @@ fn describe_one(s: &Shared) -> Result<bool, String> {
     struct Log<'a>(&'a Shared, lm::Tape, i64);
     impl Drop for Log<'_> {
         fn drop(&mut self) {
-            self.0.note(devlog::about(take(&self.1), self.2));
+            let known = known(self.0);
+            self.0.note(devlog::about(take(&self.1), self.2, &|t| hide_known(&known, t)));
         }
     }
     let _log = Log(s, tape, shot.id);
@@ -1334,20 +1339,35 @@ fn describe_one(s: &Shared) -> Result<bool, String> {
         *lock(&s.last_lm_use) = Instant::now();
         r
     };
-    let (d, tags) = match ask(first) {
-        Ok(x) => x,
-        // Gave way: nothing is wrong with the picture, so it isn't counted against it.
-        Err(lm::LmError::Yielded) => return Ok(false),
-        Err(e @ lm::LmError::Offline) => return Err(e.to_string()),
-        Err(e) => return Err(fail(e.to_string())),
+    let yielded = || {
+        *lock(&s.put_off) = Instant::now() + Duration::from_secs(30);
+        Ok(false)
     };
-    let d = hide_known(s, &d);
-    // AIDEV-NOTE: the fuller account is the model's words about the screen too: masked like the description before it is kept.
+    // Both were asked for and the short one was written on an earlier try: it isn't written again.
+    let (d, tags) = if second.is_some() && !shot.description.is_empty() {
+        (shot.description.clone(), shot.tags.clone())
+    } else {
+        let (d, tags) = match ask(first) {
+            Ok(x) => x,
+            // Gave way: nothing is wrong with the picture, so it isn't counted against it.
+            Err(lm::LmError::Yielded) => return yielded(),
+            Err(e @ lm::LmError::Offline) => return Err(e.to_string()),
+            Err(e) => return Err(fail(e.to_string())),
+        };
+        let known = known(s);
+        // The model's tags are its words about the screen too.
+        let (d, tags) = (hide_known(&known, &d), tags.iter().map(|t| hide_known(&known, t)).collect::<Vec<String>>());
+        if second.is_some() {
+            lock(&s.store).keep_brief(shot.id, &d, &tags).map_err(|e| e.to_string())?;
+        }
+        (d, tags)
+    };
+    // AIDEV-NOTE: the fuller account is the model's words about the screen too: made safe like the description before it is kept.
     let more = match second.map(ask) {
         None => String::new(),
-        Some(Ok((m, _))) => hide_known(s, &m),
+        Some(Ok((m, _))) => hide_known(&known(s), &m),
+        Some(Err(lm::LmError::Yielded)) => return yielded(),
         // Not there to ask: the whole picture waits, so it gets both.
-        Some(Err(lm::LmError::Yielded)) => return Ok(false),
         Some(Err(e @ lm::LmError::Offline)) => return Err(e.to_string()),
         // It answered the short question and not the long one: the short one is kept.
         Some(Err(e)) => {
@@ -1355,8 +1375,6 @@ fn describe_one(s: &Shared) -> Result<bool, String> {
             String::new()
         }
     };
-    // The model's tags are its words about the screen too.
-    let tags: Vec<String> = tags.iter().map(|t| hide_known(s, t)).collect();
     let emb = if c.embed_model.is_empty() { None } else { embed_shot(s, &l, &c, &shot, &d, &body).ok() };
     lock(&s.store).finish_index(shot.id, &d, &more, &tags, emb.as_deref(), &c.embed_model, &c.model).map_err(|e| e.to_string())
 }
@@ -1364,6 +1382,8 @@ fn describe_one(s: &Shared) -> Result<bool, String> {
 /// What a picture is, as one piece of text for the embedding model.
 fn embed_shot(s: &Shared, l: &lm::Lm, c: &Config, shot: &Shot, description: &str, body: &str) -> Result<Vec<f32>, lm::LmError> {
     let style = lm::embed_style(&c.embed_model);
+    // A full account mustn't crowd the picture's own words out of what is embedded.
+    let description: String = description.chars().take(1500).collect();
     let head: String = format!("{}{} {} {}\n{}", style.document, shot.moment.app_name, shot.moment.window_title, description, body).chars().take(3500).collect();
     s.ensure(l, &c.embed_model, 2048)?;
     l.embed(&c.embed_model, &head, 30)
@@ -1384,7 +1404,7 @@ fn reembed_one(s: &Shared) -> Result<bool, String> {
     let (l, tape) = s.taped(&c);
     let l = l.map_err(|e| e.to_string())?;
     let r = embed_shot(s, &l, &c, &shot, &shot.description, &body);
-    s.note(devlog::about(take(&tape), shot.id));
+    s.note(devlog::about(take(&tape), shot.id, &|t| hide_known(&known(s), t)));
     *lock(&s.last_lm_use) = Instant::now();
     match r {
         Ok(e) => lock(&s.store).set_embedding(shot.id, Some(&e), &c.embed_model).map(|_| true).map_err(|e| e.to_string()),
@@ -2360,20 +2380,55 @@ mod tests {
 
     #[test]
     fn a_description_never_repeats_a_secret_found_on_screen() {
-        // The model finds a secret no rule would, then (reading the picture) says it again in its description.
+        // The model finds a secret no rule would, then (reading the picture) says it again, spaced its own way.
         let d = tempfile::tempdir().unwrap();
-        let said = r#"{"findings":[{"line":0,"value":"quartz-otter-9","kind":"password"}],"description":"The door code quartz-otter-9 is on a note","tags":["quartz-otter-9"]}"#;
-        let c = Config { lm_url: fake_lm(said, 200), describe: DescribeWhen::Always, ..config(true) };
+        let said = r#"{"findings":[{"line":0,"value":"quartz-otter-9","kind":"password"}],"description":"The door code Quartz Otter 9 is on a note","tags":["quartz-otter-9"]}"#;
+        let c = Config { lm_url: fake_lm(said, 200), describe: DescribeWhen::Always, developer: true, ..config(true) };
         let e = Engine::new(d.path().to_string_lossy().into(), c, Arc::new(FakeHost(Default::default()))).unwrap();
-        // A window's picture: what is found in it is remembered for the others, and for what is said about it.
-        let mut f = secretive(1000);
-        f.moment.window_key = "win:7".into();
-        e.ingest(f);
+        // An ordinary whole-screen picture: what is found in it is remembered for what is said about it.
+        e.ingest(secretive(1000));
         wait(|| e.stats().unwrap().count == 1 && e.stats().unwrap().pending == 0);
         let shot = e.list(Filter::default(), 5, 0).unwrap().remove(0);
         assert_eq!(shot.description, "The door code [hidden] is on a note");
         assert_eq!(shot.tags, vec!["[hidden]".to_owned()]);
+        // Nor does the developer log, which keeps the model's answer.
+        wait(|| e.dev_log(50, None).unwrap().iter().any(|x| x.kind == "describe"));
+        let log = format!("{:?}", e.dev_log(50, None).unwrap()).to_lowercase();
+        assert!(log.contains("the door code") && !log.contains("quartz") && !log.contains("otter 9"), "{log}");
         e.shutdown();
+    }
+
+    #[test]
+    fn known_secrets_are_hidden_in_words_however_they_are_written() {
+        let known = vec!["marmalade-tuba-41".to_owned(), "tuba-41-zebra".to_owned(), "7725".to_owned()];
+        // Broken across rows, in capitals, and two that overlap.
+        assert_eq!(hide_known(&known, "wifi is MARMALADE TUBA\n41 today"), "wifi is [hidden]\n[hidden] today");
+        let both = hide_known(&known, "see marmalade-tuba-41-zebra here");
+        assert!(!both.contains("marmalade") && !both.contains("zebra") && both.starts_with("see ") && both.ends_with(" here"), "{both}");
+        // A short one only as a word of its own: a year or a total isn't chewed up.
+        assert_eq!(hide_known(&known, "code 7725, total 177250"), "code [hidden], total 177250");
+        assert_eq!(hide_known(&[], "nothing known\nsecond line"), "nothing known\nsecond line");
+    }
+
+    #[test]
+    fn the_short_description_is_kept_while_the_full_one_waits() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = store::Store::open(d.path()).unwrap();
+        let e = Engine::new(d.path().join("e").to_string_lossy().into(), config(false), Arc::new(FakeHost(Default::default()))).unwrap();
+        e.ingest(frame(1000));
+        wait(|| e.stats().unwrap().count == 1);
+        e.shutdown();
+        drop(s);
+        s = store::Store::open(&d.path().join("e")).unwrap();
+        let (shot, _) = s.next_pending().unwrap().unwrap();
+        s.keep_brief(shot.id, "short", &["t".into()]).unwrap();
+        // Still waiting, and the next try finds the short one already there.
+        let (again, _) = s.next_pending().unwrap().unwrap();
+        assert_eq!((again.id, again.description.as_str(), again.indexed, again.tags.len()), (shot.id, "short", false, 1));
+        // Once the picture is finished it isn't touched.
+        s.finish_index(shot.id, "short", "long", &[], None, "", "m").unwrap();
+        s.keep_brief(shot.id, "changed", &[]).unwrap();
+        assert_eq!(s.list(&Filter::default(), 5, 0).unwrap()[0].description, "short");
     }
 
     #[test]

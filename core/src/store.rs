@@ -313,6 +313,12 @@ impl Store {
     }
 
     /// `model`: the embedding model that made `emb`, or that was tried. `by`: the model that wrote the description.
+    /// The short description of a picture still waiting for its fuller one: kept so it needn't be written twice.
+    pub fn keep_brief(&mut self, id: i64, description: &str, tags: &[String]) -> Res<()> {
+        self.db.execute("UPDATE shots SET description=?,tags=? WHERE id=? AND indexed=0", params![description, serde_json::to_string(tags).unwrap_or_default(), id])?;
+        Ok(())
+    }
+
     /// `detail`: the fuller account kept beside the description, or empty. Searched with it.
     #[allow(clippy::too_many_arguments)]
     pub fn finish_index(&mut self, id: i64, description: &str, detail: &str, tags: &[String], emb: Option<&[f32]>, model: &str, by: &str) -> Res<bool> {

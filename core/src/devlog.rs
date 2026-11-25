@@ -84,7 +84,8 @@ fn settings(c: Call, mut e: DevEntry) -> DevEntry {
 }
 
 /// Calls about a saved picture: its text is already redacted, the picture itself is only named.
-pub fn about(calls: Vec<Call>, shot: i64) -> Vec<DevEntry> {
+/// `clean`: what makes the model's own words safe to keep; the same as is used on the description that is saved.
+pub fn about(calls: Vec<Call>, shot: i64, clean: &dyn Fn(&str) -> String) -> Vec<DevEntry> {
     calls
         .into_iter()
         .map(|c| {
@@ -98,8 +99,8 @@ pub fn about(calls: Vec<Call>, shot: i64) -> Vec<DevEntry> {
                     // Decoded first: a rule can't see a key hiding behind a JSON escape.
                     let content = match serde_json::from_str::<Value>(text) {
                         Ok(p) if p["description"].is_string() => json!({
-                            "description": detect::mask_text(p["description"].as_str().unwrap_or_default()),
-                            "tags": p["tags"].as_array().into_iter().flatten().filter_map(Value::as_str).map(detect::mask_text).collect::<Vec<_>>()}),
+                            "description": clean(p["description"].as_str().unwrap_or_default()),
+                            "tags": p["tags"].as_array().into_iter().flatten().filter_map(Value::as_str).map(clean).collect::<Vec<_>>()}),
                         _ => json!({"unreadable_answer_characters": text.chars().count()}),
                     };
                     e.response = pretty(&json!({"finish_reason": v["choices"][0]["finish_reason"].as_str(), "usage": v["usage"].as_object(), "content": content}));
@@ -144,7 +145,7 @@ mod tests {
     #[test]
     fn captions_are_masked_as_text_not_as_json() {
         let c = json!({"description": "first line\nAKIAIOSFODNN7EXAMPLE and \"password: hunter2zebra\"", "tags": ["ok", "token=Zx81qwertyuiop"]}).to_string();
-        let e = about(vec![described(&c)], 5).remove(0);
+        let e = about(vec![described(&c)], 5, &detect::mask_text).remove(0);
         for x in ["AKIAIOSFODNN7", "hunter2zebra", "Zx81qwerty", "data:..."] {
             assert!(!format!("{e:?}").contains(x), "{x}: {e:?}");
         }
@@ -153,7 +154,7 @@ mod tests {
 
     #[test]
     fn a_caption_that_cannot_be_read_is_only_counted() {
-        let e = about(vec![described("AKIAIOSFODNN7EXAMPLE {")], 5).remove(0);
+        let e = about(vec![described("AKIAIOSFODNN7EXAMPLE {")], 5, &detect::mask_text).remove(0);
         assert!(!e.response.contains("AKIA") && e.response.contains("unreadable_answer_characters"), "{}", e.response);
     }
 }

@@ -120,6 +120,9 @@ pub struct ModelInfo {
     pub vision: bool,
     pub embedding: bool,
     pub loaded: bool,
+    /// The smallest context it is loaded with, when LM Studio says. None: not loaded, or not told.
+    #[uniffi(default = None)]
+    pub context: Option<u32>,
 }
 
 /// How much a description says and how much it is given to go on.
@@ -168,7 +171,7 @@ fn read_stream(from: impl std::io::BufRead, stop: &dyn Fn() -> bool) -> Result<(
         if stop() {
             return Err(LmError::Yielded);
         }
-        let line = line.map_err(|_| LmError::Model("timed out".into()))?;
+        let line = line.map_err(|e| LmError::Model(if e.kind() == std::io::ErrorKind::TimedOut { "timed out" } else { "the answer broke off" }.into()))?;
         let Some(data) = line.strip_prefix("data:").map(str::trim) else { continue };
         if data == "[DONE]" {
             break;
@@ -246,6 +249,7 @@ impl Lm {
                 vision: m["capabilities"]["vision"].as_bool().unwrap_or(false),
                 embedding: m["type"] == "embedding",
                 loaded: m["loaded_instances"].as_array().is_some_and(|a| !a.is_empty()),
+                context: m["loaded_instances"].as_array().into_iter().flatten().filter_map(|i| i["config"]["context_length"].as_u64()).min().map(|c| c as u32),
             })
             .collect())
     }
@@ -263,7 +267,12 @@ impl Lm {
             return Err(LmError::Model(format!("{key} isn't in LM Studio any more. Choose a model in Settings.")));
         };
         if m.loaded {
-            return Ok(false);
+            // AIDEV-NOTE: a model answers at the size it was loaded with. Too small for what is asked of it now (a fuller
+            // AIDEV-NOTE: description): loaded again, whoever loaded it, or every such description would be cut off.
+            if !m.context.is_some_and(|c| c < context) {
+                return Ok(false);
+            }
+            self.unload(key)?;
         }
         self.call("/api/v1/models/load", Some(&json!({"model": key, "context_length": context})), 180)?;
         Ok(true)
@@ -289,9 +298,11 @@ impl Lm {
         c["message"]["content"].as_str().map(str::to_owned).ok_or(LmError::BadAnswer("empty"))
     }
 
-    /// As `chat`, but the answer is read as it is written and given up the moment `stop` says so.
+    /// As `chat`, but the answer is read as it is written and given up when `stop` says so.
     // AIDEV-NOTE: privacy-critical. LM Studio answers one request at a time: a description that ran on would keep a
     // AIDEV-NOTE: picture waiting in RAM for its secret check until the check timed out. Closing the connection ends the writing.
+    // AIDEV-TODO: `stop` is asked before sending and at each piece of the answer, not while the model is still reading
+    // AIDEV-TODO: the prompt (seconds). Closing the socket during that wait needs our own reader (afterimage-aan).
     fn chat_yielding(&self, model: &str, messages: Value, max_tokens: u32, schema: Value, timeout: u64, stop: &dyn Fn() -> bool) -> Result<String, LmError> {
         const PATH: &str = "/v1/chat/completions";
         let body = json!({
@@ -333,7 +344,8 @@ impl Lm {
             let text = c["message"]["content"].as_str().ok_or(LmError::BadAnswer("empty"))?;
             return Ok((text.to_owned(), c["finish_reason"].as_str().unwrap_or_default().to_owned()));
         }
-        read_stream(std::io::BufReader::new(res.into_body().into_reader()), stop)
+        // Bounded before it is buffered: a server can't make this grow without end.
+        read_stream(std::io::BufReader::new(std::io::Read::take(res.into_body().into_reader(), 8 << 20)), stop)
     }
 
     /// Ask the model which of `numbered` lines hold secrets. Returns (line index, value, kind).
