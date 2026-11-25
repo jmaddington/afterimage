@@ -23,6 +23,10 @@ public actor Capturer {
     private let session = WindowShots.newSession()
     /// Windows that have a picture of them in front showing what they show now. Bounded; forgetting costs a repeat.
     private var frontTaken: Set<CGWindowID> = []
+    /// What each window said in the last picture saved of it (WindowShots.words). Bounded; forgetting costs a repeat.
+    private var lastWords: [CGWindowID: Int] = [:]
+    /// When the whole screen was last saved alongside the windows.
+    private var lastOverview: Date?
     public init(engine: Engine) { self.engine = engine }
 
     /// Asked of the recorder each time: why not to look right now (nil to go ahead), and what is off-limits.
@@ -89,13 +93,13 @@ public actor Capturer {
 
     /// The outcome, and when it was a privacy refusal, which kind (for a log that mustn't name the app).
     /// `windows`: photograph each window on its own instead of the display ("Capture windows separately").
-    public func capture(_ trigger: Trigger, allDisplays: Bool, windows: Bool = false, gate: @escaping Gate) async -> (outcome: CaptureOutcome, refusal: HideReason?) {
+    public func capture(_ trigger: Trigger, allDisplays: Bool, windows: Bool = false, overviewEvery: Int = 0, gate: @escaping Gate) async -> (outcome: CaptureOutcome, refusal: HideReason?) {
         // Actors are re-entrant across awaits; without this two cycles could mix one's pixels with the other's facts.
         guard !busy else { return (.blocked("Busy"), nil) }
         busy = true
         defer { busy = false }
         lastRefusal = nil
-        let outcome = windows ? await runWindows(trigger, allDisplays: allDisplays, gate: gate) : await run(trigger, allDisplays: allDisplays, gate: gate)
+        let outcome = windows ? await runWindows(trigger, allDisplays: allDisplays, overviewEvery: overviewEvery, gate: gate) : await run(trigger, allDisplays: allDisplays, gate: gate)
         return (outcome, lastRefusal)
     }
 
@@ -104,7 +108,7 @@ public actor Capturer {
     /// AIDEV-NOTE: and after; a picture is kept only if both agree. Two brackets: the window in front (with a picture of
     /// AIDEV-NOTE: the displays, read for context only and never saved) in one short one; the windows behind in a second,
     /// AIDEV-NOTE: with a look after every picture. Trouble in the second costs only the windows behind.
-    private func runWindows(_ trigger: Trigger, allDisplays: Bool, gate: @escaping Gate) async -> CaptureOutcome {
+    private func runWindows(_ trigger: Trigger, allDisplays: Bool, overviewEvery: Int, gate: @escaping Gate) async -> CaptureOutcome {
         let front = await MainActor.run { NSWorkspace.shared.frontmostApplication.map { ($0.processIdentifier, $0.localizedName ?? "", $0.bundleIdentifier ?? "") } }
         guard let front else { return .skipped("No app is in front") }
         // Afterimage in front: its own windows are left out of every picture, and the rest of the screen is taken.
@@ -186,7 +190,7 @@ public actor Capturer {
         if let frontChoice { frontShot = await grab(frontChoice) }
         // AIDEV-NOTE: privacy-critical. These pictures are read for their text and dropped. Whole-display capture hides a
         // AIDEV-NOTE: secret wherever it shows once it is found anywhere on screen; a window alone must hide no less.
-        var around: [CGImage] = []
+        var around: [(display: SCDisplay, image: CGImage, at: Date)] = []
         for d in screens {
             let filter = SCContentFilter(display: d, excludingApplications: omit, exceptingWindows: [])
             let cfg = SCStreamConfiguration()
@@ -195,7 +199,8 @@ public actor Capturer {
             cfg.height = Int(Double(d.height) * scale)
             cfg.showsCursor = false
             cfg.captureResolution = .best
-            do { around.append(try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg)) }
+            let at = Date()
+            do { around.append((d, try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg), at)) }
             catch { return .failed(error.localizedDescription) }
         }
         let quick = await look(exclusions, hiddenBefore, gate)
@@ -220,27 +225,60 @@ public actor Capturer {
         let displays = content.displays.map { (id: $0.displayID, frame: $0.frame) }
         // Read once, when the first picture needs it.
         var context: [TextLine]?
+        var perDisplay: [[TextLine]] = []
         func surroundings() -> [TextLine]? {
             if let context { return context }
-            var all: [TextLine] = []
-            for i in around {
-                guard let l = try? Recognizer.lines(in: i) else { return nil }
-                all += l
+            var each: [[TextLine]] = []
+            for a in around {
+                guard let l = try? Recognizer.lines(in: a.image) else { return nil }
+                each.append(l)
             }
-            around = []
-            context = all
-            return all
+            perDisplay = each
+            context = each.flatMap { $0 }
+            return context
         }
         var queued = 0
+        // Now and then the whole screen is saved too, so there is a picture of how it all sat together.
+        // AIDEV-NOTE: the same pictures the first bracket vouched for, saved the way whole-display capture saves them:
+        // AIDEV-NOTE: hidden apps left out, the extension's fields placed, deduplicated per display.
+        // AIDEV-NOTE: saved after the windows of the same look, so what they gave away is already remembered; and only
+        // AIDEV-NOTE: if the address in front was the same before and after, window in front or not.
+        func overview() async {
+            guard WindowShots.overviewDue(last: lastOverview, now: Date(), every: overviewEvery), !around.isEmpty,
+                  hiddenBefore.focusedURL[front.0] == hiddenAfter.focusedURL[front.0], let everything = surroundings() else { return }
+            lastOverview = Date()
+            let frontWindow = OnScreenWindow.front(of: front.0, in: planned.list)
+            for (i, a) in around.enumerated() {
+                let key = String(a.display.displayID)
+                guard engine.isNew(displayKey: key, luma: Pixels.thumbprint(a.image)), let b = Pixels.bitmap(a.image) else { continue }
+                let m = Moment(
+                    takenAt: Int64(a.at.timeIntervalSince1970 * 1000), trigger: trigger.rawValue, display: await Self.name(a.display.displayID),
+                    appName: front.1, bundleId: front.2, windowTitle: ours ? "" : frontWindow?.title ?? "", url: ours ? "" : hiddenAfter.focusedURL[front.0] ?? "",
+                    userName: Session.consoleUser, fullName: NSFullUserName(), host: Session.computerName, sessions: Session.loggedIn, runningApps: apps)
+                engine.ingest(frame: Frame(rgba: b.data, width: UInt32(b.width), height: UInt32(b.height), stride: UInt32(b.stride), lines: perDisplay[i], moment: m, displayKey: key,
+                                           covers: Self.onDisplay(before.covers.filter { !leftOut.contains($0.key) }.values.flatMap { $0 }, a.display.frame), context: everything))
+                queued += 1
+            }
+        }
         /// Read one picture and hand it over. False when it couldn't be, and its thumbprint has been let go.
-        func send(_ s: Shot, covers: [Cover], url: String) async -> Bool {
+        /// `ifWordsChanged`: the picture differs only slightly from the last look, so it is saved only if it reads
+        /// differently from the last one saved. Not saving it then is not a failure.
+        func send(_ s: Shot, covers: [Cover], url: String, ifWordsChanged: Bool = false) async -> Bool {
             guard let w = listed[s.choice.id], let owner = planned.owners[w.pid] else { return false }
             let key = "win:\(w.id)"
-            // Without what else was on screen the picture would hide less than a whole-display one: not taken.
-            guard let lines = try? Recognizer.lines(in: s.image), let around = surroundings(), let b = Pixels.bitmap(s.image) else {
+            guard let lines = try? Recognizer.lines(in: s.image) else {
                 engine.lost(displayKey: key)
                 return false
             }
+            let words = WindowShots.words(lines)
+            if ifWordsChanged, lastWords[w.id] == words { return true }
+            // Without what else was on screen the picture would hide less than a whole-display one: not taken.
+            guard let around = surroundings(), let b = Pixels.bitmap(s.image) else {
+                engine.lost(displayKey: key)
+                return false
+            }
+            if lastWords.count >= 512 { lastWords.removeAll() }
+            lastWords[w.id] = words
             let display = Self.displays(displays, front: w.bounds, all: false, main: CGMainDisplayID()).first
             let m = Moment(
                 takenAt: Int64(s.at.timeIntervalSince1970 * 1000), trigger: trigger.rawValue, display: await Self.name(display ?? CGMainDisplayID()),
@@ -267,10 +305,10 @@ public actor Capturer {
             guard let covers = fields(s) else { return .skipped("A secret field couldn’t be placed on the window in front") }
             let id = s.choice.id
             let verdict = WindowShots.take(front: true, manual: trigger == .manual, print: Pixels.thumbprint(s.image, skipBar: false), queued: queued, hadFront: frontTaken.contains(id)) {
-                engine.isNew(displayKey: "win:\(id)", luma: $0)
+                engine.howNew(displayKey: "win:\(id)", luma: $0)
             }
-            if verdict == .take {
-                guard await send(s, covers: covers, url: hiddenAfter.focusedURL[s.choice.pid] ?? "") else { return .failed("The screen couldn't be read, so it wasn't saved") }
+            if verdict == .take || verdict == .ifWordsChanged {
+                guard await send(s, covers: covers, url: hiddenAfter.focusedURL[s.choice.pid] ?? "", ifWordsChanged: verdict == .ifWordsChanged) else { return .failed("The screen couldn't be read, so it wasn't saved") }
                 if frontTaken.count >= 512 { frontTaken.removeAll() }
                 frontTaken.insert(id)
             }
@@ -278,6 +316,7 @@ public actor Capturer {
 
         // Second bracket: the windows behind, one at a time, with a look after each. Only changed ones are held on to.
         var behind: [Shot] = []
+        var slight: Set<CGWindowID> = []
         var looks: [Look] = []
         for c in wanted where !c.front && kept.contains(c.id) {
             guard queued + behind.count < WindowShots.maxQueued else { break }
@@ -285,11 +324,11 @@ public actor Capturer {
             looks.append(await look(exclusions, hiddenAfter, gate))
             let id = c.id
             let verdict = WindowShots.take(front: false, manual: false, print: Pixels.thumbprint(s.image, skipBar: false), queued: queued + behind.count, hadFront: false) {
-                engine.isNew(displayKey: "win:\(id)", luma: $0)
+                engine.howNew(displayKey: "win:\(id)", luma: $0)
             }
-            guard verdict == .take else { continue }
+            guard verdict == .take || verdict == .ifWordsChanged else { continue }
             // What it shows has changed since any picture of it in front.
-            frontTaken.remove(id)
+            if verdict == .take { frontTaken.remove(id) } else { slight.insert(id) }
             behind.append(s)
         }
         if !behind.isEmpty {
@@ -305,9 +344,11 @@ public actor Capturer {
                     continue
                 }
                 // One window that can't be read is one window less, not a failed look.
-                _ = await send(s, covers: covers, url: "")
+                _ = await send(s, covers: covers, url: "", ifWordsChanged: slight.contains(s.choice.id))
             }
         }
+        await overview()
+        around = []
         return queued == 0 ? .unchanged : .queued(queued)
     }
 

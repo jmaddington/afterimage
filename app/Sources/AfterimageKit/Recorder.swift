@@ -147,11 +147,11 @@ import Observation
         if t == .interval && Session.idleSeconds > max(60, Double(settings.interval)) { return }
         policy.captured(at: now)
         capturing = true
-        let all = settings.allDisplays, windows = settings.windowsSeparately, generation = policy.generation
+        let all = settings.allDisplays, windows = settings.windowsSeparately, overview = settings.overviewSeconds, generation = policy.generation
         let shown = frontNow()
         engine.setConditions(onPower: Session.onPower, calm: Session.calm)
         Task {
-            let (r, refused) = await capturer.capture(t, allDisplays: all, windows: windows) { self.gate() }
+            let (r, refused) = await capturer.capture(t, allDisplays: all, windows: windows, overviewEvery: overview) { self.gate() }
             capturing = false
             if settings.developer {
                 let refusal = refused.map(Capturer.logPhrase)
